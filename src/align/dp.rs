@@ -8103,7 +8103,7 @@ unsafe fn lightweight_align_i16_sse2(qp: &mut LightweightProfile, target_len: i3
 }}
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
+unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) { unsafe {
     let slen = qp.segment_len;
     let mut gmax: i32 = 0;
     let qlen8 = slen * 8;
@@ -8139,9 +8139,8 @@ unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i3
             let e_sub = vqsubq_u16(vreinterpretq_u16_s16(e), gape_v);
             let e_new = vmaxq_s16(vreinterpretq_s16_u16(e_sub), vreinterpretq_s16_u16(h_sub));
             vst1q_s16(qp.e[j * 8..].as_mut_ptr(), e_new);
-            f = vqsubq_u16(vreinterpretq_u16_s16(f), gape_v);
-            f = vmaxq_s16(vreinterpretq_s16_u16(f), vreinterpretq_s16_u16(h_sub));
-            f = vreinterpretq_s16_u16(vreinterpretq_u16_s16(f)); // keep as s16
+            f = vreinterpretq_s16_u16(vqsubq_u16(vreinterpretq_u16_s16(f), gape_v));
+            f = vmaxq_s16(f, vreinterpretq_s16_u16(h_sub));
             h = vld1q_s16(qp.h0[j * 8..].as_ptr());
         }
 
@@ -8154,10 +8153,10 @@ unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i3
                 h1 = vmaxq_s16(h1, f);
                 vst1q_s16(qp.h1[j * 8..].as_mut_ptr(), h1);
                 let h1_sub = vqsubq_u16(vreinterpretq_u16_s16(h1), gapoe);
-                f = vqsubq_u16(vreinterpretq_u16_s16(f), gape_v);
-                let cmp = vcgtq_s16(vreinterpretq_s16_u16(f), vreinterpretq_s16_u16(h1_sub));
+                f = vreinterpretq_s16_u16(vqsubq_u16(vreinterpretq_u16_s16(f), gape_v));
+                let cmp = vcgtq_s16(f, vreinterpretq_s16_u16(h1_sub));
                 // Check if all lanes are zero (no f > h1_sub)
-                let any_set = vmaxvq_u16(vreinterpretq_u16_s16(cmp));
+                let any_set = vmaxvq_u16(cmp);
                 if any_set == 0 {
                     did_break = true;
                     break;
@@ -8191,7 +8190,7 @@ unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i3
     }
 
     (gmax, query_end, target_end)
-}
+}}
 
 /// WASM SIMD128 implementation of lightweight_align_i16
 #[cfg(target_arch = "wasm32")]
