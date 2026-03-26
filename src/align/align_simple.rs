@@ -54,11 +54,13 @@ impl Aligner for NWAligner {
         let k = anchors[0].query_span() as usize;
 
         let first = &anchors[0];
-        let last = &anchors[anchors.len() - 1];
         let rs = (first.ref_pos() as usize).saturating_sub(k - 1);
         let qs = (first.query_pos() as usize).saturating_sub(k - 1);
-        let re = last.ref_pos() as usize + 1;
-        let qe_anchor = last.query_pos() as usize + 1;
+
+        // we don't use the end position here, but if you want it:
+        //let last = &anchors[anchors.len() - 1];
+        //let re = last.ref_pos() as usize + 1;
+        //let qe = last.query_pos() as usize + 1;
 
         let mut ops: Vec<CigarOp> = Vec::new();
         let mut dp_score: i32 = 0;
