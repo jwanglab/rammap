@@ -194,18 +194,16 @@ bash tests/integration_test.sh
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) for a detailed guide to the
-codebase, and [`docs/extensibility.md`](docs/extensibility.md) for the educational
-pipeline module implementations.
+See [`docs/architecture.md`](docs/architecture.md) for a detailed guide to the codebase.
+
+## Extensibility
+
+See [`docs/extensibility.md`](docs/extensibility.md) for documentation on building and replacing
+modular components (seeding, chaining, alignment, etc).
 
 ## Performance
 
 See [`docs/performance.md`](docs/performance.md) for detailed benchmarks against minimap2.
-
-Highlights (GRCh38, 8 threads, 20K reads):
-- **map-ont**: 22% faster wall time, byte-identical output
-- **sr**: parity on speed, 3.5 GB less memory
-- **100% concordance** on 29/30 test presets (1 minimap2 undefined behavior)
 
 ## License
 
