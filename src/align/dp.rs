@@ -2561,7 +2561,7 @@ pub fn extend_dual_affine(
     if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() {
         // Compare mode: run both SIMD and scalar, report differences
         if std::env::var("RAMMAP_COMPARE_SCALAR").is_ok() {
-            let mut ez_simd = DpResult::default();
+            let ez_simd = DpResult::default();
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 extend_dual_affine2_impl(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, gap_open2, gap_extend2, bandwidth, z_drop, end_bonus, flags, &mut ez_simd);
