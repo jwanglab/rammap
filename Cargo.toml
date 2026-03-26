@@ -1,0 +1,54 @@
+[package]
+name = "rammap"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["parallel", "cli"]
+parallel = ["rayon"]
+cli = ["clap", "env_logger"]
+
+[dependencies]
+# Alignment module
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bitflags = "2"
+byteorder = "1"
+
+# Parallelism
+rayon = { version = "1", optional = true }
+
+# FASTA/FASTQ parsing
+flate2 = "1"
+memchr = "2"
+
+# Logging, errors (used by library)
+log = "0.4"
+thiserror = "2"
+anyhow = "1"
+
+# CLI-only (optional, enabled by default via `cli` feature)
+clap = { version = "4", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+# WASM-only dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Native-only dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+indicatif = { version = "0.17", features = ["rayon"] }
+
+[[bin]]
+name = "rammap"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
