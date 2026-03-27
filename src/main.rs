@@ -696,10 +696,16 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
 
     // Parse query files from positional args
     let frag_mode = opt.flags.contains(AlignFlags::FRAG_MODE);
+    let no_query = cli.queries.is_empty() && cli.dump_index.is_some();
     let (query_files, query2_path, two_file_pe): (Vec<String>, Option<String>, bool) = {
         if cli.queries.is_empty() {
-            // No query files → stdin
-            (vec!["-".to_string()], None, false)
+            if cli.dump_index.is_some() {
+                // -d with no query files → index-only mode (build/dump and exit)
+                (vec![], None, false)
+            } else {
+                // No query files, no -d → read from stdin (like minimap2)
+                (vec!["-".to_string()], None, false)
+            }
         } else if cli.queries.len() == 2 && frag_mode {
             // Exactly 2 files with frag_mode (sr preset) → two-file paired-end
             (vec![cli.queries[0].clone()], Some(cli.queries[1].clone()), true)
@@ -719,7 +725,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if let Some(ref q2) = query2_path && !std::path::Path::new(q2).exists() {
         anyhow::bail!("Second query file '{}' not found.", q2);
     }
-    let query_path = &query_files[0];
+    let query_path = query_files.first().map(|s| s.as_str()).unwrap_or("-");
 
     // ─── Output setup ───
     let t_start = Instant::now();
@@ -762,6 +768,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if is_idx_file {
         // ─── Load from .mmi/.idx: iterate over parts ───
         eprintln!("[*] Loading index from {}...", target_path);
+        let t_load = Instant::now();
         let f = std::fs::File::open(target_path)
             .map_err(|e| anyhow::anyhow!("Error opening index '{}': {}", target_path, e))?;
         let mut idx_reader = std::io::BufReader::new(f);
@@ -773,6 +780,11 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                 None => break,
             };
             n_parts += 1;
+            let total_len: u64 = mi.seqs.iter().map(|s| s.len as u64).sum();
+            eprintln!("[*] Loaded part {} in {:.3}s — k: {}; w: {}; hpc: {}; #seq: {}; total len: {}",
+                n_parts, t_load.elapsed().as_secs_f64(),
+                mi.kmer_size, mi.window_size, if mi.homopolymer_compressed { 1 } else { 0 },
+                mi.seqs.len(), total_len);
             if n_parts == 1 && do_cigar && !mi.has_sequences() {
                 anyhow::bail!("The prebuilt index doesn't contain sequences. Cannot produce CIGAR/cs/MD output.");
             }
@@ -1063,21 +1075,27 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         total_stats = total_stats + merge_stats;
     }
 
-    let total_time = t_start.elapsed().as_secs_f64();
-    eprintln!("[*] Mapping done in {:.3}s ({} index part{})", total_time, n_parts, if n_parts != 1 { "s" } else { "" });
+    if no_query {
+        let total_time = t_start.elapsed().as_secs_f64();
+        eprintln!("[*] Done in {:.3}s ({} index part{}). No query file provided; skipping mapping.",
+            total_time, n_parts, if n_parts != 1 { "s" } else { "" });
+    } else {
+        let total_time = t_start.elapsed().as_secs_f64();
+        eprintln!("[*] Mapping done in {:.3}s ({} index part{})", total_time, n_parts, if n_parts != 1 { "s" } else { "" });
 
-    eprintln!("--- Alignment Breakdown ---");
-    eprintln!("  Sequence Sketching: {:.3}s", total_stats.t_sketch.as_secs_f64());
-    eprintln!("  Seeding (Lookup):   {:.3}s", total_stats.t_seed.as_secs_f64());
-    eprintln!("  Chaining:           {:.3}s", total_stats.t_chain.as_secs_f64());
-    eprintln!("  Alignment (Ext):    {:.3}s", total_stats.t_align.as_secs_f64());
-    eprintln!("  Post-chain:         {:.3}s", total_stats.t_post.as_secs_f64());
-    eprintln!("  Total Measured:     {:.3}s",
-        (total_stats.t_sketch + total_stats.t_seed + total_stats.t_chain + total_stats.t_align + total_stats.t_post).as_secs_f64()
-    );
-    eprintln!("  Reads: {}, Seeds: {}, Anchors: {}, Chains: {}",
-        total_stats.n_reads, total_stats.n_seeds, total_stats.n_anchors, total_stats.n_chains);
-    eprintln!("---------------------------");
+        eprintln!("--- Alignment Breakdown ---");
+        eprintln!("  Sequence Sketching: {:.3}s", total_stats.t_sketch.as_secs_f64());
+        eprintln!("  Seeding (Lookup):   {:.3}s", total_stats.t_seed.as_secs_f64());
+        eprintln!("  Chaining:           {:.3}s", total_stats.t_chain.as_secs_f64());
+        eprintln!("  Alignment (Ext):    {:.3}s", total_stats.t_align.as_secs_f64());
+        eprintln!("  Post-chain:         {:.3}s", total_stats.t_post.as_secs_f64());
+        eprintln!("  Total Measured:     {:.3}s",
+            (total_stats.t_sketch + total_stats.t_seed + total_stats.t_chain + total_stats.t_align + total_stats.t_post).as_secs_f64()
+        );
+        eprintln!("  Reads: {}, Seeds: {}, Anchors: {}, Chains: {}",
+            total_stats.n_reads, total_stats.n_seeds, total_stats.n_anchors, total_stats.n_chains);
+        eprintln!("---------------------------");
+    }
 
     Ok(())
 }
