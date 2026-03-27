@@ -464,11 +464,9 @@ fn init_dp_result_full(result: &mut DpResult) {
 /// 0=M, 1=I, 2=D, 3=N_SKIP
 #[inline(always)]
 fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
-    if let Some(last) = cigar.last_mut() {
-        if (*last & 0xf) == op {
-            *last += len << 4;
-            return;
-        }
+    if let Some(last) = cigar.last_mut() && (*last & 0xf) == op {
+        *last += len << 4;
+        return;
     }
     cigar.push((len << 4) | op);
 }
@@ -855,10 +853,10 @@ unsafe fn extend_single_affine_neon_impl(
 ) { unsafe {
     let query_len = qseq.len();
     let target_len = tseq.len();
-    let _n_col_ = if (query_len + target_len - 1) * 16 < query_len * target_len { (query_len + target_len - 1 + 15) / 16 } else { (query_len + 15) / 16 + (target_len + 15) / 16 }; // simplified
+    let _n_col_ = if (query_len + target_len - 1) * 16 < query_len * target_len { (query_len + target_len - 1).div_ceil(16) } else { query_len.div_ceil(16) + target_len.div_ceil(16) }; // simplified
     let approx_max = (flags & APPROX_MAX) != 0;
     
-    if alphabet_size <= 0 || query_len <= 0 || target_len <= 0 {
+    if alphabet_size <= 0 {
         return;
     }
     
@@ -874,7 +872,7 @@ unsafe fn extend_single_affine_neon_impl(
     let _sc_mch_ = vdupq_n_s8(score_matrix[0]);
     let _sc_mis_ = vdupq_n_s8(score_matrix[1]);
     let _sc_n = if score_matrix[(alphabet_size as usize)*(alphabet_size as usize)-1] == 0 { 
-        vdupq_n_s8(-(gap_extend as i8)) 
+        vdupq_n_s8(-gap_extend) 
     } else { 
         vdupq_n_s8(score_matrix[(alphabet_size as usize)*(alphabet_size as usize)-1]) 
     };
@@ -887,18 +885,18 @@ unsafe fn extend_single_affine_neon_impl(
     let wl = bandwidth;
     let _wr = bandwidth;
     
-    let tlen_ = (target_len + 15) / 16; // Number of 16-byte blocks for target_len
-    let _qlen_ = (query_len + 15) / 16; // Number of 16-byte blocks for query_len
+    let tlen_ = target_len.div_ceil(16); // Number of 16-byte blocks for target_len
+    let _qlen_ = query_len.div_ceil(16); // Number of 16-byte blocks for query_len
 
     // _n_col_ is for traceback arrays p, off, off_end
     let mut _n_col_ = if query_len < target_len { query_len } else { target_len };
-    _n_col_ = ((if _n_col_ < (bandwidth + 1) as usize { _n_col_ } else { (bandwidth + 1) as usize }) + 15) / 16 + 1;
+    _n_col_ = (if _n_col_ < (bandwidth + 1) as usize { _n_col_ } else { (bandwidth + 1) as usize }).div_ceil(16) + 1;
     
     let with_cigar = (flags & SCORE_ONLY) == 0;
     
     // Calculate total memory needed for a single allocation
     // Buffer sizing: sf gets tlen_*16 bytes, qr gets (qlen_+1)*16 bytes
-    let qlen_ = (query_len + 15) / 16;
+    let qlen_ = query_len.div_ceil(16);
     let dp_size = 5 * tlen_ * 16;
     let sf_offset = dp_size;
     let qr_offset = sf_offset + tlen_ * 16;
@@ -994,10 +992,10 @@ unsafe fn extend_single_affine_neon_impl(
         let v8_ptr = v as *mut u8;
         
         // Find boundaries
-        if st < (r as i32 - query_len as i32 + 1) { st = r as i32 - query_len as i32 + 1; }
-        if en > r as i32 { en = r as i32; }
-        if st < ((r as i32 - wl + 1) >> 1) { st = (r as i32 - wl + 1) >> 1; }
-        if en > ((r as i32 + wl) >> 1) { en = (r as i32 + wl) >> 1; }
+        if st < (r - query_len as i32 + 1) { st = r - query_len as i32 + 1; }
+        if en > r { en = r; }
+        if st < ((r - wl + 1) >> 1) { st = (r - wl + 1) >> 1; }
+        if en > ((r + wl) >> 1) { en = (r + wl) >> 1; }
         
         if st > en {
             result.zdropped = 1;
@@ -1015,7 +1013,7 @@ unsafe fn extend_single_affine_neon_impl(
         // set boundary conditions
         // set boundary conditions
         if st > 0 {
-             if st - 1 >= last_st && st - 1 <= last_en {
+             if st > last_st && st - 1 <= last_en {
                  x1 = *(x as *mut i8).add((st - 1) as usize);
                  v1 = *(v as *mut i8).add((st - 1) as usize);
              } else {
@@ -1027,7 +1025,7 @@ unsafe fn extend_single_affine_neon_impl(
              v1 = if r == 0 { 0 } else { gap_open };
         }
         
-        if en >= r as i32 {
+        if en >= r {
              *(y as *mut i8).add(r as usize) = 0;
              *(u as *mut i8).add(r as usize) = if r == 0 { 0 } else { gap_open };
         }
@@ -1052,7 +1050,7 @@ unsafe fn extend_single_affine_neon_impl(
             let sc_mis_val = score_matrix[1] as u8;
             let sc_mch_val = score_matrix[0] as u8;
             let sc_n_val = if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
-                (-(gap_extend as i8)) as u8
+                (-gap_extend) as u8
             } else {
                 score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] as u8
             };
@@ -1133,7 +1131,7 @@ unsafe fn extend_single_affine_neon_impl(
              
              if with_cigar {
                  let offset = (r as usize * _n_col_) as isize - st_ as isize;
-                 let pr_ptr = (p_ptr as *mut u8).add((offset + ti as isize) as usize * 16);
+                 let pr_ptr = p_ptr.add((offset + ti as isize) as usize * 16);
                  
                  if ti == st_ {
                      *band_offset_ptr.add(r as usize) = st;
@@ -1221,7 +1219,7 @@ unsafe fn extend_single_affine_neon_impl(
         } else {
              // Approx max logic
              if r > 0 {
-                 if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t + 1 <= en0 {
+                 if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
                      let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
                      let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
                      let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
@@ -1250,15 +1248,13 @@ unsafe fn extend_single_affine_neon_impl(
                  }
                  
                  // Check z_drop
-                 if (flags & APPROX_DROP) != 0 {
-                      if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                          let tl = last_h0_t - result.max_score_target_pos;
-                          let ql = (r - last_h0_t) - result.max_score_query_pos;
-                          let l = if tl > ql { tl - ql } else { ql - tl };
-                          if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                              result.zdropped = 1;
-                              break;
-                          }
+                 if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                      let tl = last_h0_t - result.max_score_target_pos;
+                      let ql = (r - last_h0_t) - result.max_score_query_pos;
+                      let l = if tl > ql { tl - ql } else { ql - tl };
+                      if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
+                          result.zdropped = 1;
+                          break;
                       }
                  }
              } else {
@@ -1273,7 +1269,7 @@ unsafe fn extend_single_affine_neon_impl(
         }
         
         // Final score update
-        if r == valid_range as i32 - 1 /* query_len+target_len-2 */ {
+        if r == valid_range - 1 /* query_len+target_len-2 */ {
             // Check if en0 reached end
              if en0 == target_len as i32 - 1 {
                  result.score = h0;
@@ -2683,15 +2679,15 @@ unsafe fn extend_dual_affine_neon_impl(
     let bandwidth = if bandwidth < 0 { target_len.max(query_len) as i32 } else { bandwidth };
     let wl = bandwidth;
 
-    let tlen_ = (target_len + 15) / 16;
+    let tlen_ = target_len.div_ceil(16);
     let mut n_col_ = query_len.min(target_len);
-    n_col_ = ((n_col_.min((bandwidth + 1) as usize)) + 15) / 16 + 1;
+    n_col_ = n_col_.min((bandwidth + 1) as usize).div_ceil(16) + 1;
 
     let with_cigar = (flags & SCORE_ONLY) == 0;
 
     // Memory allocation - 7 arrays for dual-affine: u, v, x, y, x2, y2, s
     // sf gets tlen_*16 bytes, qr gets (qlen_+1)*16 bytes for SIMD scoring reads
-    let qlen_ = (query_len + 15) / 16;
+    let qlen_ = query_len.div_ceil(16);
     let dp_size = 7 * tlen_ * 16;
     let sf_offset = dp_size;
     let qr_offset = sf_offset + tlen_ * 16;
@@ -2798,7 +2794,7 @@ unsafe fn extend_dual_affine_neon_impl(
         let x28_arr = x2 as *mut i8;
 
         if st > 0 {
-            if st - 1 >= last_st && st - 1 <= last_en {
+            if st > last_st && st - 1 <= last_en {
                 x1 = *x8_arr.add((st - 1) as usize);
                 x21 = *x28_arr.add((st - 1) as usize);
                 v1 = *v8_arr.add((st - 1) as usize);
@@ -2841,7 +2837,7 @@ unsafe fn extend_dual_affine_neon_impl(
             let sc_mis_val = score_matrix[1] as u8;
             let sc_mch_val = score_matrix[0] as u8;
             let sc_n_val = if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
-                (-(gap_extend2 as i8)) as u8
+                (-gap_extend2) as u8
             } else {
                 score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] as u8
             };
@@ -3146,7 +3142,7 @@ unsafe fn extend_dual_affine_neon_impl(
         } else {
             // Approximate max tracking (existing code)
             if r > 0 {
-                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t + 1 <= en0 {
+                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
                     // Dual-affine: use raw v8/u8 values (no qe subtraction)
                     let d0 = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
                     let d1 = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
@@ -3171,16 +3167,14 @@ unsafe fn extend_dual_affine_neon_impl(
                 }
 
                 // Check z_drop
-                if (flags & APPROX_DROP) != 0 {
-                    if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                        let tl = last_h0_t - result.max_score_target_pos;
-                        let ql = (r - last_h0_t) - result.max_score_query_pos;
-                        let l = if tl > ql { tl - ql } else { ql - tl };
-                        // Dual-affine uses gap_extend2 for z-drop
-                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend2 as i32) {
-                            result.zdropped = 1;
-                            break;
-                        }
+                if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                    let tl = last_h0_t - result.max_score_target_pos;
+                    let ql = (r - last_h0_t) - result.max_score_query_pos;
+                    let l = if tl > ql { tl - ql } else { ql - tl };
+                    // Dual-affine uses gap_extend2 for z-drop
+                    if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend2 as i32) {
+                        result.zdropped = 1;
+                        break;
                     }
                 }
             } else {
@@ -7316,15 +7310,15 @@ unsafe fn extend_splice_neon_impl(
     let sc_mch_ = vdupq_n_u8(score_matrix[0] as u8);
     let sc_mis_ = vdupq_n_u8(score_matrix[1] as u8);
     let sc_n_ = if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
-        vdupq_n_u8(-(gap_extend as i8) as u8)
+        vdupq_n_u8(-gap_extend as u8)
     } else {
         vdupq_n_u8(score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] as u8)
     };
     let m1_ = vdupq_n_u8((alphabet_size - 1) as u8);
 
-    let tlen_ = (target_len + 15) / 16;
-    let qlen_ = (query_len + 15) / 16;
-    let n_col_ = (query_len.min(target_len) + 15) / 16 + 1;
+    let tlen_ = target_len.div_ceil(16);
+    let qlen_ = query_len.div_ceil(16);
+    let n_col_ = query_len.min(target_len).div_ceil(16) + 1;
 
     // Check scoring matrix bounds
     {
@@ -7413,19 +7407,18 @@ unsafe fn extend_splice_neon_impl(
 
     // --- Donor/acceptor initialization from splice site patterns ---
     if (flags & (SPLICE_FORWARD | SPLICE_REVERSE)) != 0 {
-        let sp: [i32; 4];
-        if (flags & SPLICE_COMPLEX) != 0 {
+        let sp: [i32; 4] = if (flags & SPLICE_COMPLEX) != 0 {
             let sp0 = [8, 15, 21, 30];
-            sp = [
+            [
                 (sp0[0] as f64 / 3.0 + 0.499) as i32,
                 (sp0[1] as f64 / 3.0 + 0.499) as i32,
                 (sp0[2] as f64 / 3.0 + 0.499) as i32,
                 (sp0[3] as f64 / 3.0 + 0.499) as i32,
-            ];
+            ]
         } else {
             let sp0 = if (flags & SPLICE_FLANK) != 0 { noncanon_penalty as i32 / 2 } else { 0 };
-            sp = [sp0, noncanon_penalty as i32, noncanon_penalty as i32, noncanon_penalty as i32];
-        }
+            [sp0, noncanon_penalty as i32, noncanon_penalty as i32, noncanon_penalty as i32]
+        };
 
         // Fill donor and acceptor with worst-case penalty
         std::ptr::write_bytes(donor as *mut u8, (-sp[3]) as u8, tlen_ * 16);
@@ -7596,7 +7589,7 @@ unsafe fn extend_splice_neon_impl(
         let x28_arr = x2 as *mut i8;
 
         if st > 0 {
-            if st - 1 >= last_st && st - 1 <= last_en {
+            if st > last_st && st - 1 <= last_en {
                 x1 = *x8_arr.add((st - 1) as usize);
                 x21 = *x28_arr.add((st - 1) as usize);
                 v1 = *v8_arr.add((st - 1) as usize);
@@ -7877,7 +7870,7 @@ unsafe fn extend_splice_neon_impl(
         } else {
             // Approximate max tracking
             if r > 0 {
-                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t + 1 <= en0 {
+                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
                     let d0 = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
                     let d1 = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
                     if d0 > d1 {

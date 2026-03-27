@@ -824,11 +824,9 @@ fn try_align_inversion(
     let ops = convert_cigar_to_eqx_pub(raw_cigar, &qseq, &tseq, q_off as usize, t_off as usize);
     let mut condensed: Vec<CigarOp> = Vec::new();
     for op in &ops {
-        if let Some(last) = condensed.last_mut() {
-            if last.op == op.op {
-                last.len += op.len;
-                continue;
-            }
+        if let Some(last) = condensed.last_mut() && last.op == op.op {
+            last.len += op.len;
+            continue;
         }
         condensed.push(op.clone());
     }

@@ -229,11 +229,9 @@ fn nw_align(
 #[inline]
 fn push_op(ops: &mut Vec<CigarOp>, op: char, len: u32) {
     if len == 0 { return; }
-    if let Some(last) = ops.last_mut() {
-        if last.op == op {
-            last.len += len;
-            return;
-        }
+    if let Some(last) = ops.last_mut() && last.op == op {
+        last.len += len;
+        return;
     }
     ops.push(CigarOp { op, len });
 }

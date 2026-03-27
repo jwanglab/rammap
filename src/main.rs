@@ -522,12 +522,8 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
 
     if let Some(r_str) = &cli.bw {
         let parts: Vec<&str> = r_str.split(',').collect();
-        if !parts.is_empty() {
-            if let Ok(val) = parts[0].parse() { opt.chaining.bandwidth = val; }
-        }
-        if parts.len() > 1 {
-             if let Ok(val) = parts[1].parse() { opt.chaining.bandwidth_long = val; }
-        }
+        if !parts.is_empty() && let Ok(val) = parts[0].parse() { opt.chaining.bandwidth = val; }
+        if parts.len() > 1 && let Ok(val) = parts[1].parse() { opt.chaining.bandwidth_long = val; }
     }
 
     if let Some(v) = cli.min_chain_score { opt.chaining.min_chain_score = v; }
@@ -543,16 +539,12 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if let Some(s) = &cli.scor_o {
         let parts: Vec<&str> = s.split(',').collect();
         if let Ok(v) = parts[0].parse() { opt.scoring.gap_open = v; }
-        if parts.len() > 1 {
-            if let Ok(v) = parts[1].parse() { opt.scoring.gap_open2 = v; }
-        }
+        if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.scoring.gap_open2 = v; }
     }
     if let Some(s) = &cli.scor_e {
         let parts: Vec<&str> = s.split(',').collect();
         if let Ok(v) = parts[0].parse() { opt.scoring.gap_extend = v; }
-        if parts.len() > 1 {
-             if let Ok(v) = parts[1].parse() { opt.scoring.gap_extend2 = v; }
-        }
+        if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.scoring.gap_extend2 = v; }
     }
     if let Some(v) = cli.best_n { opt.filtering.best_n = v; }
     if let Some(v) = cli.pri_ratio { opt.filtering.pri_ratio = v; }
@@ -562,16 +554,12 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
             opt.alignment.zdrop = v;
             opt.alignment.zdrop_inv = v; // zdrop_inv = zdrop by default
         }
-        if parts.len() > 1 {
-            if let Ok(v) = parts[1].parse() { opt.alignment.zdrop_inv = v; }
-        }
+        if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.alignment.zdrop_inv = v; }
     }
     if let Some(s) = &cli.mid_occ_range {
         let parts: Vec<&str> = s.split(',').collect();
         if let Ok(v) = parts[0].parse() { opt.seeding.min_mid_occ = v; }
-        if parts.len() > 1 {
-            if let Ok(v) = parts[1].parse() { opt.seeding.max_mid_occ = v; }
-        }
+        if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.seeding.max_mid_occ = v; }
     }
     if let Some(v) = cli.max_frag_len { opt.pairing.max_frag_len = v; }
     if let Some(v) = cli.max_intron_len {
@@ -728,10 +716,8 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
             anyhow::bail!("Input file '{}' not found.", qf);
         }
     }
-    if let Some(ref q2) = query2_path {
-        if !std::path::Path::new(q2).exists() {
-            anyhow::bail!("Second query file '{}' not found.", q2);
-        }
+    if let Some(ref q2) = query2_path && !std::path::Path::new(q2).exists() {
+        anyhow::bail!("Second query file '{}' not found.", q2);
     }
     let query_path = &query_files[0];
 
@@ -805,7 +791,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                 let mut split_writer = split::split_init(prefix, n_parts - 1, &mi)
                     .map_err(|e| anyhow::anyhow!("Failed to init split temp file: {}", e))?;
                 for qf in &query_files {
-                    let (part_stats, _) = map_one_part_split(
+                    let part_stats = map_one_part_split(
                         &mi, &mut opt, &run_cfg,
                         qf, n_parts, &mut split_writer,
                     )?;
@@ -813,15 +799,12 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                 }
             } else {
                 for qf in &query_files {
-                    let (part_stats, part_processed) = map_one_part(
+                    let part_stats = map_one_part(
                         &mi, &mut opt, &run_cfg,
                         qf, n_parts, &mut sam_header_written,
                         &mut handle,
                     )?;
                     total_stats = total_stats + part_stats;
-                    if n_parts > 1 && part_processed == 0 {
-                        // no reads mapped for this part (e.g. stdin already consumed)
-                    }
                 }
             }
         }
@@ -888,7 +871,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                     }
 
                     for qf in &query_files {
-                        let (part_stats, _) = map_one_part(
+                        let part_stats = map_one_part(
                             &mi, &mut opt, &run_cfg,
                             qf, 1, &mut sam_header_written,
                             &mut handle,
@@ -942,7 +925,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                             let mut split_writer = split::split_init(prefix, *n_parts - 1, &mi)
                                 .map_err(|e| anyhow::anyhow!("Failed to init split temp file: {}", e))?;
                             for qf in &query_files {
-                                let (part_stats, _) = map_one_part_split(
+                                let part_stats = map_one_part_split(
                                     &mi, opt, &run_cfg,
                                     qf, *n_parts, &mut split_writer,
                                 )?;
@@ -950,7 +933,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                             }
                         } else {
                             for qf in &query_files {
-                                let (part_stats, _) = map_one_part(
+                                let part_stats = map_one_part(
                                     &mi, opt, &run_cfg,
                                     qf, *n_parts, sam_header_written,
                                     &mut handle,
@@ -1024,7 +1007,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                     let mut split_writer = split::split_init(prefix, n_parts - 1, &mi)
                         .map_err(|e| anyhow::anyhow!("Failed to init split temp file: {}", e))?;
                     for qf in &query_files {
-                        let (part_stats, _) = map_one_part_split(
+                        let part_stats = map_one_part_split(
                             &mi, &mut opt, &run_cfg,
                             qf, n_parts, &mut split_writer,
                         )?;
@@ -1032,7 +1015,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                     }
                 } else {
                     for qf in &query_files {
-                        let (part_stats, _) = map_one_part(
+                        let part_stats = map_one_part(
                             &mi, &mut opt, &run_cfg,
                             qf, n_parts, &mut sam_header_written,
                             &mut handle,
@@ -1052,34 +1035,32 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     }
 
     // Merge split results if --split-prefix was used
-    if let Some(ref prefix) = split_prefix {
-        if n_parts >= 1 {
-            eprintln!("[*] Merging {} split parts...", n_parts);
-            let pe_flip = if pe_mode {
-                let pe_ori = opt.pairing.pe_ori;
-                Some(((pe_ori >> 1) & 1 != 0, pe_ori & 1 != 0))
-            } else {
-                None
-            };
-            let merge_cfg = split::MergeConfig {
-                prefix,
-                n_parts,
-                k: saved_k,
-                w: saved_w,
-                is_hpc: saved_is_hpc,
-                pe_mode,
-                pe_flip,
-                query_path,
-                query2_path: query2_path.as_deref(),
-                two_file_pe,
-                sam_rg: cli.sam_rg.as_deref(),
-                copy_comment,
-            };
-            let merge_stats = split::merge_split_results(
-                &merge_cfg, &opt, &out_cfg, &mut *handle,
-            )?;
-            total_stats = total_stats + merge_stats;
-        }
+    if let Some(ref prefix) = split_prefix && n_parts >= 1 {
+        eprintln!("[*] Merging {} split parts...", n_parts);
+        let pe_flip = if pe_mode {
+            let pe_ori = opt.pairing.pe_ori;
+            Some(((pe_ori >> 1) & 1 != 0, pe_ori & 1 != 0))
+        } else {
+            None
+        };
+        let merge_cfg = split::MergeConfig {
+            prefix,
+            n_parts,
+            k: saved_k,
+            w: saved_w,
+            is_hpc: saved_is_hpc,
+            pe_mode,
+            pe_flip,
+            query_path,
+            query2_path: query2_path.as_deref(),
+            two_file_pe,
+            sam_rg: cli.sam_rg.as_deref(),
+            copy_comment,
+        };
+        let merge_stats = split::merge_split_results(
+            &merge_cfg, &opt, &out_cfg, &mut *handle,
+        )?;
+        total_stats = total_stats + merge_stats;
     }
 
     let total_time = t_start.elapsed().as_secs_f64();
@@ -1123,7 +1104,7 @@ fn map_one_part(
     part_number: usize,  // 1-based
     sam_header_written: &mut bool,
     handle: &mut Box<dyn Write>,
-) -> anyhow::Result<(AlignmentStats, usize)> {
+) -> anyhow::Result<AlignmentStats> {
     let mid_occ_frac = run.mid_occ_frac;
     let cli = run.cli;
     let query2_path = run.query2_path;
@@ -1200,7 +1181,7 @@ fn map_one_part(
     if query_path == "-" && part_number > 1 {
         // If stdin is being used and this is not the first part, skip mapping silently.
         // This happens with -d (dump index only) or if stdin was already consumed by part 1.
-        return Ok((AlignmentStats::default(), 0));
+        return Ok(AlignmentStats::default());
     }
 
     let reader = rammap::fasta::open(query_path)
@@ -1214,7 +1195,6 @@ fn map_one_part(
     };
 
     let mut total_stats = AlignmentStats::default();
-    let mut processed_count = 0usize;
     let mut record_iter = reader.records();
     let mut record_iter2 = reader2.map(|r| r.records());
     const CHUNK_SIZE: usize = 4096;
@@ -1270,7 +1250,6 @@ fn map_one_part(
 
                 while let Ok(chunk_data) = rx.recv() {
                     if chunk_data.is_empty() { break; }
-                    let chunk_len = chunk_data.len();
 
                     let results: Vec<(String, AlignmentStats)> = chunk_data.par_iter().map_init(
                         || (rammap::align::extend::AlignmentContext::new(), rammap::align::map::MapContext::new()),
@@ -1298,7 +1277,6 @@ fn map_one_part(
                         }
                         total_stats = total_stats + stats;
                     }
-                    processed_count += chunk_len * 2;
                 }
                 Ok(())
             })?;
@@ -1345,7 +1323,6 @@ fn map_one_part(
                 }
 
                 if chunk_data.is_empty() { break; }
-                let chunk_len = chunk_data.len();
 
                 let results: Vec<(String, AlignmentStats)> = {
                     let mut ctx = rammap::align::extend::AlignmentContext::new();
@@ -1364,7 +1341,6 @@ fn map_one_part(
                     write!(handle, "{}", res)?;
                     total_stats = total_stats + stats;
                 }
-                processed_count += chunk_len * 2;
             }
         }
     } else {
@@ -1400,7 +1376,6 @@ fn map_one_part(
 
                 while let Ok(chunk_data) = rx.recv() {
                     if chunk_data.is_empty() { break; }
-                    let chunk_len = chunk_data.len();
 
                     let results: Vec<(String, AlignmentStats)> = chunk_data.par_iter().map_init(
                         || (rammap::align::extend::AlignmentContext::new(), rammap::align::map::MapContext::new()),
@@ -1427,7 +1402,6 @@ fn map_one_part(
                         }
                         total_stats = total_stats + stats;
                     }
-                    processed_count += chunk_len;
                 }
                 Ok(())
             })?;
@@ -1453,7 +1427,6 @@ fn map_one_part(
                 }
 
                 if chunk_data.is_empty() { break; }
-                let chunk_len = chunk_data.len();
 
                 let results: Vec<(String, AlignmentStats)> = {
                     let mut ctx = rammap::align::extend::AlignmentContext::new();
@@ -1471,12 +1444,11 @@ fn map_one_part(
                     write!(handle, "{}", res)?;
                     total_stats = total_stats + stats;
                 }
-                processed_count += chunk_len;
             }
         }
     }
 
-    Ok((total_stats, processed_count))
+    Ok(total_stats)
 }
 
 /// Map all queries against one index part, writing raw results to a split temp file.
@@ -1488,7 +1460,7 @@ fn map_one_part_split(
     query_path: &str,
     part_number: usize,  // 1-based
     split_writer: &mut std::io::BufWriter<std::fs::File>,
-) -> anyhow::Result<(AlignmentStats, usize)> {
+) -> anyhow::Result<AlignmentStats> {
     use rammap::align::pipeline::{process_query, process_query_from_regs};
     use rammap::align::map::{MapContext, map_query_multi};
     use rammap::align::extend::rev_comp;
@@ -1548,7 +1520,7 @@ fn map_one_part_split(
 
     // stdin can't be re-read for subsequent parts
     if query_path == "-" && part_number > 1 {
-        return Ok((AlignmentStats::default(), 0));
+        return Ok(AlignmentStats::default());
     }
 
     let reader = rammap::fasta::open(query_path)
@@ -1562,7 +1534,6 @@ fn map_one_part_split(
     };
 
     let mut total_stats = AlignmentStats::default();
-    let mut processed_count = 0usize;
     let mut record_iter = reader.records();
     let mut record_iter2 = reader2.map(|r| r.records());
     let is_weak = opt.flags.contains(AlignFlags::WEAK_PAIRING);
@@ -1631,7 +1602,6 @@ fn map_one_part_split(
                 .map_err(|e| anyhow::anyhow!("Error writing split temp: {}", e))?;
 
             total_stats = total_stats + pq1.stats + pq2.stats;
-            processed_count += 2;
         }
     } else {
         // Single-end split write
@@ -1665,10 +1635,9 @@ fn map_one_part_split(
                 .map_err(|e| anyhow::anyhow!("Error writing split temp: {}", e))?;
 
             total_stats = total_stats + pq.stats;
-            processed_count += 1;
         }
     }
 
     split_writer.flush()?;
-    Ok((total_stats, processed_count))
+    Ok(total_stats)
 }

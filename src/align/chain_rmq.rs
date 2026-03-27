@@ -362,32 +362,28 @@ pub fn chain_anchors_rmq(
             }
 
             // If not exact match, also search inner tree for close matches
-            if !exact {
-                if let Some(ref inner) = root_inner {
-                    if a[i].query_pos() > 0 {
-                        let mut skip_count = 0;
-                        for (q_y, q_i, _q_pri) in inner.iter_rev_le(a[i].query_pos() - 1) {
-                            if q_y < a[i].query_pos() - max_dist_inner {
+            if !exact && let Some(ref inner) = root_inner && a[i].query_pos() > 0 {
+                let mut skip_count = 0;
+                for (q_y, q_i, _q_pri) in inner.iter_rev_le(a[i].query_pos() - 1) {
+                    if q_y < a[i].query_pos() - max_dist_inner {
+                        break;
+                    }
+                    let j = q_i;
+                    let (sc, _, width) = compute_chain_score_simple(&a[i], &a[j], opt.chn_pen_gap, opt.chn_pen_skip);
+                    if width <= bw {
+                        let total_sc = scores[j] + sc;
+                        if total_sc > best_score {
+                            best_score = total_sc;
+                            best_predecessor = j as i64;
+                            if skip_count > 0 { skip_count -= 1; }
+                        } else if visited[j] == i as i32 {
+                            skip_count += 1;
+                            if skip_count > opt.max_chain_skip {
                                 break;
                             }
-                            let j = q_i;
-                            let (sc, _, width) = compute_chain_score_simple(&a[i], &a[j], opt.chn_pen_gap, opt.chn_pen_skip);
-                            if width <= bw {
-                                let total_sc = scores[j] + sc;
-                                if total_sc > best_score {
-                                    best_score = total_sc;
-                                    best_predecessor = j as i64;
-                                    if skip_count > 0 { skip_count -= 1; }
-                                } else if visited[j] == i as i32 {
-                                    skip_count += 1;
-                                    if skip_count > opt.max_chain_skip {
-                                        break;
-                                    }
-                                }
-                                if predecessors[j] >= 0 {
-                                    visited[predecessors[j] as usize] = i as i32;
-                                }
-                            }
+                        }
+                        if predecessors[j] >= 0 {
+                            visited[predecessors[j] as usize] = i as i32;
                         }
                     }
                 }

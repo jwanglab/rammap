@@ -776,11 +776,9 @@ pub fn fmt_cigar(ops: &[CigarOp], eqx: bool) -> String {
         let mut min_ops: Vec<CigarOp> = Vec::new();
         for op in ops {
             let ch = if op.op == '=' || op.op == 'X' { 'M' } else { op.op };
-            if let Some(last) = min_ops.last_mut() {
-                if last.op == ch {
-                    last.len += op.len;
-                    continue;
-                }
+            if let Some(last) = min_ops.last_mut() && last.op == ch {
+                last.len += op.len;
+                continue;
             }
             min_ops.push(CigarOp { op: ch, len: op.len });
         }

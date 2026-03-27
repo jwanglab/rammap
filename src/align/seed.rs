@@ -284,20 +284,18 @@ pub(crate) fn collect_seed_hits_with_occ(
             for &(_, r_packed) in hits {
                 // skip_seed logic
                 let mut is_self = false;
-                if let Some(qn) = qname {
-                    if !skip_flags.is_empty() {
-                        let rid = (r_packed >> 32) as usize;
-                        let tname = &mi.seqs[rid].name;
-                        let tlen = mi.seqs[rid].len;
-                        let cmp = qn.cmp(tname.as_str());
-                        if opt.flags.contains(AlignFlags::NO_DIAG) && cmp == std::cmp::Ordering::Equal && tlen == qlen {
-                            let r_pos_raw = (r_packed as u32) >> 1;
-                            let q_pos_raw = (m.y as u32) >> 1;
-                            if r_pos_raw == q_pos_raw { continue; } // skip diagonal
-                            if (r_packed & 1) == (m.y & 1) { is_self = true; } // same strand
-                        }
-                        if opt.flags.contains(AlignFlags::NO_DUAL) && cmp == std::cmp::Ordering::Greater { continue; }
+                if let Some(qn) = qname && !skip_flags.is_empty() {
+                    let rid = (r_packed >> 32) as usize;
+                    let tname = &mi.seqs[rid].name;
+                    let tlen = mi.seqs[rid].len;
+                    let cmp = qn.cmp(tname.as_str());
+                    if opt.flags.contains(AlignFlags::NO_DIAG) && cmp == std::cmp::Ordering::Equal && tlen == qlen {
+                        let r_pos_raw = (r_packed as u32) >> 1;
+                        let q_pos_raw = (m.y as u32) >> 1;
+                        if r_pos_raw == q_pos_raw { continue; } // skip diagonal
+                        if (r_packed & 1) == (m.y & 1) { is_self = true; } // same strand
                     }
+                    if opt.flags.contains(AlignFlags::NO_DUAL) && cmp == std::cmp::Ordering::Greater { continue; }
                 }
 
                 let r_pos = (r_packed as u32) >> 1;
@@ -411,10 +409,8 @@ pub fn collect_seed_hits_heap(
     // Initialize heap: (r_packed, seed_idx << 32 | hit_counter)
     let mut heap: Vec<(u64, u64)> = Vec::with_capacity(matched_seeds.len());
     for (i, hits) in hit_slices.iter().enumerate() {
-        if let Some(h) = hits {
-            if !h.is_empty() {
-                heap.push((h[0].1, (i as u64) << 32)); // h[0].1 = r_packed
-            }
+        if let Some(h) = hits && !h.is_empty() {
+            heap.push((h[0].1, (i as u64) << 32)); // h[0].1 = r_packed
         }
     }
     anchor_heap_make(&mut heap);
@@ -437,20 +433,18 @@ pub fn collect_seed_hits_heap(
         // skip_seed logic
         let mut is_self = false;
         let mut skip = false;
-        if let Some(qn) = qname {
-            if !skip_flags.is_empty() {
-                let rid = (r >> 32) as usize;
-                let tname = &mi.seqs[rid].name;
-                let tlen = mi.seqs[rid].len;
-                let cmp = qn.cmp(tname.as_str());
-                if opt.flags.contains(AlignFlags::NO_DIAG) && cmp == std::cmp::Ordering::Equal && tlen == qlen {
-                    let r_pos_raw = (r as u32) >> 1;
-                    let q_pos_raw = (m.y as u32) >> 1;
-                    if r_pos_raw == q_pos_raw { skip = true; }
-                    else if (r & 1) == (m.y & 1) { is_self = true; }
-                }
-                if !skip && opt.flags.contains(AlignFlags::NO_DUAL) && cmp == std::cmp::Ordering::Greater { skip = true; }
+        if let Some(qn) = qname && !skip_flags.is_empty() {
+            let rid = (r >> 32) as usize;
+            let tname = &mi.seqs[rid].name;
+            let tlen = mi.seqs[rid].len;
+            let cmp = qn.cmp(tname.as_str());
+            if opt.flags.contains(AlignFlags::NO_DIAG) && cmp == std::cmp::Ordering::Equal && tlen == qlen {
+                let r_pos_raw = (r as u32) >> 1;
+                let q_pos_raw = (m.y as u32) >> 1;
+                if r_pos_raw == q_pos_raw { skip = true; }
+                else if (r & 1) == (m.y & 1) { is_self = true; }
             }
+            if !skip && opt.flags.contains(AlignFlags::NO_DUAL) && cmp == std::cmp::Ordering::Greater { skip = true; }
         }
 
         if !skip {
