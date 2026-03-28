@@ -8,6 +8,7 @@
 //!
 //! ```no_run
 //! use rammap::api::{Aligner, Preset};
+//! use rammap::Strand;
 //!
 //! let aligner = Aligner::from_index("reference.mmi", Preset::MapOnt).unwrap();
 //! let results = aligner.map_seq("read1", b"ACGTACGTACGT...");

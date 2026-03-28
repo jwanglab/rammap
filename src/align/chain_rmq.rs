@@ -398,15 +398,14 @@ impl RmqTree {
 
         // Scan lo-path below LCA: nodes where we went left/equal are in range.
         // Their right subtrees are fully in range.
-        for i in (lca + 1)..len_lo {
-            let (node, cmp) = path_lo[i];
-            if cmp <= 0 {
+        for (node, cmp) in path_lo.iter().take(len_lo).skip(lca + 1) {
+            if *cmp <= 0 {
                 // This node is in range (>= lo)
-                if self.nodes[node as usize].pri < self.nodes[min_idx as usize].pri {
-                    min_idx = node;
+                if self.nodes[*node as usize].pri < self.nodes[min_idx as usize].pri {
+                    min_idx = *node;
                 }
                 // Its right subtree is fully in range
-                let rc = self.nodes[node as usize].right;
+                let rc = self.nodes[*node as usize].right;
                 if rc != NIL {
                     let rc_min = self.nodes[rc as usize].sub_min_idx;
                     if self.nodes[rc_min as usize].pri < self.nodes[min_idx as usize].pri {
@@ -418,13 +417,12 @@ impl RmqTree {
 
         // Scan hi-path below LCA: nodes where we went right/equal are in range.
         // Their left subtrees are fully in range.
-        for i in (lca + 1)..len_hi {
-            let (node, cmp) = path_hi[i];
-            if cmp >= 0 {
-                if self.nodes[node as usize].pri < self.nodes[min_idx as usize].pri {
-                    min_idx = node;
+        for (node, cmp) in path_hi.iter().take(len_hi).skip(lca + 1) {
+            if *cmp >= 0 {
+                if self.nodes[*node as usize].pri < self.nodes[min_idx as usize].pri {
+                    min_idx = *node;
                 }
-                let lc = self.nodes[node as usize].left;
+                let lc = self.nodes[*node as usize].left;
                 if lc != NIL {
                     let lc_min = self.nodes[lc as usize].sub_min_idx;
                     if self.nodes[lc_min as usize].pri < self.nodes[min_idx as usize].pri {
