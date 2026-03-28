@@ -363,37 +363,94 @@ impl Index {
         let mut offset = 0usize;
         let mut ascii_seqs: Vec<Vec<u8>> = Vec::new();
 
-        // Phase 1: Storage and Metadata (Sequential)
+        // Phase 1: Storage and Metadata
         for (name, seq_bytes) in seqs {
             let len = seq_bytes.len();
-            let mut normalized = seq_bytes;
-            for b in normalized.iter_mut() {
-                *b = b.to_ascii_uppercase();
-            }
-
             idx.seqs.push(TargetSequence {
                 name,
                 len,
                 offset: offset as u64,
                 is_alt: false,
             });
-            ascii_seqs.push(normalized);
+            // Uppercase for HPC mode's raw byte comparison (seq[i]==seq[i+1]).
+            // Non-HPC paths use lookup tables that handle both cases.
+            if is_hpc {
+                let mut normalized = seq_bytes;
+                for b in normalized.iter_mut() { *b = b.to_ascii_uppercase(); }
+                ascii_seqs.push(normalized);
+            } else {
+                ascii_seqs.push(seq_bytes);
+            }
             offset += len;
         }
 
-        // Pack ASCII sequences into global 4-bit packed array
+        // Pack ASCII sequences into global 4-bit packed array (parallel per-sequence)
         {
-            #[inline]
-            fn ascii_to_nt4(b: u8) -> u32 {
-                match b { b'A' | b'a' => 0, b'C' | b'c' => 1, b'G' | b'g' => 2, b'T' | b't' => 3, _ => 4 }
-            }
+            // Lookup table: ASCII byte → 4-bit nt4 value (case-insensitive)
+            static NT4_TABLE: [u32; 256] = {
+                let mut t = [4u32; 256];
+                t[b'A' as usize] = 0; t[b'a' as usize] = 0;
+                t[b'C' as usize] = 1; t[b'c' as usize] = 1;
+                t[b'G' as usize] = 2; t[b'g' as usize] = 2;
+                t[b'T' as usize] = 3; t[b't' as usize] = 3;
+                t
+            };
+
             let n_u32 = offset.div_ceil(8);
+
+            // Each sequence packs into a non-overlapping region of the packed array.
+            // When sequence boundaries are 8-base aligned, regions don't share u32 words
+            // and can be packed in parallel. The last word of a sequence may share with
+            // the first word of the next when not aligned — we handle this with a
+            // parallel pack + sequential fixup for boundary words.
+
+            // Pack each sequence independently into per-seq local buffers, then merge.
+            // This avoids false sharing and allows full parallelism.
+            #[cfg(feature = "parallel")]
+            let per_seq_packed: Vec<Vec<u32>> = {
+                idx.seqs.par_iter().zip(ascii_seqs.par_iter()).map(|(seq_info, ascii)| {
+                    let len = seq_info.len;
+                    let n_words = len.div_ceil(8);
+                    let mut buf = vec![0u32; n_words];
+                    for (i, &b) in ascii.iter().enumerate() {
+                        buf[i >> 3] |= NT4_TABLE[b as usize] << (((i & 7) << 2) as u32);
+                    }
+                    buf
+                }).collect()
+            };
+
+            #[cfg(not(feature = "parallel"))]
+            let per_seq_packed: Vec<Vec<u32>> = {
+                idx.seqs.iter().zip(ascii_seqs.iter()).map(|(seq_info, ascii)| {
+                    let len = seq_info.len;
+                    let n_words = len.div_ceil(8);
+                    let mut buf = vec![0u32; n_words];
+                    for (i, &b) in ascii.iter().enumerate() {
+                        buf[i >> 3] |= NT4_TABLE[b as usize] << (((i & 7) << 2) as u32);
+                    }
+                    buf
+                }).collect()
+            };
+
+            // Merge per-seq buffers into global packed array
             let mut packed = vec![0u32; n_u32];
-            for (seq_info, ascii) in idx.seqs.iter().zip(ascii_seqs.iter()) {
+            for (seq_info, seq_packed) in idx.seqs.iter().zip(per_seq_packed.iter()) {
                 let goff = seq_info.offset as usize;
-                for (i, &b) in ascii.iter().enumerate() {
-                    let gpos = goff + i;
-                    packed[gpos >> 3] |= ascii_to_nt4(b) << (((gpos & 7) << 2) as u32);
+                let word_start = goff >> 3;
+                let bit_shift = ((goff & 7) << 2) as u32;
+
+                if bit_shift == 0 {
+                    // Aligned: direct copy
+                    packed[word_start..word_start + seq_packed.len()]
+                        .copy_from_slice(seq_packed);
+                } else {
+                    // Unaligned: shift and OR each word
+                    for (j, &w) in seq_packed.iter().enumerate() {
+                        packed[word_start + j] |= w << bit_shift;
+                        if word_start + j + 1 < n_u32 {
+                            packed[word_start + j + 1] |= w >> (32 - bit_shift);
+                        }
+                    }
                 }
             }
             idx.packed_seqs = packed;
@@ -463,7 +520,6 @@ impl Index {
         for mut v in entries_per_seq {
             temp_entries.append(&mut v);
         }
-
         // Sort by (hash, position)
         radix_sort_pair(&mut temp_entries);
 

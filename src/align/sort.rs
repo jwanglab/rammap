@@ -122,23 +122,164 @@ pub fn radix_sort_128x(arr: &mut [Minimizer]) {
     }
 }
 
+/// Perform the top-level MSD radix partition: count, prefix-sum, and in-place
+/// cyclic permutation for the most significant byte. Returns (bb, be) bucket
+/// boundaries so the caller can recurse into each bucket independently.
+fn rs_partition_top<T: RadixKey>(arr: &mut [T], s: u32) -> ([usize; 256], [usize; 256]) {
+    let m = 255u64;
+    let mut bb = [0usize; 256];
+    let mut be = [0usize; 256];
+
+    for item in arr.iter() {
+        let byte = ((item.radix_key() >> s) & m) as usize;
+        be[byte] += 1;
+    }
+
+    for i in 1..256 {
+        be[i] += be[i - 1];
+        bb[i] = be[i - 1];
+    }
+
+    // In-place cyclic permutation (American Flag sort)
+    let mut k = 0usize;
+    while k < 256 {
+        if bb[k] < be[k] {
+            let l = ((arr[bb[k]].radix_key() >> s) & m) as usize;
+            if l != k {
+                let mut tmp = arr[bb[k]];
+                let mut cur = l;
+                loop {
+                    std::mem::swap(&mut tmp, &mut arr[bb[cur]]);
+                    bb[cur] += 1;
+                    cur = ((tmp.radix_key() >> s) & m) as usize;
+                    if cur == k { break; }
+                }
+                arr[bb[k]] = tmp;
+                bb[k] += 1;
+            } else {
+                bb[k] += 1;
+            }
+        } else {
+            k += 1;
+        }
+    }
+
+    // Reset bb to proper bucket starts
+    bb[0] = 0;
+    bb[1..256].copy_from_slice(&be[..255]);
+
+    (bb, be)
+}
+
 /// MSD in-place radix sort for (u64, u64) index entries.
 /// Sorts by first element (hash), then by second (position) within ties.
+/// The top-level partition is sequential; the 256 sub-bucket sorts run in
+/// parallel via rayon. Sub-bucket recursion is sequential. Result is
+/// identical to the fully sequential version.
 pub fn radix_sort_pair(arr: &mut [(u64, u64)]) {
     if arr.len() <= RS_MIN_SIZE {
-        // For small arrays, sort lexicographically (matching original behavior)
         rs_insertsort_pair(arr);
+        return;
+    }
+
+    // Find the highest occupied byte to start partitioning at the right level.
+    // This avoids wasting partition passes on empty top bytes (e.g. 30-bit hashes
+    // stored in 64-bit keys have zero upper bytes).
+    let mut max_key = 0u64;
+    for item in arr.iter() {
+        max_key |= item.radix_key();
+    }
+    let top_byte = if max_key == 0 { 0 } else { (63 - max_key.leading_zeros()) / 8 };
+    let top_s = top_byte * RS_MAX_BITS;
+
+    // Two-level partition to get more buckets for better parallelism.
+    // Level 1: partition by the highest occupied byte.
+    let (bb1, be1) = rs_partition_top(arr, top_s);
+
+    // Level 2: sub-partition each level-1 bucket by the next byte down.
+    // This gives up to 65536 independent buckets for parallel recursion.
+    let next_s = top_s.saturating_sub(RS_MAX_BITS);
+    let mut buckets: Vec<(usize, usize)> = Vec::new();
+
+    if next_s > 0 || top_s == 0 {
+        // Can do a second partition level
+        for i in 0..256 {
+            let len = be1[i] - bb1[i];
+            if len <= 1 { continue; }
+            let sub = &mut arr[bb1[i]..be1[i]];
+            if len <= RS_MIN_SIZE {
+                // Too small for radix — just record as a single bucket
+                buckets.push((bb1[i], be1[i]));
+            } else {
+                let (bb2, be2) = rs_partition_top(sub, next_s);
+                for j in 0..256 {
+                    if be2[j] > bb2[j] {
+                        buckets.push((bb1[i] + bb2[j], bb1[i] + be2[j]));
+                    }
+                }
+            }
+        }
     } else {
-        rs_sort(arr, RS_MAX_BITS, (8 - 1) * RS_MAX_BITS);
-        // Second pass: sort positions within each hash group.
-        // Groups are typically very small (avg ~1.18 entries), so this is fast.
-        let mut i = 0;
-        while i < arr.len() {
-            let h = arr[i].0;
-            let start = i;
-            while i < arr.len() && arr[i].0 == h { i += 1; }
-            if i - start > 1 {
-                arr[start..i].sort_unstable_by_key(|e| e.1);
+        // Only one byte of key bits — level-1 buckets are final
+        for i in 0..256 {
+            if be1[i] > bb1[i] {
+                buckets.push((bb1[i], be1[i]));
+            }
+        }
+    }
+    let recurse_s = next_s.saturating_sub(RS_MAX_BITS);
+
+    // Safety: buckets are non-overlapping slices of arr, so parallel mutable
+    // access is safe. We use raw pointer arithmetic to avoid borrow checker issues.
+    let ptr = arr.as_mut_ptr();
+
+    // Pass base address as usize so the closure is Send+Sync.
+    // Safety: buckets are non-overlapping regions of arr, each thread
+    // gets exclusive access to its own slice.
+    let base = ptr as usize;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        buckets.par_iter().for_each(|&(start, end)| {
+            let slice = unsafe { std::slice::from_raw_parts_mut((base as *mut (u64, u64)).add(start), end - start) };
+            let len = slice.len();
+            if len > RS_MIN_SIZE {
+                rs_sort(slice, RS_MAX_BITS, recurse_s);
+            } else if len > 1 {
+                rs_insertsort(slice);
+            }
+            // Second pass: sort positions within each hash group
+            let mut i = 0;
+            while i < slice.len() {
+                let h = slice[i].0;
+                let s = i;
+                while i < slice.len() && slice[i].0 == h { i += 1; }
+                if i - s > 1 {
+                    slice[s..i].sort_unstable_by_key(|e| e.1);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        for &(start, end) in &buckets {
+            let slice = unsafe { std::slice::from_raw_parts_mut((base as *mut (u64, u64)).add(start), end - start) };
+            let len = slice.len();
+            if len > RS_MIN_SIZE {
+                rs_sort(slice, RS_MAX_BITS, recurse_s);
+            } else if len > 1 {
+                rs_insertsort(slice);
+            }
+            let mut i = 0;
+            while i < slice.len() {
+                let h = slice[i].0;
+                let s = i;
+                while i < slice.len() && slice[i].0 == h { i += 1; }
+                if i - s > 1 {
+                    slice[s..i].sort_unstable_by_key(|e| e.1);
+                }
             }
         }
     }
