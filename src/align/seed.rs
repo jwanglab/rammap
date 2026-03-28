@@ -71,6 +71,7 @@ struct SeedInfo {
     is_tandem: bool,
     is_filtered: bool,      // true = filtered out
     mi_idx: usize,  // index into q_minimizers
+    entry_range: (u32, u32), // absolute range into Index.entries
 }
 
 /// Select seeds by frequency threshold
@@ -164,6 +165,7 @@ struct MatchedSeed {
     is_tandem: bool,
     mi_idx: usize,  // index into q_minimizers
     seg_id: u64,    // segment index (from minimizer rid field, for multi-segment)
+    entry_range: (u32, u32), // absolute range into Index.entries, avoids re-lookup
 }
 
 /// Common seed collection + filtering logic shared by both heap and non-heap paths.
@@ -193,13 +195,17 @@ fn collect_anchor_matches(
     }
 
     // Phase 1: Collect seed info (like mm_seed_collect_all)
+    // Use get_range to capture the entry range so we can skip the binary search later.
     let mut seeds: Vec<SeedInfo> = Vec::with_capacity(n_qm);
     for (mi_idx, m) in q_minimizers.iter().enumerate() {
         let hash = m.x >> 8;
         let q_span = (m.x & 0xFF) as u32;
         let q_pos = m.y as u32; // includes strand bit
-        let n = mi.get(hash).map_or(0, |h| h.len());
-        if n == 0 { continue; }
+        let range = match mi.get_range(hash) {
+            Some(r) => r,
+            None => continue,
+        };
+        let n = (range.1 - range.0) as usize;
         seeds.push(SeedInfo {
             query_pos: q_pos,
             q_span,
@@ -207,6 +213,7 @@ fn collect_anchor_matches(
             is_tandem: is_tandem[mi_idx],
             is_filtered: false,
             mi_idx,
+            entry_range: range,
         });
     }
 
@@ -247,6 +254,7 @@ fn collect_anchor_matches(
             is_tandem: seed.is_tandem,
             mi_idx: seed.mi_idx,
             seg_id: (q_minimizers[seed.mi_idx].y >> 32),
+            entry_range: seed.entry_range,
         });
     }
 
@@ -275,13 +283,13 @@ pub(crate) fn collect_seed_hits_with_occ(
 
     for seed in &matched_seeds {
         let m = &q_minimizers[seed.mi_idx];
-        let hash = m.x >> 8;
         let q_span = seed.q_span as usize;
         let q_pos = ((m.y as u32) >> 1) as usize;
         let tandem = seed.is_tandem;
 
-        if let Some(hits) = mi.get(hash) {
-            for &(_, r_packed) in hits {
+        {
+            let hits = mi.get_by_range(seed.entry_range);
+            for &r_packed in hits {
                 // skip_seed logic
                 let mut is_self = false;
                 if let Some(qn) = qname && !skip_flags.is_empty() {
@@ -400,17 +408,16 @@ pub fn collect_seed_hits_heap(
 
     anchors.resize(n_a, Minimizer { x: 0, y: 0 });
 
-    // Cache hit slices for each matched seed (equivalent to mm_seed_t.cr pointers)
-    let hit_slices: Vec<Option<&[(u64, u64)]>> = matched_seeds.iter().map(|seed| {
-        let hash = q_minimizers[seed.mi_idx].x >> 8;
-        mi.get(hash)
+    // Retrieve hit slices directly from cached entry ranges (no binary search).
+    let hit_slices: Vec<&[u64]> = matched_seeds.iter().map(|seed| {
+        mi.get_by_range(seed.entry_range)
     }).collect();
 
     // Initialize heap: (r_packed, seed_idx << 32 | hit_counter)
     let mut heap: Vec<(u64, u64)> = Vec::with_capacity(matched_seeds.len());
-    for (i, hits) in hit_slices.iter().enumerate() {
-        if let Some(h) = hits && !h.is_empty() {
-            heap.push((h[0].1, (i as u64) << 32)); // h[0].1 = r_packed
+    for (i, h) in hit_slices.iter().enumerate() {
+        if !h.is_empty() {
+            heap.push((h[0], (i as u64) << 32)); // h[0] = r_packed
         }
     }
     anchor_heap_make(&mut heap);
@@ -481,10 +488,10 @@ pub fn collect_seed_hits_heap(
         }
 
         // Update heap: advance to next hit or remove seed
-        let hits = hit_slices[seed_idx].unwrap();
+        let hits = hit_slices[seed_idx];
         let hs = heap.len();
         if hit_idx < hits.len() - 1 {
-            let next_r = hits[hit_idx + 1].1;
+            let next_r = hits[hit_idx + 1];
             heap[0] = (next_r, ((seed_idx as u64) << 32) | ((hit_idx + 1) as u64));
         } else {
             heap[0] = heap[hs - 1];

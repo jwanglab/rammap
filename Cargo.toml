@@ -13,6 +13,7 @@ cli = ["clap", "env_logger"]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 bitflags = "2"
+rustc-hash = "2"
 byteorder = "1"
 
 # Parallelism

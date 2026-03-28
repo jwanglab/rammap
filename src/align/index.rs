@@ -4,6 +4,7 @@ use crate::align::sort::radix_sort_pair;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{self, BufWriter, BufReader, Read, Write, Seek, SeekFrom};
 
 /// Read a Vec<u32> from a binary stream (little-endian, safe).
@@ -46,15 +47,14 @@ pub struct Index {
     pub homopolymer_compressed: bool,
     pub index: usize, // part number (0-based)
     pub seqs: Vec<TargetSequence>,
-    pub entries: Vec<(u64, u64)>, // Sorted by hash
+    /// Hash table: minimizer_hash -> (offset_into_positions << 32) | count
+    pub lookup: HashMap<u64, u64>,
+    /// Flat position array for all minimizers (r_packed values, 8 bytes each)
+    pub positions: Vec<u64>,
     /// Packed 4-bit reference sequences (8 bases per u32, minimap2 encoding).
     /// Kept at runtime for on-demand per-region nt4 extraction (~375 MB for GRCh38).
     #[serde(default)]
     pub packed_seqs: Vec<u32>,
-    #[serde(skip)]
-    bucket_offsets: Vec<u32>, // bucket_offsets[i] = start index for bucket i; len = n_buckets + 1
-    #[serde(skip)]
-    bucket_shift: u32, // hash >> bucket_shift = bucket index
 }
 
 impl Index {
@@ -170,7 +170,7 @@ impl Index {
             Err(e) => return Err(e),
         }
 
-        let mut idx: Self = if &magic == RMMI_MAGIC {
+        let idx: Self = if &magic == RMMI_MAGIC {
             // rammap format: magic already consumed, deserialize the rest
             bincode::deserialize_from(reader)
                 .map_err(io::Error::other)?
@@ -183,7 +183,6 @@ impl Index {
             bincode::deserialize_from(reader)
                 .map_err(io::Error::other)?
         };
-        idx.build_hash_lut();
         Ok(Some(idx))
     }
 
@@ -233,12 +232,12 @@ impl Index {
             sum_len += len as u64;
         }
 
-        // Read per-bucket hash tables and build flat entries
+        // Read per-bucket hash tables and build lookup + positions directly
         let t_hash = Instant::now();
         let n_buckets = 1usize << b;
-        // Pre-allocate: estimate ~1 minimizer per w bases
         let estimated_entries = (sum_len as usize) / w.max(1);
-        let mut entries: Vec<(u64, u64)> = Vec::with_capacity(estimated_entries);
+        let mut lookup: HashMap<u64, u64> = HashMap::with_capacity_and_hasher(estimated_entries / 6 + 1, Default::default());
+        let mut positions: Vec<u64> = Vec::with_capacity(estimated_entries);
 
         for bucket_idx in 0..n_buckets {
             // Read n (i32) — size of positions array
@@ -263,33 +262,26 @@ impl Index {
                 let key = hash_buf[i * 2];
                 let value = hash_buf[i * 2 + 1];
 
-                // Reconstruct full minimizer hash:
-                // key = (minimizer >> b) << 1, with LSB = singleton flag
-                // full_hash = (key >> 1) << b | bucket_idx
                 let full_hash = (key >> 1) << b | bucket_idx as u64;
 
                 if key & 1 != 0 {
                     // Singleton: value is the direct position
-                    entries.push((full_hash, value));
+                    let offset = positions.len() as u64;
+                    positions.push(value);
+                    lookup.insert(full_hash, (offset << 32) | 1);
                 } else {
                     // Multi-occurrence: value = (offset_in_p << 32) | count
                     let count = (value & 0xFFFFFFFF) as usize;
                     let start = (value >> 32) as usize;
+                    let offset = positions.len() as u64;
                     for j in 0..count {
-                        entries.push((full_hash, p[start + j]));
+                        positions.push(p[start + j]);
                     }
+                    lookup.insert(full_hash, (offset << 32) | count as u64);
                 }
             }
         }
-        let hash_elapsed = t_hash.elapsed();
-
-        // Sort entries by (hash, position) — matches our internal format
-        let t_sort = Instant::now();
-        #[cfg(feature = "parallel")]
-        entries.par_sort_unstable();
-        #[cfg(not(feature = "parallel"))]
-        radix_sort_pair(&mut entries);
-        let sort_elapsed = t_sort.elapsed();
+        let _hash_elapsed = t_hash.elapsed();
 
         // Read packed 4-bit sequences if present — keep in packed format
         let packed_seqs = if !no_seq {
@@ -299,24 +291,21 @@ impl Index {
             Vec::new()
         };
 
-        let n_entries = entries.len();
-        let mut idx = Index {
+        let n_entries = positions.len();
+        let idx = Index {
             kmer_size: k,
             window_size: w,
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs,
-            entries,
+            lookup,
+            positions,
             packed_seqs,
-            bucket_offsets: Vec::new(),
-            bucket_shift: 0,
         };
-        idx.build_hash_lut();
 
-        eprintln!("[*] Index loaded: {}M entries, {}M bases in {:.1}s (hash {:.1}s, sort {:.1}s)",
-            n_entries / 1_000_000, sum_len / 1_000_000,
-            t_total.elapsed().as_secs_f64(),
-            hash_elapsed.as_secs_f64(), sort_elapsed.as_secs_f64());
+        eprintln!("[*] Index loaded: {}M positions, {}M unique hashes, {}M bases in {:.1}s",
+            n_entries / 1_000_000, idx.lookup.len() / 1_000_000, sum_len / 1_000_000,
+            t_total.elapsed().as_secs_f64());
         Ok(Some(idx))
     }
 
@@ -329,10 +318,9 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs,
-            entries: Vec::new(),
+            lookup: HashMap::default(),
+            positions: Vec::new(),
             packed_seqs: Vec::new(),
-            bucket_offsets: Vec::new(),
-            bucket_shift: 0,
         }
     }
 
@@ -343,10 +331,9 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs: Vec::new(),
-            entries: Vec::new(),
+            lookup: HashMap::default(),
+            positions: Vec::new(),
             packed_seqs: Vec::new(),
-            bucket_offsets: Vec::new(),
-            bucket_shift: 0,
         }
     }
 
@@ -368,10 +355,9 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs: Vec::new(),
-            entries: Vec::new(),
+            lookup: HashMap::default(),
+            positions: Vec::new(),
             packed_seqs: Vec::new(),
-            bucket_offsets: Vec::new(),
-            bucket_shift: 0,
         };
 
         let mut offset = 0usize;
@@ -508,72 +494,63 @@ impl Index {
             temp_entries.truncate(keep_idx);
         }
         
-        idx.entries = temp_entries;
-        idx.build_hash_lut();
+        // Build lookup HashMap and compact positions in-place within temp_entries.
+        // positions[k] (8 bytes at offset k*8) only overlaps temp_entries[k/2],
+        // which we've already fully read, so in-place compaction is safe.
+        let n_entries = temp_entries.len();
+        let mut lookup: HashMap<u64, u64> = HashMap::with_capacity_and_hasher(n_entries / 6 + 1, Default::default());
+        let entries_ptr = temp_entries.as_mut_ptr() as *mut u64;
+        let mut pos_idx: usize = 0;
+        let mut i = 0;
+        while i < n_entries {
+            let h = temp_entries[i].0;
+            let offset = pos_idx as u64;
+            let start = i;
+            while i < n_entries && temp_entries[i].0 == h {
+                // Safety: positions[pos_idx] at byte pos_idx*8 overlaps temp_entries[pos_idx/2]
+                // which has already been read (pos_idx == i, so pos_idx/2 < i for i >= 2).
+                // For i=0,1: we read .0 and .1 before writing.
+                unsafe { entries_ptr.add(pos_idx).write(temp_entries[i].1); }
+                pos_idx += 1;
+                i += 1;
+            }
+            lookup.insert(h, (offset << 32) | (i - start) as u64);
+        }
+        // Reinterpret Vec<(u64,u64)> as Vec<u64> using the same allocation
+        let cap_u64 = temp_entries.capacity() * 2;
+        let ptr = temp_entries.as_mut_ptr() as *mut u64;
+        std::mem::forget(temp_entries);
+        let mut positions = unsafe { Vec::from_raw_parts(ptr, pos_idx, cap_u64) };
+        positions.shrink_to_fit();
+
+        idx.lookup = lookup;
+        idx.positions = positions;
 
         idx
     }
 
-    /// Build bucket offset table from sorted entries for O(1) bucket + binary search lookup.
-    ///
-    /// Uses top bits of hash for bucket selection. Since entries are sorted by hash,
-    /// all entries in bucket i come before bucket i+1, enabling a simple offset table.
-    /// Build: O(n) sequential scan. Lookup: O(1) + O(log bucket_size).
-    fn build_hash_lut(&mut self) {
-        if self.entries.is_empty() {
-            self.bucket_offsets = vec![0; 2];
-            self.bucket_shift = 0;
-            return;
-        }
-
-        // Determine hash bit width from k, then pick bucket count
-        let hash_bits = (2 * self.kmer_size) as u32;
-        let bucket_bits = 18u32.min(hash_bits); // 2^18 = 256K buckets
-        let shift = hash_bits.saturating_sub(bucket_bits);
-        let n_buckets = 1usize << bucket_bits;
-
-        let mut offsets = vec![0u32; n_buckets + 1];
-
-        // Count entries per bucket
-        for &(hash, _) in &self.entries {
-            let bucket = (hash >> shift) as usize;
-            // Safety: bucket < n_buckets since hash < 2^hash_bits and shift = hash_bits - bucket_bits
-            offsets[bucket] += 1;
-        }
-
-        // Prefix sum: offsets[i] = start of bucket i
-        let mut acc = 0u32;
-        for offset in &mut offsets[..n_buckets] {
-            let count = *offset;
-            *offset = acc;
-            acc += count;
-        }
-        offsets[n_buckets] = acc;
-
-        self.bucket_offsets = offsets;
-        self.bucket_shift = shift;
+    pub fn get(&self, hash: u64) -> Option<&[u64]> {
+        let &encoded = self.lookup.get(&hash)?;
+        let offset = (encoded >> 32) as usize;
+        let count = (encoded & 0xFFFFFFFF) as usize;
+        Some(&self.positions[offset..offset + count])
     }
 
-    pub fn get(&self, hash: u64) -> Option<&[(u64, u64)]> {
-        if self.bucket_offsets.len() < 2 { return None; }
+    /// Returns the (start, end) range into `self.positions` for a given hash,
+    /// so the caller can later retrieve the slice with `get_by_range` without
+    /// redoing the hash table lookup.
+    #[inline]
+    pub fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
+        let &encoded = self.lookup.get(&hash)?;
+        let offset = (encoded >> 32) as u32;
+        let count = (encoded & 0xFFFFFFFF) as u32;
+        Some((offset, offset + count))
+    }
 
-        let bucket = (hash >> self.bucket_shift) as usize;
-        if bucket + 1 >= self.bucket_offsets.len() { return None; }
-
-        let start = self.bucket_offsets[bucket] as usize;
-        let end = self.bucket_offsets[bucket + 1] as usize;
-        if start >= end { return None; }
-
-        let slice = &self.entries[start..end];
-
-        // Binary search within bucket for first entry with this hash
-        let first = slice.partition_point(|e| e.0 < hash);
-        if first >= slice.len() || slice[first].0 != hash { return None; }
-
-        // Find end of group (entries with same hash are contiguous)
-        let last = first + slice[first..].partition_point(|e| e.0 == hash);
-
-        Some(&slice[first..last])
+    /// Retrieve a slice of positions from a previously computed range.
+    #[inline]
+    pub fn get_by_range(&self, range: (u32, u32)) -> &[u64] {
+        &self.positions[range.0 as usize..range.1 as usize]
     }
 
     /// Calculate mid_occ threshold to filter top `frac` fraction of repetitive minimizers.
@@ -581,17 +558,12 @@ impl Index {
     pub fn cal_mid_occ(&self, frac: f32, min_mid_occ: i32, max_mid_occ: i32) -> usize {
         let min_mid = min_mid_occ.max(1) as usize;
         if frac <= 0.0 { return usize::MAX; }
-        if self.entries.is_empty() { return min_mid; }
+        if self.lookup.is_empty() { return min_mid; }
 
-        // Count occurrences per unique hash by scanning sorted entries
-        let mut counts: Vec<u32> = Vec::new();
-        let mut i = 0;
-        while i < self.entries.len() {
-            let h = self.entries[i].0;
-            let start = i;
-            while i < self.entries.len() && self.entries[i].0 == h { i += 1; }
-            counts.push((i - start) as u32);
-        }
+        // Extract counts directly from lookup values
+        let mut counts: Vec<u32> = self.lookup.values()
+            .map(|&encoded| (encoded & 0xFFFFFFFF) as u32)
+            .collect();
 
         let n = counts.len();
         if n == 0 { return min_mid; }
@@ -625,7 +597,7 @@ mod tests {
         let hash = 86616326159 >> 8;
         let positions = idx.get(hash);
         assert!(positions.is_some());
-        assert_eq!(positions.unwrap()[0].1, 624);
+        assert_eq!(positions.unwrap()[0], 624);
         assert_eq!(idx.seqs.len(), 1);
     }
     #[test]

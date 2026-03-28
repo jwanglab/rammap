@@ -1095,6 +1095,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         eprintln!("  Reads: {}, Seeds: {}, Anchors: {}, Chains: {}",
             total_stats.n_reads, total_stats.n_seeds, total_stats.n_anchors, total_stats.n_chains);
         eprintln!("---------------------------");
+        rammap::align::map::print_post_chain_breakdown();
     }
 
     Ok(())

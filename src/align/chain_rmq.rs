@@ -21,181 +21,424 @@ use crate::align::map::{ChainingParams, ChainingBuffers};
 
 const NIL: u32 = u32::MAX;
 
-/// Arena-based treap with augmented subtree-min priority.
-/// Gives O(log n) expected for insert, erase, and range-minimum query.
-/// Augmented red-black tree with range-minimum query support.
+/// Arena-based AVL tree with subtree-min augmentation for O(log n) RMQ.
+/// Replaces the previous treap with iterative insert/erase and compact nodes.
 struct RmqTree {
-    nodes: Vec<TreapNode>,
+    nodes: Vec<AvlNode>,
     root: u32,
     size: usize,
-    rng: u64, // xorshift64 state
+    free_head: u32, // free list for node reuse
 }
 
-#[derive(Clone)]
-struct TreapNode {
-    key_y: i32,
-    key_i: usize,
-    pri: f64,       // node's priority (negative score, lower = better)
-    sub_min: f64,   // minimum pri in subtree rooted at this node
-    heap: u32,      // random heap priority for treap balancing
+#[derive(Clone, Copy)]
+struct AvlNode {
+    pri: f64,           // negative DP score (RMQ value to minimize)
+    key_y: i32,         // query position (sort key)
+    key_i: u32,         // anchor index (tiebreak key)
     left: u32,
     right: u32,
+    parent: u32,
+    sub_min_idx: u32,   // arena index of node with min pri in subtree
+    balance: i8,        // AVL balance factor: -1, 0, +1
 }
 
 impl RmqTree {
     fn new() -> Self {
-        RmqTree {
-            nodes: Vec::with_capacity(256),
-            root: NIL,
-            size: 0,
-            rng: 0x12345678_9abcdef0,
+        RmqTree { nodes: Vec::with_capacity(256), root: NIL, size: 0, free_head: NIL }
+    }
+
+    #[inline]
+    fn len(&self) -> usize { self.size }
+
+    #[inline(always)]
+    fn key_lt(ay: i32, ai: u32, by: i32, bi: u32) -> bool {
+        ay < by || (ay == by && ai < bi)
+    }
+
+    fn alloc_node(&mut self, key_y: i32, key_i: u32, pri: f64) -> u32 {
+        let idx;
+        if self.free_head != NIL {
+            idx = self.free_head;
+            self.free_head = self.nodes[idx as usize].right; // free list uses right pointer
+            self.nodes[idx as usize] = AvlNode {
+                pri, key_y, key_i, left: NIL, right: NIL, parent: NIL,
+                sub_min_idx: idx, balance: 0,
+            };
+        } else {
+            idx = self.nodes.len() as u32;
+            self.nodes.push(AvlNode {
+                pri, key_y, key_i, left: NIL, right: NIL, parent: NIL,
+                sub_min_idx: idx, balance: 0,
+            });
         }
+        idx
+    }
+
+    fn free_node(&mut self, idx: u32) {
+        self.nodes[idx as usize].right = self.free_head;
+        self.free_head = idx;
     }
 
     #[inline]
-    fn xorshift(&mut self) -> u32 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        x as u32
-    }
-
-    #[inline]
-    fn update_min(&mut self, idx: u32) {
-        if idx == NIL { return; }
+    fn update_sub_min(&mut self, idx: u32) {
         let i = idx as usize;
-        let mut m = self.nodes[i].pri;
+        let mut best = idx;
         let l = self.nodes[i].left;
         let r = self.nodes[i].right;
-        if l != NIL && self.nodes[l as usize].sub_min < m {
-            m = self.nodes[l as usize].sub_min;
+        if l != NIL && self.nodes[self.nodes[l as usize].sub_min_idx as usize].pri < self.nodes[best as usize].pri {
+            best = self.nodes[l as usize].sub_min_idx;
         }
-        if r != NIL && self.nodes[r as usize].sub_min < m {
-            m = self.nodes[r as usize].sub_min;
+        if r != NIL && self.nodes[self.nodes[r as usize].sub_min_idx as usize].pri < self.nodes[best as usize].pri {
+            best = self.nodes[r as usize].sub_min_idx;
         }
-        self.nodes[i].sub_min = m;
+        self.nodes[i].sub_min_idx = best;
     }
 
-    /// Split tree rooted at `t` into (< key, >= key). Returns (left_root, right_root).
-    fn split(&mut self, t: u32, key_y: i32, key_i: usize) -> (u32, u32) {
-        if t == NIL { return (NIL, NIL); }
-        let ti = t as usize;
-        if (self.nodes[ti].key_y, self.nodes[ti].key_i) < (key_y, key_i) {
-            let r = self.nodes[ti].right;
-            let (lr, rr) = self.split(r, key_y, key_i);
-            self.nodes[ti].right = lr;
-            self.update_min(t);
-            (t, rr)
-        } else {
-            let l = self.nodes[ti].left;
-            let (ll, rl) = self.split(l, key_y, key_i);
-            self.nodes[ti].left = rl;
-            self.update_min(t);
-            (ll, t)
-        }
+    /// Set child[dir] of p to c, updating parent pointer.
+    #[inline]
+    fn set_child(&mut self, p: u32, dir: usize, c: u32) {
+        if dir == 0 { self.nodes[p as usize].left = c; }
+        else { self.nodes[p as usize].right = c; }
+        if c != NIL { self.nodes[c as usize].parent = p; }
     }
 
-    /// Merge two trees where all keys in `l` < all keys in `r`.
-    fn merge(&mut self, l: u32, r: u32) -> u32 {
-        if l == NIL { return r; }
-        if r == NIL { return l; }
-        if self.nodes[l as usize].heap > self.nodes[r as usize].heap {
-            let lr = self.nodes[l as usize].right;
-            self.nodes[l as usize].right = self.merge(lr, r);
-            self.update_min(l);
-            l
-        } else {
-            let rl = self.nodes[r as usize].left;
-            self.nodes[r as usize].left = self.merge(l, rl);
-            self.update_min(r);
-            r
+    #[inline]
+    fn child(&self, idx: u32, dir: usize) -> u32 {
+        if dir == 0 { self.nodes[idx as usize].left } else { self.nodes[idx as usize].right }
+    }
+
+    /// Single rotation: rotate node x up over its parent p.
+    /// dir=0: left rotation (x is right child of p), dir=1: right rotation.
+    fn rotate(&mut self, p: u32, dir: usize) -> u32 {
+        let x = self.child(p, 1 - dir);
+        let mid = self.child(x, dir);
+        let gp = self.nodes[p as usize].parent;
+        // x takes p's place under gp
+        self.set_child(x, dir, p);
+        self.set_child(p, 1 - dir, mid);
+        self.nodes[x as usize].parent = gp;
+        if gp != NIL {
+            if self.nodes[gp as usize].left == p { self.nodes[gp as usize].left = x; }
+            else { self.nodes[gp as usize].right = x; }
         }
+        self.update_sub_min(p);
+        self.update_sub_min(x);
+        x
     }
 
     fn insert_elem(&mut self, y: i32, i: usize, pri: f64) {
-        let heap = self.xorshift();
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(TreapNode {
-            key_y: y, key_i: i, pri, sub_min: pri,
-            heap, left: NIL, right: NIL,
-        });
-        let (l, r) = self.split(self.root, y, i);
-        let m = self.merge(l, idx);
-        self.root = self.merge(m, r);
+        let key_i = i as u32;
+        let new_idx = self.alloc_node(y, key_i, pri);
         self.size += 1;
+
+        if self.root == NIL {
+            self.root = new_idx;
+            return;
+        }
+
+        // BST insert
+        let mut cur = self.root;
+        loop {
+            let n = &self.nodes[cur as usize];
+            let go_left = Self::key_lt(y, key_i, n.key_y, n.key_i);
+            let next = if go_left { n.left } else { n.right };
+            if next == NIL {
+                self.set_child(cur, if go_left { 0 } else { 1 }, new_idx);
+                break;
+            }
+            cur = next;
+        }
+
+        // Walk up: update sub_min and fix balance
+        self.update_sub_min(new_idx);
+        let mut child = new_idx;
+        let mut p = self.nodes[child as usize].parent;
+        while p != NIL {
+            self.update_sub_min(p);
+            let pn = &self.nodes[p as usize];
+            let dir = if pn.left == child { 0usize } else { 1 };
+            let old_balance = pn.balance;
+            let new_balance = if dir == 0 { old_balance - 1 } else { old_balance + 1 };
+            self.nodes[p as usize].balance = new_balance;
+
+            if new_balance == 0 {
+                break; // height didn't change
+            } else if new_balance == -2 || new_balance == 2 {
+                // Rebalance
+                let heavy_dir = if new_balance > 0 { 1usize } else { 0 };
+                let heavy_child = self.child(p, heavy_dir);
+                let hb = self.nodes[heavy_child as usize].balance;
+                if (heavy_dir == 1 && hb >= 0) || (heavy_dir == 0 && hb <= 0) {
+                    // Single rotation
+                    let opposite = 1 - heavy_dir;
+                    let new_root = self.rotate(p, opposite);
+                    self.nodes[p as usize].balance = if hb == 0 { if heavy_dir == 1 { 1 } else { -1 } } else { 0 };
+                    self.nodes[new_root as usize].balance = if hb == 0 { if heavy_dir == 1 { -1 } else { 1 } } else { 0 };
+                    if self.root == p { self.root = new_root; }
+                } else {
+                    // Double rotation
+                    let opposite = 1 - heavy_dir;
+                    let inner = self.child(heavy_child, opposite);
+                    let inner_bal = self.nodes[inner as usize].balance;
+                    self.rotate(heavy_child, heavy_dir);
+                    let new_root = self.rotate(p, opposite);
+                    // Set balance factors based on inner node's old balance
+                    self.nodes[p as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
+                        if heavy_dir == 1 { -1 } else { 1 }
+                    } else { 0 };
+                    self.nodes[heavy_child as usize].balance = if (heavy_dir == 1 && inner_bal < 0) || (heavy_dir == 0 && inner_bal > 0) {
+                        if heavy_dir == 1 { 1 } else { -1 }
+                    } else { 0 };
+                    self.nodes[new_root as usize].balance = 0;
+                    if self.root == p { self.root = new_root; }
+                }
+                break; // AVL insert: at most one rotation needed, then done
+            } else {
+                // |balance| == 1, tree grew taller, continue up
+                child = p;
+                p = self.nodes[p as usize].parent;
+            }
+        }
+        // Continue updating sub_min for remaining ancestors
+        while p != NIL {
+            self.update_sub_min(p);
+            p = self.nodes[p as usize].parent;
+        }
     }
 
     fn erase(&mut self, y: i32, i: usize) -> bool {
+        let key_i = i as u32;
+        // Find the node
+        let mut cur = self.root;
+        while cur != NIL {
+            let n = &self.nodes[cur as usize];
+            if n.key_y == y && n.key_i == key_i { break; }
+            cur = if Self::key_lt(y, key_i, n.key_y, n.key_i) { n.left } else { n.right };
+        }
+        if cur == NIL { return false; }
+
         self.size -= 1;
-        self.root = self.erase_impl(self.root, y, i);
+
+        // If two children, copy in-order successor's data and delete the successor instead
+        let victim = cur;
+        if self.nodes[cur as usize].left != NIL && self.nodes[cur as usize].right != NIL {
+            let mut succ = self.nodes[cur as usize].right;
+            while self.nodes[succ as usize].left != NIL {
+                succ = self.nodes[succ as usize].left;
+            }
+            self.nodes[cur as usize].key_y = self.nodes[succ as usize].key_y;
+            self.nodes[cur as usize].key_i = self.nodes[succ as usize].key_i;
+            self.nodes[cur as usize].pri = self.nodes[succ as usize].pri;
+            cur = succ;
+        }
+
+        // cur has at most one child. Record which side of parent it was on BEFORE splicing.
+        let par = self.nodes[cur as usize].parent;
+        let del_was_left = par != NIL && self.nodes[par as usize].left == cur;
+
+        let child = if self.nodes[cur as usize].left != NIL {
+            self.nodes[cur as usize].left
+        } else {
+            self.nodes[cur as usize].right
+        };
+
+        // Splice out cur
+        if child != NIL { self.nodes[child as usize].parent = par; }
+        if par == NIL {
+            self.root = child;
+        } else if del_was_left {
+            self.nodes[par as usize].left = child;
+        } else {
+            self.nodes[par as usize].right = child;
+        }
+
+        self.free_node(cur);
+
+        // Walk up from par rebalancing. Track which side shrunk.
+        let mut p = par;
+        let mut shrunk_left = del_was_left;
+        while p != NIL {
+            self.update_sub_min(p);
+            let old_balance = self.nodes[p as usize].balance;
+            // Adjust balance: left shrunk → balance increases; right shrunk → decreases
+            let new_balance = if shrunk_left { old_balance + 1 } else { old_balance - 1 };
+            self.nodes[p as usize].balance = new_balance;
+
+            if new_balance == 1 || new_balance == -1 {
+                // Height didn't change (was 0, now ±1), stop propagating
+                break;
+            } else if new_balance == 0 {
+                // Height decreased, continue propagating up
+                let pp = self.nodes[p as usize].parent;
+                if pp != NIL {
+                    shrunk_left = self.nodes[pp as usize].left == p;
+                }
+                p = pp;
+            } else {
+                // |new_balance| == 2, need rotation
+                let heavy_dir = if new_balance > 0 { 1usize } else { 0 };
+                let heavy_child = self.child(p, heavy_dir);
+                let hb = self.nodes[heavy_child as usize].balance;
+                let opposite = 1 - heavy_dir;
+
+                if (heavy_dir == 1 && hb >= 0) || (heavy_dir == 0 && hb <= 0) {
+                    // Single rotation
+                    let new_root = self.rotate(p, opposite);
+                    if hb == 0 {
+                        // Height didn't change after rotation
+                        self.nodes[p as usize].balance = if heavy_dir == 1 { 1 } else { -1 };
+                        self.nodes[new_root as usize].balance = if heavy_dir == 1 { -1 } else { 1 };
+                        if self.root == p { self.root = new_root; }
+                        break; // height unchanged, stop
+                    } else {
+                        self.nodes[p as usize].balance = 0;
+                        self.nodes[new_root as usize].balance = 0;
+                        if self.root == p { self.root = new_root; }
+                        // Height decreased, continue propagating
+                        let pp = self.nodes[new_root as usize].parent;
+                        if pp != NIL {
+                            shrunk_left = self.nodes[pp as usize].left == new_root;
+                        }
+                        p = pp;
+                    }
+                } else {
+                    // Double rotation
+                    let inner = self.child(heavy_child, opposite);
+                    let inner_bal = self.nodes[inner as usize].balance;
+                    self.rotate(heavy_child, heavy_dir);
+                    let new_root = self.rotate(p, opposite);
+                    self.nodes[p as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
+                        if heavy_dir == 1 { -1 } else { 1 }
+                    } else { 0 };
+                    self.nodes[heavy_child as usize].balance = if (heavy_dir == 1 && inner_bal < 0) || (heavy_dir == 0 && inner_bal > 0) {
+                        if heavy_dir == 1 { 1 } else { -1 }
+                    } else { 0 };
+                    self.nodes[new_root as usize].balance = 0;
+                    if self.root == p { self.root = new_root; }
+                    // Height decreased, continue propagating
+                    let pp = self.nodes[new_root as usize].parent;
+                    if pp != NIL {
+                        shrunk_left = self.nodes[pp as usize].left == new_root;
+                    }
+                    p = pp;
+                }
+            }
+        }
+        // Continue updating sub_min for remaining ancestors
+        while p != NIL {
+            self.update_sub_min(p);
+            p = self.nodes[p as usize].parent;
+        }
+        // Update sub_min from victim (whose key/pri was overwritten) up to root
+        if victim != cur {
+            let mut v = victim;
+            while v != NIL {
+                self.update_sub_min(v);
+                v = self.nodes[v as usize].parent;
+            }
+        }
         true
     }
 
-    fn erase_impl(&mut self, t: u32, y: i32, i: usize) -> u32 {
-        if t == NIL { self.size += 1; return NIL; } // not found, undo size decrement
-        let ti = t as usize;
-        let k = (self.nodes[ti].key_y, self.nodes[ti].key_i);
-        if k == (y, i) {
-            let l = self.nodes[ti].left;
-            let r = self.nodes[ti].right;
-            return self.merge(l, r);
-        }
-        if (y, i) < k {
-            let l = self.nodes[ti].left;
-            self.nodes[ti].left = self.erase_impl(l, y, i);
-        } else {
-            let r = self.nodes[ti].right;
-            self.nodes[ti].right = self.erase_impl(r, y, i);
-        }
-        self.update_min(t);
-        t
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.size
-    }
-
-    /// Range minimum query: O(log n) using subtree-min augmentation.
-    /// Finds element with minimum priority in the range
-    /// y > lo_y (exclusive), y < hi_y (all), y == hi_y only if i == 0.
+    /// Two-path LCA range minimum query (port of krmq.h __KRMQ_RMQ).
+    /// Finds element with minimum pri in CLOSED interval [lo, hi] where
+    /// lo = (lo_y, u32::MAX) and hi = (hi_y, 0).
+    /// This means: y > lo_y (exclusive lower), y < hi_y (all), y == hi_y only if i == 0.
     fn rmq(&self, lo_y: i32, hi_y: i32) -> Option<(i32, usize, f64)> {
-        let mut best_pri = f64::MAX;
-        let mut best: Option<(i32, usize, f64)> = None;
-        self.rmq_impl(self.root, lo_y, hi_y, &mut best_pri, &mut best);
-        best
+        if self.root == NIL { return None; }
+
+        // Key comparison: (y, i) ordering. lo = (lo_y, MAX), hi = (hi_y, 0).
+        let lo_key = (lo_y, u32::MAX);
+        let hi_key = (hi_y, 0u32);
+
+        // Trace path from root to lo bound
+        let mut path_lo: [(u32, i8); 64] = [(NIL, 0); 64]; // (node, cmp result)
+        let mut len_lo = 0usize;
+        let mut p = self.root;
+        while p != NIL {
+            let n = &self.nodes[p as usize];
+            let nk = (n.key_y, n.key_i);
+            let cmp = if lo_key < nk { -1i8 } else if lo_key > nk { 1 } else { 0 };
+            path_lo[len_lo] = (p, cmp);
+            len_lo += 1;
+            if cmp < 0 { p = n.left; }
+            else if cmp > 0 { p = n.right; }
+            else { break; }
+        }
+
+        // Trace path from root to hi bound
+        let mut path_hi: [(u32, i8); 64] = [(NIL, 0); 64];
+        let mut len_hi = 0usize;
+        p = self.root;
+        while p != NIL {
+            let n = &self.nodes[p as usize];
+            let nk = (n.key_y, n.key_i);
+            let cmp = if hi_key < nk { -1i8 } else if hi_key > nk { 1 } else { 0 };
+            path_hi[len_hi] = (p, cmp);
+            len_hi += 1;
+            if cmp < 0 { p = n.left; }
+            else if cmp > 0 { p = n.right; }
+            else { break; }
+        }
+
+        // Find LCA: first shared node where lo goes left/equal and hi goes right/equal
+        let mut lca = 0usize;
+        let mut found_lca = false;
+        for i in 0..len_lo.min(len_hi) {
+            if path_lo[i].0 == path_hi[i].0 && path_lo[i].1 <= 0 && path_hi[i].1 >= 0 {
+                lca = i;
+                found_lca = true;
+                break;
+            }
+            if path_lo[i].0 != path_hi[i].0 { break; }
+        }
+        if !found_lca { return None; }
+
+        let mut min_idx = path_lo[lca].0; // start with LCA node
+
+        // Scan lo-path below LCA: nodes where we went left/equal are in range.
+        // Their right subtrees are fully in range.
+        for i in (lca + 1)..len_lo {
+            let (node, cmp) = path_lo[i];
+            if cmp <= 0 {
+                // This node is in range (>= lo)
+                if self.nodes[node as usize].pri < self.nodes[min_idx as usize].pri {
+                    min_idx = node;
+                }
+                // Its right subtree is fully in range
+                let rc = self.nodes[node as usize].right;
+                if rc != NIL {
+                    let rc_min = self.nodes[rc as usize].sub_min_idx;
+                    if self.nodes[rc_min as usize].pri < self.nodes[min_idx as usize].pri {
+                        min_idx = rc_min;
+                    }
+                }
+            }
+        }
+
+        // Scan hi-path below LCA: nodes where we went right/equal are in range.
+        // Their left subtrees are fully in range.
+        for i in (lca + 1)..len_hi {
+            let (node, cmp) = path_hi[i];
+            if cmp >= 0 {
+                if self.nodes[node as usize].pri < self.nodes[min_idx as usize].pri {
+                    min_idx = node;
+                }
+                let lc = self.nodes[node as usize].left;
+                if lc != NIL {
+                    let lc_min = self.nodes[lc as usize].sub_min_idx;
+                    if self.nodes[lc_min as usize].pri < self.nodes[min_idx as usize].pri {
+                        min_idx = lc_min;
+                    }
+                }
+            }
+        }
+
+        let n = &self.nodes[min_idx as usize];
+        Some((n.key_y, n.key_i as usize, n.pri))
     }
 
-    fn rmq_impl(&self, t: u32, lo_y: i32, hi_y: i32, best_pri: &mut f64, best: &mut Option<(i32, usize, f64)>) {
-        if t == NIL { return; }
-        let ti = t as usize;
-        // Prune: if subtree's min priority can't beat current best, skip
-        if self.nodes[ti].sub_min >= *best_pri { return; }
-
-        let ky = self.nodes[ti].key_y;
-        let ki = self.nodes[ti].key_i;
-
-        // Check if this node is in range: y > lo_y, and (y < hi_y || (y == hi_y && i == 0))
-        let in_range = ky > lo_y && (ky < hi_y || (ky == hi_y && ki == 0));
-        if in_range && self.nodes[ti].pri < *best_pri {
-            *best_pri = self.nodes[ti].pri;
-            *best = Some((ky, ki, self.nodes[ti].pri));
-        }
-
-        // Search left subtree if it could contain in-range elements
-        if ky > lo_y {
-            self.rmq_impl(self.nodes[ti].left, lo_y, hi_y, best_pri, best);
-        }
-        // Search right subtree if it could contain in-range elements
-        if ky < hi_y || (ky == hi_y && ki == 0) {
-            self.rmq_impl(self.nodes[ti].right, lo_y, hi_y, best_pri, best);
-        }
-    }
-
-    /// Create a reverse in-order iterator over elements with key_y <= start_y.
-    /// Yields elements in descending (key_y, key_i) order. O(log n) init, O(1) per step.
+    /// Reverse in-order iterator over elements with key_y <= start_y.
     fn iter_rev_le(&self, start_y: i32) -> RmqRevIter<'_> {
         let mut stack = Vec::with_capacity(32);
         let mut t = self.root;
@@ -224,8 +467,7 @@ impl<'a> Iterator for RmqRevIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let t = self.stack.pop()?;
         let node = &self.tree.nodes[t as usize];
-        let result = (node.key_y, node.key_i, node.pri);
-        // Explore left subtree: push rightmost path (all < current, hence in range)
+        let result = (node.key_y, node.key_i as usize, node.pri);
         let mut child = node.left;
         while child != NIL {
             self.stack.push(child);

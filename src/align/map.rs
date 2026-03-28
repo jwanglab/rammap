@@ -8,6 +8,26 @@
 //! a `Mapping` (reference coordinates, score, strand, and anchor list).
 
 use bitflags::bitflags;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+// Sub-timers for post-chain breakdown (nanoseconds, summed across threads)
+static PC_RESCUE_NS: AtomicU64 = AtomicU64::new(0);
+static PC_RESCUE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PC_RESCUE_ANCHORS: AtomicU64 = AtomicU64::new(0);
+static PC_BUILD_REGS_NS: AtomicU64 = AtomicU64::new(0);
+static PC_PARENT_NS: AtomicU64 = AtomicU64::new(0);
+static PC_DIVEST_NS: AtomicU64 = AtomicU64::new(0);
+static PC_SQUEEZED_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn print_post_chain_breakdown() {
+    eprintln!("--- Post-chain sub-timers ---");
+    eprintln!("  RMQ rescue:      {:.3}s ({} calls, {} anchors)", PC_RESCUE_NS.load(Relaxed) as f64 / 1e9, PC_RESCUE_COUNT.load(Relaxed), PC_RESCUE_ANCHORS.load(Relaxed));
+    eprintln!("  Build regs:      {:.3}s", PC_BUILD_REGS_NS.load(Relaxed) as f64 / 1e9);
+    eprintln!("  Parent+filter:   {:.3}s", PC_PARENT_NS.load(Relaxed) as f64 / 1e9);
+    eprintln!("  Div+strand:      {:.3}s", PC_DIVEST_NS.load(Relaxed) as f64 / 1e9);
+    eprintln!("  Squeezed+bounds: {:.3}s", PC_SQUEEZED_NS.load(Relaxed) as f64 / 1e9);
+    eprintln!("-----------------------------");
+}
 use crate::align::sketch::{sketch_sequence, sketch_sequence_append, Minimizer};
 use crate::align::index::Index;
 use crate::align::chain::chain_anchors;
@@ -1257,6 +1277,7 @@ pub fn map_query(
     stats.n_chains = chains.len();
 
     let t3 = Instant::now();
+    let pc0 = Instant::now();
 
     // RMQ rescue re-chaining
     // Only when: bw_long > bw, not splice/sr/no_ljoin, multiple chains
@@ -1276,6 +1297,8 @@ pub fn map_query(
                 || (coverage > (qlen as f32 * opt.chaining.rmq_rescue_ratio) as usize);
 
             if needs_rescue {
+                PC_RESCUE_COUNT.fetch_add(1, Relaxed);
+                PC_RESCUE_ANCHORS.fetch_add(chains.len() as u64, Relaxed);
                 // Stable sort by x before re-chaining
                 radix_sort_128x(&mut chains);
 
@@ -1314,6 +1337,9 @@ pub fn map_query(
             chains = chains2;
         }
     }
+
+    let pc1 = Instant::now();
+    PC_RESCUE_NS.fetch_add((pc1 - pc0).as_nanos() as u64, Relaxed);
 
     let mut regs = Vec::with_capacity(u.len());
 
@@ -1421,6 +1447,9 @@ pub fn map_query(
         // Sort by (score, hash) descending, by (score, hash) descending
         regs.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.hash.cmp(&a.hash)));
     }
+
+    let pc2 = Instant::now();
+    PC_BUILD_REGS_NS.fetch_add((pc2 - pc1).as_nanos() as u64, Relaxed);
 
     if regs.is_empty() { stats.t_post = t3.elapsed(); return (regs, rep_len, stats, Vec::new()); }
 
@@ -1628,6 +1657,8 @@ pub fn map_query(
     }
     regs.truncate(k);
     let mut filtered_regs = regs;
+    let pc3 = Instant::now();
+    PC_PARENT_NS.fetch_add((pc3 - pc2).as_nanos() as u64, Relaxed);
     // estimate_divergence + filter_strand_retained
     // Only apply when not SR mode and not qstrand mode
     if !opt.flags.contains(AlignFlags::SHORT_READ) {
@@ -1638,6 +1669,8 @@ pub fn map_query(
             filter_strand_retained(&mut filtered_regs);
         }
     }
+    let pc4 = Instant::now();
+    PC_DIVEST_NS.fetch_add((pc4 - pc3).as_nanos() as u64, Relaxed);
     // Nearby-seed computation on post-filter chains
     // Build squeezed anchor array from surviving chains, sorted by position
     // Sort surviving regs by original anchor array offset (matching mm_squeeze_a)
@@ -1671,6 +1704,7 @@ pub fn map_query(
         filtered_regs[ri].right_bound_qe1 = right_qe1;
     }
 
+    PC_SQUEEZED_NS.fetch_add((Instant::now() - pc4).as_nanos() as u64, Relaxed);
     stats.t_post = t3.elapsed();
     (filtered_regs, rep_len, stats, squeezed)
 }
