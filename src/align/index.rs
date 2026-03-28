@@ -1,6 +1,5 @@
 
 use crate::align::sketch::sketch_sequence;
-use crate::align::sort::radix_sort_pair;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
@@ -21,12 +20,6 @@ fn read_u64_vec<R: Read>(reader: &mut R, n: usize) -> io::Result<Vec<u64>> {
     Ok(buf.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
 }
 use std::fs::File;
-#[cfg(not(target_arch = "wasm32"))]
-use indicatif::{ProgressBar, ProgressStyle};
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "parallel")))]
-use indicatif::ProgressIterator;
-#[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
-use indicatif::ParallelProgressIterator;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetSequence {
@@ -456,128 +449,64 @@ impl Index {
             idx.packed_seqs = packed;
         }
 
-        // Phase 2: Parallel Sketching
-        // Helper
-        fn sketch_seq_helper(rid: usize, ascii: &[u8], len: usize, w: usize, k: usize, is_hpc: bool) -> Vec<(u64, u64)> {
+        // Phase 2+3: Combined sketch → bucket distribution → sort → build index.
+        // Each sequence is sketched and its entries distributed directly to per-bucket
+        // arrays, avoiding a global accumulation of all entries.
+        let bucket_bits = 10u32.min((2 * k) as u32);
+        let n_buckets = 1usize << bucket_bits;
+        let mask = (n_buckets - 1) as u64;
+
+        // Helper: sketch one sequence and distribute entries to bucket arrays.
+        fn sketch_to_buckets(
+            rid: usize, ascii: &[u8], len: usize, w: usize, k: usize, is_hpc: bool,
+            buckets: &mut Vec<Vec<(u64, u64)>>, mask: u64,
+        ) {
             let mut minimizers = Vec::new();
             sketch_sequence(ascii, len, w, k, rid, is_hpc, &mut minimizers);
-            minimizers.into_iter().map(|m| (m.x >> 8, m.y)).collect()
+            for m in minimizers {
+                let hash = m.x >> 8;
+                buckets[(hash & mask) as usize].push((hash, m.y));
+            }
         }
 
-        // Only show progress bar for large inputs (> 10 sequences) to reduce overhead
-        let use_progress = idx.seqs.len() > 10;
-
-        #[cfg(all(not(target_arch = "wasm32"), feature = "parallel"))]
-        let entries_per_seq: Vec<Vec<(u64, u64)>> = {
-            if use_progress {
-                let style = ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) {msg}")
-                    .unwrap()
-                    .progress_chars("##-");
-                let pb = ProgressBar::new(idx.seqs.len() as u64);
-                pb.set_style(style);
-                pb.set_message("Sketching sequences");
-                idx.seqs.par_iter().zip(ascii_seqs.par_iter()).enumerate().progress_with(pb).map(|(rid, (t_seq, ascii))| {
-                    sketch_seq_helper(rid, ascii, t_seq.len, w, k, is_hpc)
-                }).collect()
-            } else {
-                idx.seqs.par_iter().zip(ascii_seqs.par_iter()).enumerate().map(|(rid, (t_seq, ascii))| {
-                    sketch_seq_helper(rid, ascii, t_seq.len, w, k, is_hpc)
-                }).collect()
-            }
-        };
-
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "parallel")))]
-        let entries_per_seq: Vec<Vec<(u64, u64)>> = {
-            if use_progress {
-                let style = ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) {msg}")
-                    .unwrap()
-                    .progress_chars("##-");
-                let pb = ProgressBar::new(idx.seqs.len() as u64);
-                pb.set_style(style);
-                pb.set_message("Sketching sequences");
-                idx.seqs.iter().zip(ascii_seqs.iter()).enumerate().progress_with(pb).map(|(rid, (t_seq, ascii))| {
-                     sketch_seq_helper(rid, ascii, t_seq.len, w, k, is_hpc)
-                }).collect()
-            } else {
-                idx.seqs.iter().zip(ascii_seqs.iter()).enumerate().map(|(rid, (t_seq, ascii))| {
-                     sketch_seq_helper(rid, ascii, t_seq.len, w, k, is_hpc)
-                }).collect()
-            }
-        };
-
-        #[cfg(target_arch = "wasm32")]
-        let entries_per_seq: Vec<Vec<(u64, u64)>> = {
-            idx.seqs.iter().zip(ascii_seqs.iter()).enumerate().map(|(rid, (t_seq, ascii))| {
-                sketch_seq_helper(rid, ascii, t_seq.len, w, k, is_hpc)
-            }).collect()
-        };
-
-        // Phase 3: Flatten and Sort
-        let total_entries: usize = entries_per_seq.iter().map(|v| v.len()).sum();
-        let mut temp_entries: Vec<(u64, u64)> = Vec::with_capacity(total_entries);
-        for mut v in entries_per_seq {
-            temp_entries.append(&mut v);
+        // Sequential sketch → bucket distribution. Processing one sequence at a time
+        // keeps peak memory to one seq's minimizers + growing buckets (~11 GB total).
+        let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_buckets];
+        for (rid, (t_seq, ascii)) in idx.seqs.iter().zip(ascii_seqs.iter()).enumerate() {
+            sketch_to_buckets(rid, ascii, t_seq.len, w, k, is_hpc, &mut buckets, mask);
         }
-        // Sort by (hash, position)
-        radix_sort_pair(&mut temp_entries);
+        drop(ascii_seqs);
 
-        // Filter extremely repetitive minimizers (hard cap)
-        // Note: mid_occ filtering happens at query time, not here
-        if !temp_entries.is_empty() && max_occ < usize::MAX {
-            let mut keep_idx = 0;
-            let mut i = 0;
-            while i < temp_entries.len() {
-                let start = i;
-                let h = temp_entries[i].0;
-                while i < temp_entries.len() && temp_entries[i].0 == h {
-                    i += 1;
-                }
-                let count = i - start;
-                if count <= max_occ {
-                    // Keep this block
-                    if keep_idx != start {
-                        for k in start..i {
-                            temp_entries[keep_idx] = temp_entries[k];
-                            keep_idx += 1;
-                        }
-                    } else {
-                        keep_idx = i;
-                    }
-                }
-            }
-            temp_entries.truncate(keep_idx);
+        // Drop ascii_seqs already happened above; now shrink buckets.
+        // With ~1024 buckets, each is ~9 MB — above mmap threshold so
+        // shrink_to_fit properly returns memory to the OS.
+        for b in &mut buckets {
+            b.shrink_to_fit();
         }
-        
-        // Build lookup HashMap and compact positions in-place within temp_entries.
-        // positions[k] (8 bytes at offset k*8) only overlaps temp_entries[k/2],
-        // which we've already fully read, so in-place compaction is safe.
-        let n_entries = temp_entries.len();
+
+        // Process each bucket: sort, max_occ filter, build lookup + positions.
+        let n_entries: usize = buckets.iter().map(|b| b.len()).sum();
         let mut lookup: HashMap<u64, u64> = HashMap::with_capacity_and_hasher(n_entries / 6 + 1, Default::default());
-        let entries_ptr = temp_entries.as_mut_ptr() as *mut u64;
-        let mut pos_idx: usize = 0;
-        let mut i = 0;
-        while i < n_entries {
-            let h = temp_entries[i].0;
-            let offset = pos_idx as u64;
-            let start = i;
-            while i < n_entries && temp_entries[i].0 == h {
-                // Safety: positions[pos_idx] at byte pos_idx*8 overlaps temp_entries[pos_idx/2]
-                // which has already been read (pos_idx == i, so pos_idx/2 < i for i >= 2).
-                // For i=0,1: we read .0 and .1 before writing.
-                unsafe { entries_ptr.add(pos_idx).write(temp_entries[i].1); }
-                pos_idx += 1;
-                i += 1;
+        let mut positions: Vec<u64> = Vec::with_capacity(n_entries);
+
+        for bucket in &mut buckets {
+            let mut b = std::mem::take(bucket);
+            if b.is_empty() { continue; }
+            b.sort_unstable();
+
+            let mut i = 0;
+            while i < b.len() {
+                let h = b[i].0;
+                let start = i;
+                while i < b.len() && b[i].0 == h { i += 1; }
+                let count = i - start;
+                if max_occ < usize::MAX && count > max_occ { continue; }
+                let offset = positions.len() as u64;
+                for j in start..i { positions.push(b[j].1); }
+                lookup.insert(h, (offset << 32) | count as u64);
             }
-            lookup.insert(h, (offset << 32) | (i - start) as u64);
         }
-        // Reinterpret Vec<(u64,u64)> as Vec<u64> using the same allocation
-        let cap_u64 = temp_entries.capacity() * 2;
-        let ptr = temp_entries.as_mut_ptr() as *mut u64;
-        std::mem::forget(temp_entries);
-        let mut positions = unsafe { Vec::from_raw_parts(ptr, pos_idx, cap_u64) };
-        positions.shrink_to_fit();
+        drop(buckets);
 
         idx.lookup = lookup;
         idx.positions = positions;
