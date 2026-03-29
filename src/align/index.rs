@@ -3,7 +3,6 @@ use crate::align::sketch::sketch_sequence;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
-use rustc_hash::FxHashMap as HashMap;
 use std::io::{self, BufWriter, BufReader, Read, Write, Seek, SeekFrom};
 
 /// Read a Vec<u32> from a binary stream (little-endian, safe).
@@ -33,6 +32,46 @@ pub struct TargetSequence {
 /// Magic bytes for multi-part index format
 const RMMI_MAGIC: &[u8; 4] = b"RMMI";
 
+// ─── Seed lookup trait + backends ───
+
+/// Trait for seed lookup backends.
+pub trait SeedLookup {
+    fn get(&self, hash: u64) -> Option<&[u64]>;
+    fn get_range(&self, hash: u64) -> Option<(u32, u32)>;
+    fn get_by_range(&self, range: (u32, u32)) -> &[u64];
+    /// Iterator over occurrence counts for each unique hash (for cal_mid_occ).
+    fn occurrence_counts(&self) -> Box<dyn Iterator<Item = u32> + '_>;
+    fn is_empty(&self) -> bool;
+}
+
+/// Seed lookup backend. Currently uses BucketHash (minimap2-style per-bucket
+/// hash tables). The enum + trait are kept for future extensibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LookupBackend {
+    BucketHash(super::index_bucket::BucketHashLookup),
+}
+
+impl SeedLookup for LookupBackend {
+    #[inline]
+    fn get(&self, hash: u64) -> Option<&[u64]> {
+        match self { LookupBackend::BucketHash(b) => b.get(hash) }
+    }
+    #[inline]
+    fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
+        match self { LookupBackend::BucketHash(b) => b.get_range(hash) }
+    }
+    #[inline]
+    fn get_by_range(&self, range: (u32, u32)) -> &[u64] {
+        match self { LookupBackend::BucketHash(b) => b.get_by_range(range) }
+    }
+    fn occurrence_counts(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        match self { LookupBackend::BucketHash(b) => b.occurrence_counts() }
+    }
+    fn is_empty(&self) -> bool {
+        match self { LookupBackend::BucketHash(b) => b.is_empty() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Index {
     pub kmer_size: usize,
@@ -40,10 +79,8 @@ pub struct Index {
     pub homopolymer_compressed: bool,
     pub index: usize, // part number (0-based)
     pub seqs: Vec<TargetSequence>,
-    /// Hash table: minimizer_hash -> (offset_into_positions << 32) | count
-    pub lookup: HashMap<u64, u64>,
-    /// Flat position array for all minimizers (r_packed values, 8 bytes each)
-    pub positions: Vec<u64>,
+    /// Seed lookup backend.
+    backend: LookupBackend,
     /// Packed 4-bit reference sequences (8 bases per u32, minimap2 encoding).
     /// Kept at runtime for on-demand per-region nt4 extraction (~375 MB for GRCh38).
     #[serde(default)]
@@ -225,14 +262,12 @@ impl Index {
             sum_len += len as u64;
         }
 
-        // Read per-bucket hash tables and build lookup + positions directly
-        let t_hash = Instant::now();
+        // Read per-bucket hash tables directly into BucketHashLookup.
+        // minimap2's format stores per-bucket: n positions (p[]), then hash entries.
         let n_buckets = 1usize << b;
-        let estimated_entries = (sum_len as usize) / w.max(1);
-        let mut lookup: HashMap<u64, u64> = HashMap::with_capacity_and_hasher(estimated_entries / 6 + 1, Default::default());
-        let mut positions: Vec<u64> = Vec::with_capacity(estimated_entries);
+        let mut bucket_data: Vec<(Vec<u64>, Vec<(u64, u64)>)> = Vec::with_capacity(n_buckets);
 
-        for bucket_idx in 0..n_buckets {
+        for _ in 0..n_buckets {
             // Read n (i32) — size of positions array
             let mut n_buf = [0u8; 4];
             reader.read_exact(&mut n_buf)?;
@@ -246,37 +281,21 @@ impl Index {
             reader.read_exact(&mut size_buf)?;
             let hash_size = u32::from_le_bytes(size_buf) as usize;
 
-            if hash_size == 0 { continue; }
+            let hash_entries = if hash_size > 0 {
+                let hash_buf = read_u64_vec(reader, hash_size * 2)?;
+                (0..hash_size).map(|i| (hash_buf[i * 2], hash_buf[i * 2 + 1])).collect()
+            } else {
+                Vec::new()
+            };
 
-            // Bulk read all hash entries for this bucket
-            let hash_buf = read_u64_vec(reader, hash_size * 2)?;
-
-            for i in 0..hash_size {
-                let key = hash_buf[i * 2];
-                let value = hash_buf[i * 2 + 1];
-
-                let full_hash = (key >> 1) << b | bucket_idx as u64;
-
-                if key & 1 != 0 {
-                    // Singleton: value is the direct position
-                    let offset = positions.len() as u64;
-                    positions.push(value);
-                    lookup.insert(full_hash, (offset << 32) | 1);
-                } else {
-                    // Multi-occurrence: value = (offset_in_p << 32) | count
-                    let count = (value & 0xFFFFFFFF) as usize;
-                    let start = (value >> 32) as usize;
-                    let offset = positions.len() as u64;
-                    for j in 0..count {
-                        positions.push(p[start + j]);
-                    }
-                    lookup.insert(full_hash, (offset << 32) | count as u64);
-                }
-            }
+            bucket_data.push((p, hash_entries));
         }
-        let _hash_elapsed = t_hash.elapsed();
 
-        // Read packed 4-bit sequences if present — keep in packed format
+        let backend = LookupBackend::BucketHash(
+            super::index_bucket::BucketHashLookup::from_minimap2_buckets(b as u32, bucket_data)
+        );
+
+        // Read packed 4-bit sequences if present
         let packed_seqs = if !no_seq {
             let n_u32 = sum_len.div_ceil(8) as usize;
             if n_u32 > 0 { read_u32_vec(reader, n_u32)? } else { Vec::new() }
@@ -284,20 +303,18 @@ impl Index {
             Vec::new()
         };
 
-        let n_entries = positions.len();
         let idx = Index {
             kmer_size: k,
             window_size: w,
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs,
-            lookup,
-            positions,
+            backend,
             packed_seqs,
         };
 
-        eprintln!("[*] Index loaded: {}M positions, {}M unique hashes, {}M bases in {:.1}s",
-            n_entries / 1_000_000, idx.lookup.len() / 1_000_000, sum_len / 1_000_000,
+        eprintln!("[*] Index loaded: {} seqs, {}M bases in {:.1}s",
+            idx.seqs.len(), sum_len / 1_000_000,
             t_total.elapsed().as_secs_f64());
         Ok(Some(idx))
     }
@@ -311,8 +328,7 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs,
-            lookup: HashMap::default(),
-            positions: Vec::new(),
+            backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
         }
     }
@@ -324,8 +340,7 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs: Vec::new(),
-            lookup: HashMap::default(),
-            positions: Vec::new(),
+            backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
         }
     }
@@ -348,15 +363,27 @@ impl Index {
             homopolymer_compressed: is_hpc,
             index: 0,
             seqs: Vec::new(),
-            lookup: HashMap::default(),
-            positions: Vec::new(),
+            backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
         };
 
         let mut offset = 0usize;
-        let mut ascii_seqs: Vec<Vec<u8>> = Vec::new();
+        // Batched parallel pack + sketch. Sequences are processed in parallel
+        // batches: each batch packs and sketches its sequences, then the results
+        // are merged sequentially and the ASCII data is dropped. This gives us
+        // parallelism while never holding all sequences in memory at once.
 
-        // Phase 1: Storage and Metadata
+        static NT4_TABLE: [u32; 256] = {
+            let mut t = [4u32; 256];
+            t[b'A' as usize] = 0; t[b'a' as usize] = 0;
+            t[b'C' as usize] = 1; t[b'c' as usize] = 1;
+            t[b'G' as usize] = 2; t[b'g' as usize] = 2;
+            t[b'T' as usize] = 3; t[b't' as usize] = 3;
+            t
+        };
+
+        // Collect metadata and total length.
+        let mut seq_data: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
         for (name, seq_bytes) in seqs {
             let len = seq_bytes.len();
             idx.seqs.push(TargetSequence {
@@ -365,190 +392,97 @@ impl Index {
                 offset: offset as u64,
                 is_alt: false,
             });
-            // Uppercase for HPC mode's raw byte comparison (seq[i]==seq[i+1]).
-            // Non-HPC paths use lookup tables that handle both cases.
-            if is_hpc {
-                let mut normalized = seq_bytes;
-                for b in normalized.iter_mut() { *b = b.to_ascii_uppercase(); }
-                ascii_seqs.push(normalized);
-            } else {
-                ascii_seqs.push(seq_bytes);
-            }
             offset += len;
+            seq_data.push(seq_bytes);
         }
 
-        // Pack ASCII sequences into global 4-bit packed array (parallel per-sequence)
-        {
-            // Lookup table: ASCII byte → 4-bit nt4 value (case-insensitive)
-            static NT4_TABLE: [u32; 256] = {
-                let mut t = [4u32; 256];
-                t[b'A' as usize] = 0; t[b'a' as usize] = 0;
-                t[b'C' as usize] = 1; t[b'c' as usize] = 1;
-                t[b'G' as usize] = 2; t[b'g' as usize] = 2;
-                t[b'T' as usize] = 3; t[b't' as usize] = 3;
-                t
-            };
-
-            let n_u32 = offset.div_ceil(8);
-
-            // Each sequence packs into a non-overlapping region of the packed array.
-            // When sequence boundaries are 8-base aligned, regions don't share u32 words
-            // and can be packed in parallel. The last word of a sequence may share with
-            // the first word of the next when not aligned — we handle this with a
-            // parallel pack + sequential fixup for boundary words.
-
-            // Pack each sequence independently into per-seq local buffers, then merge.
-            // This avoids false sharing and allows full parallelism.
-            #[cfg(feature = "parallel")]
-            let per_seq_packed: Vec<Vec<u32>> = {
-                idx.seqs.par_iter().zip(ascii_seqs.par_iter()).map(|(seq_info, ascii)| {
-                    let len = seq_info.len;
-                    let n_words = len.div_ceil(8);
-                    let mut buf = vec![0u32; n_words];
-                    for (i, &b) in ascii.iter().enumerate() {
-                        buf[i >> 3] |= NT4_TABLE[b as usize] << (((i & 7) << 2) as u32);
-                    }
-                    buf
-                }).collect()
-            };
-
-            #[cfg(not(feature = "parallel"))]
-            let per_seq_packed: Vec<Vec<u32>> = {
-                idx.seqs.iter().zip(ascii_seqs.iter()).map(|(seq_info, ascii)| {
-                    let len = seq_info.len;
-                    let n_words = len.div_ceil(8);
-                    let mut buf = vec![0u32; n_words];
-                    for (i, &b) in ascii.iter().enumerate() {
-                        buf[i >> 3] |= NT4_TABLE[b as usize] << (((i & 7) << 2) as u32);
-                    }
-                    buf
-                }).collect()
-            };
-
-            // Merge per-seq buffers into global packed array
-            let mut packed = vec![0u32; n_u32];
-            for (seq_info, seq_packed) in idx.seqs.iter().zip(per_seq_packed.iter()) {
-                let goff = seq_info.offset as usize;
-                let word_start = goff >> 3;
-                let bit_shift = ((goff & 7) << 2) as u32;
-
-                if bit_shift == 0 {
-                    // Aligned: direct copy
-                    packed[word_start..word_start + seq_packed.len()]
-                        .copy_from_slice(seq_packed);
-                } else {
-                    // Unaligned: shift and OR each word
-                    for (j, &w) in seq_packed.iter().enumerate() {
-                        packed[word_start + j] |= w << bit_shift;
-                        if word_start + j + 1 < n_u32 {
-                            packed[word_start + j + 1] |= w >> (32 - bit_shift);
-                        }
-                    }
-                }
-            }
-            idx.packed_seqs = packed;
-        }
-
-        // Phase 2+3: Combined sketch → bucket distribution → sort → build index.
-        // Each sequence is sketched and its entries distributed directly to per-bucket
-        // arrays, avoiding a global accumulation of all entries.
         let bucket_bits = 10u32.min((2 * k) as u32);
         let n_buckets = 1usize << bucket_bits;
         let mask = (n_buckets - 1) as u64;
 
-        // Helper: sketch one sequence and distribute entries to bucket arrays.
-        fn sketch_to_buckets(
-            rid: usize, ascii: &[u8], len: usize, w: usize, k: usize, is_hpc: bool,
-            buckets: &mut [Vec<(u64, u64)>], mask: u64,
-        ) {
-            let mut minimizers = Vec::new();
-            sketch_sequence(ascii, len, w, k, rid, is_hpc, &mut minimizers);
-            for m in minimizers {
+        let n_u32 = offset.div_ceil(8);
+        let mut packed = vec![0u32; n_u32];
+        let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_buckets];
+
+        // Sequential sketch: process one sequence at a time.
+        // Pack + sketch each, distribute entries to buckets, then drop ASCII.
+        // This keeps peak memory to buckets + packed_seqs (no accumulated ASCII).
+        // Parallelism comes from the bucket post-processing step, not sketching.
+        let mut minimizers = Vec::new();
+        for (rid, seq_bytes) in seq_data.drain(..).enumerate() {
+            let len = idx.seqs[rid].len;
+            let goff = idx.seqs[rid].offset as usize;
+
+            let ascii = if is_hpc {
+                let mut n = seq_bytes;
+                for b in n.iter_mut() { *b = b.to_ascii_uppercase(); }
+                n
+            } else {
+                seq_bytes
+            };
+
+            // Pack into global 4-bit array.
+            for (i, &b) in ascii.iter().enumerate() {
+                let gpos = goff + i;
+                packed[gpos >> 3] |= NT4_TABLE[b as usize] << (((gpos & 7) << 2) as u32);
+            }
+
+            // Sketch and distribute to buckets.
+            sketch_sequence(&ascii, len, w, k, rid, is_hpc, &mut minimizers);
+            for m in &minimizers {
                 let hash = m.x >> 8;
                 buckets[(hash & mask) as usize].push((hash, m.y));
             }
+            minimizers.clear();
+            // ascii dropped here — one sequence at a time
+        }
+        drop(seq_data);
+        idx.packed_seqs = packed;
+
+        // Parallel bucket post-processing: sort each bucket independently.
+        // This is where minimap2 gets its parallelism — 1024 independent
+        // sort+compact jobs across all threads via kt_for/rayon.
+        #[cfg(feature = "parallel")]
+        buckets.par_iter_mut().for_each(|b| {
+            if !b.is_empty() { b.sort_unstable(); }
+        });
+        #[cfg(not(feature = "parallel"))]
+        for b in buckets.iter_mut() {
+            if !b.is_empty() { b.sort_unstable(); }
         }
 
-        // Sequential sketch → bucket distribution. Processing one sequence at a time
-        // keeps peak memory to one seq's minimizers + growing buckets (~11 GB total).
-        let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_buckets];
-        for (rid, (t_seq, ascii)) in idx.seqs.iter().zip(ascii_seqs.iter()).enumerate() {
-            sketch_to_buckets(rid, ascii, t_seq.len, w, k, is_hpc, &mut buckets, mask);
-        }
-        drop(ascii_seqs);
-
-        // Drop ascii_seqs already happened above; now shrink buckets.
-        // With ~1024 buckets, each is ~9 MB — above mmap threshold so
-        // shrink_to_fit properly returns memory to the OS.
-        for b in &mut buckets {
-            b.shrink_to_fit();
-        }
-
-        // Process each bucket: sort, max_occ filter, build lookup + positions.
-        let n_entries: usize = buckets.iter().map(|b| b.len()).sum();
-        let mut lookup: HashMap<u64, u64> = HashMap::with_capacity_and_hasher(n_entries / 6 + 1, Default::default());
-        let mut positions: Vec<u64> = Vec::with_capacity(n_entries);
-
-        for bucket in &mut buckets {
-            let mut b = std::mem::take(bucket);
-            if b.is_empty() { continue; }
-            b.sort_unstable();
-
-            let mut i = 0;
-            while i < b.len() {
-                let h = b[i].0;
-                let start = i;
-                while i < b.len() && b[i].0 == h { i += 1; }
-                let count = i - start;
-                if max_occ < usize::MAX && count > max_occ { continue; }
-                let offset = positions.len() as u64;
-                for it in b.iter().take(i).skip(start) { positions.push(it.1); }
-                lookup.insert(h, (offset << 32) | count as u64);
-            }
-        }
-        drop(buckets);
-
-        idx.lookup = lookup;
-        idx.positions = positions;
+        // Build per-bucket hash tables (minimap2-style). Each bucket is processed
+        // and freed independently, keeping peak memory low.
+        idx.backend = LookupBackend::BucketHash(
+            super::index_bucket::BucketHashLookup::build(bucket_bits, &mut buckets, max_occ)
+        );
 
         idx
     }
 
     pub fn get(&self, hash: u64) -> Option<&[u64]> {
-        let &encoded = self.lookup.get(&hash)?;
-        let offset = (encoded >> 32) as usize;
-        let count = (encoded & 0xFFFFFFFF) as usize;
-        Some(&self.positions[offset..offset + count])
+        self.backend.get(hash)
     }
 
-    /// Returns the (start, end) range into `self.positions` for a given hash,
-    /// so the caller can later retrieve the slice with `get_by_range` without
-    /// redoing the hash table lookup.
+    /// Returns the (start, end) range for a hash, for deferred retrieval via `get_by_range`.
     #[inline]
     pub fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
-        let &encoded = self.lookup.get(&hash)?;
-        let offset = (encoded >> 32) as u32;
-        let count = (encoded & 0xFFFFFFFF) as u32;
-        Some((offset, offset + count))
+        self.backend.get_range(hash)
     }
 
     /// Retrieve a slice of positions from a previously computed range.
     #[inline]
     pub fn get_by_range(&self, range: (u32, u32)) -> &[u64] {
-        &self.positions[range.0 as usize..range.1 as usize]
+        self.backend.get_by_range(range)
     }
 
     /// Calculate mid_occ threshold to filter top `frac` fraction of repetitive minimizers.
-    /// Compute mid-occurrence threshold from seed frequency distribution.
     pub fn cal_mid_occ(&self, frac: f32, min_mid_occ: i32, max_mid_occ: i32) -> usize {
         let min_mid = min_mid_occ.max(1) as usize;
         if frac <= 0.0 { return usize::MAX; }
-        if self.lookup.is_empty() { return min_mid; }
+        if self.backend.is_empty() { return min_mid; }
 
-        // Extract counts directly from lookup values
-        let mut counts: Vec<u32> = self.lookup.values()
-            .map(|&encoded| (encoded & 0xFFFFFFFF) as u32)
-            .collect();
+        let mut counts: Vec<u32> = self.backend.occurrence_counts().collect();
 
         let n = counts.len();
         if n == 0 { return min_mid; }

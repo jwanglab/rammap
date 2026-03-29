@@ -265,7 +265,7 @@ pub fn radix_sort_pair(arr: &mut [(u64, u64)]) {
     #[cfg(not(feature = "parallel"))]
     {
         for &(start, end) in &buckets {
-            let slice = unsafe { std::slice::from_raw_parts_mut((base as *mut (u64, u64)).add(start), end - start) };
+            let slice = &mut arr[start..end];
             let len = slice.len();
             if len > RS_MIN_SIZE {
                 rs_sort(slice, RS_MAX_BITS, recurse_s);

@@ -2,7 +2,7 @@
 
 **rammap** is a pure-Rust minimap2-compatible sequence aligner producing byte-identical output via the same algorithms. It supports all major minimap2 presets (map-ont, map-hifi, sr, splice, asm, ava) with full CIGAR, CS/MD/DS tag, SAM, and PAF output.
 
-Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). 24 Rust source files, ~19.7K lines total. The alignment module is ~16K lines across 19 files; the FASTA/FASTQ reader is ~650 lines.
+Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). 30 Rust source files, ~28K lines total. The alignment module is ~24K lines across 24 files; the FASTA/FASTQ reader is ~650 lines.
 
 **Key dependencies**: rayon (parallelism), clap (CLI), serde/bincode (index serialization), memmap2 (FASTA mmap), flate2 (gzip), wasm-bindgen (WASM support).
 
@@ -32,33 +32,37 @@ Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). 24
 
 ```
 src/
-  main.rs             (1784)  # Binary entry: CLI parse + alignment orchestration
-  lib.rs                 (2)  # Library exports: align, fasta
+  main.rs             (1662)  # Binary entry: CLI parse + alignment orchestration
+  lib.rs                 (7)  # Library exports: align, fasta, api
+  api.rs               (915)  # Programmatic API entry points
 
-  align/                       # minimap2 alignment engine (~16K lines)
-    mod.rs               (19)  # Module declarations
-    sketch.rs           (257)  # Minimizer generation (rolling hash, windowing)
-    sort.rs             (208)  # MSD radix sort (RadixKey trait, American Flag sort)
-    index.rs            (578)  # Reference index: build, save, load (RMMI/MMI formats)
-    seed.rs             (538)  # Seed collection: index lookup, occurrence filtering, heap mode
-    map.rs             (1607)  # Mapping orchestration: MapOptions, MapContext, map_query()
-    chain.rs            (416)  # Standard DP chaining (O(n^2) with skip limits)
-    chain_rmq.rs        (518)  # RMQ-accelerated chaining (arena treap, O(log n))
-    filter.rs           (367)  # Parent assignment + secondary filtering
-    extend.rs          (2511)  # Anchor extension, gap-fill, CIGAR generation, CS/MD/DS formatters
-    dp.rs              (5890)  # SIMD DP engine (SSE2/SSE4.1/NEON, 3 algorithm variants)
-    pipeline.rs        (2599)  # End-to-end pipeline: process_query, format_output, MAPQ, PE
-    pair.rs             (247)  # Paired-end logic (concordant pairing, PE MAPQ)
-    junc.rs             (293)  # Junction annotation scoring (BED/SPSC for splice)
-    jump.rs             (520)  # Jump splice extension (BED12 junction rescue)
-    split.rs            (416)  # Split index: temp file I/O, multi-part merge
-    stats.rs             (34)  # AlignmentStats timing struct
-    wasm.rs               (8)  # WASM stub
+  align/                       # alignment engine (~24K lines)
+    mod.rs               (50)  # Module declarations
+    sketch.rs           (332)  # Minimizer generation (rolling hash, windowing)
+    sort.rs             (349)  # MSD radix sort (parallel two-level for index build)
+    index.rs            (553)  # Reference index: build, save, load (RMMI/MMI formats)
+    index_bucket.rs     (314)  # Per-bucket hash table backend
+    seed.rs             (555)  # Seed collection: index lookup, occurrence filtering, heap mode
+    map.rs             (1775)  # Mapping orchestration: MapOptions, MapContext, map_query()
+    chain.rs            (471)  # Standard DP chaining (O(n^2) with skip limits)
+    chain_simd.rs      (1289)  # SIMD chaining: AVX2 (8-wide) + NEON (4-wide)
+    chain_rmq.rs        (770)  # RMQ-accelerated chaining (arena treap, O(log n))
+    chain_simple.rs     (215)  # Greedy chain scoring (simple/fast)
+    filter.rs           (375)  # Parent assignment + secondary filtering
+    extend.rs          (2117)  # Anchor extension, gap-fill, CIGAR generation, CS/MD/DS formatters
+    dp.rs             (10616)  # SIMD DP engine (SSE2/SSE4.1/AVX2/AVX512/NEON, 3 algorithm variants)
+    pipeline.rs        (2649)  # End-to-end pipeline: process_query, format_output, MAPQ, PE
+    pair.rs             (250)  # Paired-end logic (concordant pairing, PE MAPQ)
+    junc.rs             (295)  # Junction annotation scoring (BED/SPSC for splice)
+    jump.rs             (522)  # Jump splice extension (BED12 junction rescue)
+    split.rs            (418)  # Split index: temp file I/O, multi-part merge
+    align_simple.rs     (339)  # Simple alignment kernels
+    stats.rs             (39)  # AlignmentStats timing struct
     wasm_lib.rs         (217)  # wasm-bindgen entry point
 
   fasta/                       # Custom FASTA/FASTQ I/O (faster than noodles for raw parsing)
-    mod.rs                (8)  # Module declarations
-    reader.rs           (567)  # Streaming parser (zero-copy RefRecord)
+    mod.rs                (7)  # Module declarations
+    reader.rs           (558)  # Streaming parser (zero-copy RefRecord)
     record.rs            (83)  # Record/RefRecord types
 ```
 
@@ -200,7 +204,7 @@ merge_split_results(prefix, n_parts, opt, mi)
 - `sketch_sequence_append(...)` — Same but appends (for multi-segment reads)
 - Both delegate to `sketch_sequence_impl()` (shared core logic)
 
-**Internal helpers**: `encode_base()` (256-byte LUT), `kmer_hash()` (invertible 64-bit hash matching minimap2).
+**Internal helpers**: `encode_base()` (256-byte LUT), `kmer_hash()` (invertible 64-bit hash).
 
 **Constants**: `MM_SEED_SEG_SHIFT=48`, `MM_SEED_SEG_MASK`, `MM_SEED_SELF=1<<43`.
 
@@ -208,38 +212,42 @@ merge_split_results(prefix, n_parts, opt, mi)
 
 ### sort.rs — Radix Sort
 
-**Purpose**: MSD in-place radix sort matching minimap2's ksort.h. NOT stable.
+**Purpose**: MSD in-place radix sort. NOT stable.
 
 **Key trait**: `RadixKey` — `fn radix_key(&self) -> u64` implemented for `Minimizer` (key=x) and `(u64, u64)` (key=first element).
 
 **Key functions**:
 - `radix_sort_128x(arr: &mut [Minimizer])` — Sort minimizers by x field
-- `radix_sort_pair(arr: &mut [(u64, u64)])` — Sort index entries by hash, then position within ties
+- `radix_sort_pair(arr: &mut [(u64, u64)])` — Sort index entries by hash, then position within ties. Uses adaptive two-level partitioning (detects highest occupied byte, creates up to 65K buckets) with parallel sub-bucket sorting via rayon.
 
-**Algorithm**: American Flag sort with 8-bit digits, 256 buckets, in-place cyclic permutation. Falls back to insertion sort for arrays < 64 elements.
+**Algorithm**: American Flag sort with 8-bit digits, 256 buckets, in-place cyclic permutation. Falls back to insertion sort for arrays < 64 elements. `radix_sort_pair` adds a parallel recursion phase: after two sequential partition passes, independent sub-buckets are sorted in parallel.
 
 ---
 
-### index.rs — Reference Index
+### index.rs + index_bucket.rs — Reference Index
 
-**Purpose**: Build, save, and load searchable minimizer hash tables from reference sequences.
+**Purpose**: Build, save, and load searchable minimizer hash tables from reference sequences. Uses per-bucket hash tables for lookup.
 
 **Key types**:
-- `Index` — `{kmer_size, window_size, homopolymer_compressed, index (part#), seqs: Vec<TargetSequence>, entries: Vec<(u64,u64)>, packed_seqs: Vec<u32>, bucket_offsets: Vec<u32>, bucket_shift: u32}`
-- `TargetSequence` — `{name, len, offset, is_alt}` (metadata only; sequence data stored on `Index`)
+- `Index` — `{kmer_size, window_size, homopolymer_compressed, index (part#), seqs: Vec<TargetSequence>, backend: LookupBackend, packed_seqs: Vec<u32>}`
+- `TargetSequence` — `{name, len, offset, is_alt}` (metadata only; sequence data in packed_seqs)
+- `SeedLookup` trait — `get()`, `get_range()`, `get_by_range()`, `occurrence_counts()`, `is_empty()`
+- `LookupBackend` enum — currently `BucketHash(BucketHashLookup)`, extensible for future backends
+- `BucketHashLookup` (index_bucket.rs) — per-bucket open-addressing hash tables with shared flat positions array. Each bucket maps hash suffixes to (offset, count) ranges.
 
 **Key methods**:
-- `Index::build(seqs, w, k, is_hpc) -> Self` — Sketch all sequences, sort entries, build bucket LUT
+- `Index::build(seqs, w, k, is_hpc) -> Self` — Fused per-sequence pack+sketch (sequential, dropping each sequence's ASCII immediately), parallel bucket sort, sequential per-bucket hash table build
 - `Index::save(path)` / `save_part(writer)` — Serialize (RMMI format with magic prefix)
 - `Index::load(path)` / `load_part(reader)` — Detect format (RMMI, MMI v2, old bincode)
-- `Index::load_minimap2(reader)` — Read minimap2 .mmi format directly; unpacks 4-bit packed sequences to ASCII
-- `Index::cal_mid_occ(frac, min, max) -> usize` — Compute occurrence threshold from entry distribution
-- `Index::header_only() -> Self` — Sequences-only index for split merge phase
-- `Index::get_chrom_ascii(rid) -> &[u8]` — Full ASCII sequence for chromosome `rid`
+- `Index::load_minimap2(reader)` — Read minimap2 .mmi format, constructing `BucketHashLookup` directly from per-bucket hash tables
+- `Index::get(hash)` / `get_range(hash)` / `get_by_range(range)` — Delegated to backend
+- `Index::cal_mid_occ(frac, min, max) -> usize` — Compute occurrence threshold via backend's `occurrence_counts()`
 - `Index::get_nt4(rid, pos) -> u8` — Single base as nt4 (0=A,1=C,2=G,3=T,4=N)
 - `Index::get_region_nt4(rid, start, end) -> Vec<u8>` — Region as nt4 bytes
 
-**Lookup**: `entries` sorted by hash; `bucket_offsets[hash >> bucket_shift]` gives start index for O(1) bucket access, then linear scan within bucket.
+**Lookup**: Per-bucket hash table indexed by `hash & mask` (low bits), then open-addressing probe for `hash >> bucket_bits` (high bits). O(1) average case.
+
+**Build memory model**: Sequential sketching processes one reference sequence at a time, dropping ASCII data immediately after packing + sketching. Bucket Vecs grow incrementally during sketch, then are sorted in parallel and consumed one-at-a-time during hash table build. Peak memory ≈ max(buckets, positions + hash tables) — never both simultaneously.
 
 ---
 
@@ -335,7 +343,7 @@ score[i] = max(
 
 ### filter.rs — Parent Assignment & Secondary Filtering
 
-**Purpose**: Determines primary/secondary status and filters low-quality chains. Matches minimap2's `mm_set_parent` + `mm_select_sub`.
+**Purpose**: Determines primary/secondary status and filters low-quality chains.
 
 **Key types**:
 - `ParentState` — `{parent: Vec<usize>, parent_score: Vec<i32>, ...}` tracking primary regions
@@ -385,7 +393,7 @@ score[i] = max(
 
 ### dp.rs — SIMD Dynamic Programming
 
-**Purpose**: SIMD-accelerated banded DP alignment. Three algorithm variants, four platform targets plus scalar fallback.
+**Purpose**: SIMD-accelerated banded DP alignment. Three algorithm variants across six platform targets (SSE2, SSE4.1, AVX2, AVX512BW, NEON, WASM SIMD128) plus scalar fallback.
 
 **Key types**:
 - `DpResult` — Alignment result with score tracking at multiple positions (see [Data Structures](#5-key-data-structures))
@@ -401,6 +409,8 @@ score[i] = max(
 - `global_align(qseq, tseq, alpha_size, mat, q, e, bw, result)` — Global NW (SIMD or Gotoh scalar)
 
 **Scalar fallbacks**: `extend_single_affine_scalar()`, `extend_dual_affine_scalar()`, `extend_splice_scalar()`, `lightweight_align_i16_scalar()`, `global_align_gotoh()`.
+
+**AVX2/AVX512 kernels**: Full implementations of all three DP variants (single-affine, dual-affine, splice) at 32 and 64 lanes respectively. Uses 16-byte boundary rounding (matching SSE) with byte-addressed loads/stores to ensure bit-exact scoring across all SIMD widths.
 
 **Key constants** (alignment flags):
 
@@ -470,7 +480,7 @@ score[i] = max(
 
 ### pair.rs — Paired-End Pairing
 
-**Purpose**: Concordant pair detection and PE MAPQ adjustment matching minimap2's `mm_pair` + `mm_set_pe_thru`.
+**Purpose**: Concordant pair detection and PE MAPQ adjustment.
 
 **Key type**: `PeReg` — `{dp_score, ref_id, ref_start, ref_end, is_reverse, hash, id, parent, sam_pri, proper_frag}`
 
@@ -738,7 +748,7 @@ AlnResult {
 }
 ```
 
-### Index (`index.rs`)
+### Index (`index.rs` + `index_bucket.rs`)
 
 ```
 Index {
@@ -747,10 +757,20 @@ Index {
     homopolymer_compressed: bool,   // HPC mode
     index: usize,                   // Part number (0-based)
     seqs: Vec<TargetSequence>,      // Reference sequence metadata
-    entries: Vec<(u64, u64)>,       // Sorted (hash, position) pairs
-    packed_seqs: Vec<u32>,          // 4-bit packed sequences (8 bases/u32, on-demand nt4 extraction)
-    bucket_offsets: Vec<u32>,       // Hash table bucket starts
-    bucket_shift: u32,              // hash >> shift = bucket index
+    backend: LookupBackend,         // Seed lookup (BucketHash)
+    packed_seqs: Vec<u32>,          // 4-bit packed sequences (8 bases/u32)
+}
+
+LookupBackend::BucketHash(BucketHashLookup {
+    bucket_bits: u32,               // log2(n_buckets) for hash partitioning
+    buckets: Vec<Bucket>,           // Per-bucket open-addressing hash tables
+    positions: Vec<u64>,            // Shared flat position array
+})
+
+Bucket {
+    keys: Vec<u32>,                 // Hash suffixes (EMPTY_KEY = u32::MAX)
+    vals: Vec<u64>,                 // Packed (offset << 32) | count
+    mask: u32,                      // capacity - 1 (power of 2)
 }
 
 TargetSequence {
@@ -825,8 +845,8 @@ For a sequence of length L with k-mer size k and window size w:
 ### Seed Collection
 
 For each query minimizer with hash h:
-1. Compute bucket: `bucket_idx = h >> bucket_shift`
-2. Linear scan within bucket for matching hash
+1. Lookup via `get_range(h)`: select bucket by `h & mask`, probe for `h >> bucket_bits` in per-bucket hash table
+2. Retrieve positions via `get_by_range(start, end)`: slice into shared positions array
 3. For each matching reference position: create anchor `(ref_id, ref_pos, query_pos, strand)`
 4. Filter: skip if `hit_count` > `mid_occ` (unless in `select_seeds` heap)
 5. Result: `Vec<Minimizer>` anchors sorted by reference position via radix sort
@@ -920,13 +940,27 @@ Adjustments:
 
 ### Platform Support
 
-| Platform | Register Type | Dispatch |
-|----------|--------------|----------|
-| x86\_64 SSE4.1 | `__m128i` | Runtime `is_x86_feature_detected!("sse4.1")` |
-| x86\_64 SSE2 | `__m128i` | Fallback (always available on x86\_64) |
-| aarch64 NEON | `uint8x16_t` / `int8x16_t` | Compile-time `#[cfg(target_arch = "aarch64")]` |
-| wasm32 SIMD128 | `v128` | Compile-time `#[cfg(target_feature = "simd128")]` |
-| Scalar | `i32` arrays | Fallback for any platform |
+**DP kernels (dp.rs)**:
+
+| Platform | Register Type | Width | Dispatch |
+|----------|--------------|-------|----------|
+| x86\_64 AVX512BW | `__m512i` | 64 lanes | Runtime `is_x86_feature_detected!("avx512bw")` |
+| x86\_64 AVX2 | `__m256i` | 32 lanes | Runtime `is_x86_feature_detected!("avx2")` |
+| x86\_64 SSE4.1 | `__m128i` | 16 lanes | Runtime `is_x86_feature_detected!("sse4.1")` |
+| x86\_64 SSE2 | `__m128i` | 16 lanes | Fallback (always available on x86\_64) |
+| aarch64 NEON | `uint8x16_t` | 16 lanes | Compile-time `#[cfg(target_arch = "aarch64")]` |
+| wasm32 SIMD128 | `v128` | 16 lanes | Compile-time `#[cfg(target_feature = "simd128")]` |
+| Scalar | `i32` arrays | 1 | Fallback for any platform |
+
+**Chaining (chain_simd.rs)**:
+
+| Platform | Width | Dispatch |
+|----------|-------|----------|
+| x86\_64 AVX2 | 8 predecessors/iter | Runtime `is_x86_feature_detected!("avx2")` |
+| aarch64 NEON | 4 predecessors/iter | Compile-time `#[cfg(target_arch = "aarch64")]` |
+| Scalar | 1 predecessor/iter | Fallback |
+
+Note: minimap2 has no SIMD chaining and no AVX2/AVX512 DP kernels (SSE4.1 max).
 
 ### SSE2/SSE4.1 Macro Unification
 
@@ -969,21 +1003,35 @@ NEON shares only the non-SIMD helpers (init, `push_cigar`, traceback).
 
 ### Runtime Dispatch Pattern
 
+**DP alignment** (dp.rs):
 ```rust
-pub fn extend_single_affine(...) {
-    if FORCE_SCALAR { return extend_single_affine_scalar(...); }
+pub fn extend_dual_affine(...) {
+    if FORCE_SCALAR { return ..._scalar(...); }
     #[cfg(target_arch = "x86_64")] {
-        if avx512bw   { return extend_single_affine_avx512(...); }
-        if avx2       { return extend_single_affine_avx2(...); }
-        if sse4.1     { return extend_single_affine41(...); }
-        return extend_single_affine2(...);   // SSE2 fallback
+        if avx512bw   { return ..._avx512(...); }   // 64 lanes
+        if avx2       { return ..._avx2(...); }      // 32 lanes
+        if sse4.1     { return ..._sse41(...); }     // 16 lanes
+        return ..._sse2(...);                         // 16 lanes (fallback)
     }
     #[cfg(target_arch = "aarch64")]
-        return extend_single_affine_neon(...);
+        return ..._neon(...);                         // 16 lanes
     #[cfg(target_arch = "wasm32")]
-        return extend_single_affine_wasm(...);
-    extend_single_affine_scalar(...)         // Non-SIMD fallback
+        return ..._wasm(...);                         // 16 lanes
+    ..._scalar(...)                                   // 1 lane
 }
+```
+
+**Chaining** (chain.rs → chain_simd.rs):
+```rust
+pub fn chain_anchors(...) {
+    if is_cdna || n_seg > 1 || a.len() < 32 { return ..._scalar(...); }
+    #[cfg(target_arch = "x86_64")]
+    if avx2 { return chain_anchors_avx2(...); }       // 8 predecessors/iter
+    #[cfg(target_arch = "aarch64")]
+    return chain_anchors_neon(...);                    // 4 predecessors/iter
+    ..._scalar(...)                                    // 1 predecessor/iter
+}
+```
 ```
 
 ---
@@ -1077,23 +1125,25 @@ Located in `#[cfg(test)] mod tests` blocks within source files. Cover:
 - Index build/save/load round-trip (index.rs)
 - Various edge cases
 
-### Integration Tests (25/25 pass)
+### Integration Tests (29/29 pass)
 
-`tests/integration_test.sh --mode=quick` compares rammap vs minimap2 across all major presets:
+`tests/integration_test.sh --mode=quick` compares rammap vs minimap2 across all major presets plus SIMD concordance:
 
 | Test | Status | Notes |
 |------|--------|-------|
 | map-ont, map-ont-cigar, map-ont-sam, map-ont-cs-md | 100% match | |
-| lr-hq, lr-hqae, map-hifi, map-iclr | 100% match | |
+| lr-hq, lr-hqae, map-hifi | 100% match | |
 | splice, splice-hq, cdna, splice-sr | 100% match | |
 | sr, sr-sam | 100% match | |
 | asm5, asm10, asm20 | 100% match | |
 | ava-ont | 100% match | |
-| split-perpart | 100% match | Single-part regression |
-| custom-scoring, custom-kw | 100% match | |
+| split-perpart | 100% match | |
+| split-merge | PASS | 4239 diffs (4238 real, 1 MAPQ/de:f) |
+| custom-scoring, custom-kw | 100% match | custom-kw: 1 known inversion UB diff |
 | secondary-N5, eqx | 100% match | |
-| map-pb | 1 diff / 38904 | `lightweight_align_i16` UB edge case (minimap2 reads before buffer) |
-| split-merge | 4273 diffs | Known lower concordance |
+| map-pb | PASS | 1 known inversion UB diff |
+| map-iclr | PASS | 1 known inversion UB diff |
+| simd-ont, simd-hifi, simd-splice, simd-sr | 0 diffs | SSE vs AVX2 vs AVX512 vs scalar-chain |
 
 Test data: `tests/inttest/` (chr20 reference, 5000 reads per preset).
 
@@ -1136,17 +1186,18 @@ See [performance.md](performance.md) for full benchmark results comparing rammap
 
 ### Unsafe Code Inventory
 
-All `unsafe` code is confined to SIMD DP kernels and their dispatch:
+All `unsafe` code is confined to SIMD kernels and parallel sort:
 
 | File | Unsafe blocks | Reason |
 |------|:------------:|--------|
 | `dp.rs` | ~110 | SIMD intrinsics (`#[target_feature]` functions), raw pointer DP matrix access, pointer-based traceback |
-| `chain_simd.rs` | 8 | AVX2 chaining kernel with SIMD intrinsics |
-| `chain.rs` | 1 | Dispatch call to `chain_anchors_avx2` |
+| `chain_simd.rs` | ~15 | AVX2 + NEON chaining kernels with SIMD intrinsics |
+| `chain.rs` | 2 | Dispatch calls to `chain_anchors_avx2` / `chain_anchors_neon` |
+| `sort.rs` | 1 | `from_raw_parts_mut` for parallel non-overlapping mutable slice access in `radix_sort_pair` |
 
 **Zero unsafe** in all other files: `extend.rs`, `pipeline.rs`, `map.rs`, `filter.rs`,
-`seed.rs`, `sketch.rs`, `index.rs`, `fasta/`, `api.rs`, `main.rs`, `sort.rs`,
-`jump.rs`, `junc.rs`, `pair.rs`, `split.rs`, `stats.rs`, and all example/extension modules.
+`seed.rs`, `sketch.rs`, `index.rs`, `index_bucket.rs`, `fasta/`, `api.rs`, `main.rs`,
+`jump.rs`, `junc.rs`, `pair.rs`, `split.rs`, `stats.rs`.
 
 ### Why SIMD Requires Unsafe
 

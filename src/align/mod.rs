@@ -32,6 +32,7 @@ pub(crate) mod chain_simd;
 pub mod dp;
 pub mod extend;
 pub mod filter;
+pub mod index_bucket;
 pub mod index;
 pub mod jump;
 pub mod junc;

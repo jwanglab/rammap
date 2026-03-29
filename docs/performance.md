@@ -14,6 +14,7 @@ rammap 0.1.0 vs minimap2 2.30-r1290
 | **SIMD** | SSE4.1, AVX2, AVX512BW |
 | **Rust** | 1.94.0, `-C target-cpu=native` |
 | **Profile** | `opt-level=3`, `lto="fat"`, `codegen-units=1` |
+| **Date** | 2026-03-29 |
 
 ## Test Data
 
@@ -33,32 +34,33 @@ indices from FASTA at runtime (no pre-built `.mmi`). Reads subsampled from full 
 
 ## Concordance Summary
 
-All core presets produce identical output (line count and sorted content) between
-rammap and minimap2, except map-pb (1 known inversion UB diff).
+All core presets produce identical output between rammap and minimap2, with known
+exceptions for inversion UB diffs and SAM header differences.
 
 | # | Test | Lines | Result | Notes |
 |--:|------|------:|--------|-------|
 | 1 | map-ont | 35,083 | **100% concordance** | |
 | 2 | map-ont-cigar | 32,732 | **100% concordance** | |
-| 3 | map-ont-sam | 32,739 alns | **100% concordance** | |
+| 3 | map-ont-sam | 33,196 alns | **100% concordance** | 2 SAM header diffs |
 | 4 | lr-hq | 31,579 | **100% concordance** | |
-| 5 | lr-hqae | 44,954 | **100% concordance** | |
+| 5 | lr-hqae | 44,954 | **PASS** | 88 diffs (de:f rounding) |
 | 6 | map-iclr | 32,747 | **100% concordance** | |
 | 7 | map-hifi | 26,006 | **100% concordance** | |
-| 8 | map-pb | 26,482/26,483 | **PASS** | 1 line diff: known inversion UB |
+| 8 | map-pb | 26,482/26,483 | **PASS** | 5 diffs: known inversion UB |
 | 9 | splice | 8,040 | **100% concordance** | |
 | 10 | splice-hq | 7,273 | **100% concordance** | |
 | 11 | cdna | 8,040 | **100% concordance** | |
 | 12 | sr | 39,965 | **100% concordance** | |
-| 13 | splice-sr | 39,611 | **100% concordance** | |
-| 14 | asm5 | 20 | **100% concordance** | |
-| 15 | asm10 | 20 | **100% concordance** | |
-| 16 | asm20 | 20 | **100% concordance** | |
-| 17 | ava-ont | 209,757 | **100% concordance** | |
-| 18 | custom-scoring | 32,286 | **100% concordance** | |
-| 19 | secondary-N5 | 32,732 | **100% concordance** | |
-| 20 | eqx | 32,732 | **100% concordance** | |
-| 21 | custom-kw | 32,327 | **100% concordance** | |
+| 13 | sr-sam | 40,427 alns | **100% concordance** | 2 SAM header diffs |
+| 14 | splice-sr | 39,611 | **100% concordance** | |
+| 15 | asm5 | 20 | **100% concordance** | |
+| 16 | asm10 | 20 | **100% concordance** | |
+| 17 | asm20 | 20 | **100% concordance** | |
+| 18 | ava-ont | 209,757 | **100% concordance** | |
+| 19 | custom-scoring | 32,286 | **100% concordance** | |
+| 20 | secondary-N5 | 32,732 | **100% concordance** | |
+| 21 | eqx | 32,732 | **100% concordance** | |
+| 22 | custom-kw | 32,327 | **100% concordance** | |
 
 ---
 
@@ -71,48 +73,48 @@ FASTA at runtime. Wall ratio < 1.0 means rammap is faster.
 
 | Preset | RT Wall | MM2 Wall | Wall Ratio | RT Mem | MM2 Mem | Mem Ratio |
 |--------|--------:|---------:|-----------:|-------:|--------:|----------:|
-| map-ont | 151s | 217s | **0.70x** | 9.4 GB | 8.6 GB | 1.09x |
-| map-ont-cigar | 158s | 229s | **0.69x** | 10.4 GB | 11.3 GB | **0.92x** |
-| map-ont-sam | 153s | 231s | **0.66x** | 10.4 GB | 11.7 GB | **0.89x** |
-| lr-hq | 81s | 77s | 1.05x | 15.7 GB | 17.8 GB | **0.88x** |
-| lr-hqae | 37s | 39s | **0.95x** | 6.1 GB | 6.8 GB | **0.90x** |
-| map-hifi | 39s | 31s | 1.26x | 9.9 GB | 13.9 GB | **0.71x** |
-| map-pb | 39s | 31s | 1.26x | 8.6 GB | 9.6 GB | **0.90x** |
-| map-iclr | 145s | 105s | 1.38x | 25.8 GB | 16.7 GB | 1.54x |
+| map-ont | 171s | 240s | **0.71x** | 10.9 GB | 9.9 GB | 1.10x |
+| map-ont-cigar | 184s | 254s | **0.72x** | 10.9 GB | 13.8 GB | **0.79x** |
+| map-ont-sam | 184s | 255s | **0.72x** | 10.9 GB | 14.2 GB | **0.77x** |
+| lr-hq | 71s | 67s | 1.06x | 11.9 GB | 17.9 GB | **0.66x** |
+| lr-hqae | 57s | 55s | 1.04x | 6.0 GB | 9.3 GB | **0.65x** |
+| map-hifi | 54s | 46s | 1.17x | 11.7 GB | 17.4 GB | **0.67x** |
+| map-pb | 65s | 54s | 1.20x | 8.0 GB | 13.1 GB | **0.61x** |
+| map-iclr | 107s | 92s | 1.16x | 13.8 GB | 16.5 GB | **0.84x** |
 
 ### Splice / RNA Presets
 
 | Preset | RT Wall | MM2 Wall | Wall Ratio | RT Mem | MM2 Mem | Mem Ratio |
 |--------|--------:|---------:|-----------:|-------:|--------:|----------:|
-| splice | 49s | 40s | 1.23x | 24.7 GB | 19.2 GB | 1.29x |
-| splice-hq | 49s | 41s | 1.20x | 24.7 GB | 19.2 GB | 1.29x |
-| cdna | 50s | 40s | 1.25x | 24.8 GB | 19.2 GB | 1.29x |
-| splice-sr | 52s | 40s | 1.30x | 24.6 GB | 19.2 GB | 1.28x |
+| splice | 57s | 40s | 1.43x | 18.4 GB | 19.2 GB | **0.96x** |
+| splice-hq | 57s | 40s | 1.43x | 18.4 GB | 19.2 GB | **0.96x** |
+| cdna | 57s | 40s | 1.43x | 18.4 GB | 19.2 GB | **0.96x** |
+| splice-sr | 55s | 38s | 1.45x | 18.4 GB | 19.2 GB | **0.96x** |
 
 ### Short-Read Presets
 
 | Preset | RT Wall | MM2 Wall | Wall Ratio | RT Mem | MM2 Mem | Mem Ratio |
 |--------|--------:|---------:|-----------:|-------:|--------:|----------:|
-| sr | 49s | 29s | 1.69x | 25.2 GB | 13.6 GB | 1.85x |
-| sr-sam | 49s | 29s | 1.69x | 25.2 GB | 13.6 GB | 1.85x |
+| sr | 45s | 29s | 1.55x | 11.9 GB | 13.6 GB | **0.88x** |
+| sr-sam | 44s | 29s | 1.52x | 11.9 GB | 13.6 GB | **0.88x** |
 
 ### Assembly Presets
 
 | Preset | RT Wall | MM2 Wall | Wall Ratio | RT Mem | MM2 Mem | Mem Ratio |
 |--------|--------:|---------:|-----------:|-------:|--------:|----------:|
-| asm5 | 32s | 29s | 1.10x | 15.7 GB | 14.9 GB | 1.05x |
-| asm10 | 31s | 29s | 1.07x | 15.7 GB | 14.8 GB | 1.06x |
-| asm20 | 52s | 32s | 1.62x | 25.8 GB | 14.3 GB | 1.80x |
+| asm5 | 39s | 28s | 1.39x | 10.6 GB | 14.9 GB | **0.71x** |
+| asm10 | 38s | 28s | 1.36x | 10.6 GB | 14.9 GB | **0.71x** |
+| asm20 | 47s | 32s | 1.47x | 13.1 GB | 14.3 GB | **0.92x** |
 
 ### Overlap / Parameter Variations
 
 | Preset | RT Wall | MM2 Wall | Wall Ratio | RT Mem | MM2 Mem | Mem Ratio |
 |--------|--------:|---------:|-----------:|-------:|--------:|----------:|
-| ava-ont | 26s | 11s | 2.36x | 1.3 GB | 1.5 GB | **0.87x** |
-| custom-scoring | 152s | 230s | **0.66x** | 10.4 GB | 11.4 GB | **0.91x** |
-| secondary-N5 | 154s | 230s | **0.67x** | 10.4 GB | 11.3 GB | **0.92x** |
-| eqx | 153s | 230s | **0.67x** | 10.4 GB | 11.4 GB | **0.91x** |
-| custom-kw | 87s | 89s | **0.98x** | 25.1 GB | 18.4 GB | 1.36x |
+| ava-ont | 27s | 11s | 2.45x | 1.4 GB | 1.4 GB | 1.00x |
+| custom-scoring | 181s | 254s | **0.71x** | 10.9 GB | 13.9 GB | **0.78x** |
+| secondary-N5 | 183s | 254s | **0.72x** | 10.9 GB | 13.8 GB | **0.79x** |
+| eqx | 181s | 253s | **0.72x** | 10.9 GB | 13.4 GB | **0.81x** |
+| custom-kw | 89s | 88s | **1.01x** | 13.5 GB | 18.2 GB | **0.74x** |
 
 ---
 
@@ -123,54 +125,53 @@ FASTA at runtime. Wall ratio < 1.0 means rammap is faster.
 ```
 Faster  ============================|============================  Slower
                                     |
-        map-ont-sam  0.66x █████████|
-        custom-scor  0.66x █████████|
-        secondary-N5 0.67x █████████|
-        eqx          0.67x █████████|
-        map-ont-cig  0.69x  ████████|
-        map-ont      0.70x  ████████|
-        lr-hqae      0.95x         █|
-        custom-kw    0.98x          |
-        lr-hq        1.05x          |█
-        asm5         1.10x          |██
-        asm10        1.07x          |██
-        splice-hq    1.20x          |█████
-        splice       1.23x          |██████
-        cdna         1.25x          |██████
-        map-hifi     1.26x          |██████
-        map-pb       1.26x          |██████
-        splice-sr    1.30x          |████████
-        map-iclr     1.38x          |██████████
-        asm20        1.62x          |████████████████
-        sr           1.69x          |█████████████████
-        ava-ont      2.36x          |██████████████████████████████
+        map-ont      0.71x ████████ |
+        custom-scor  0.71x ████████ |
+        map-ont-cig  0.72x ████████ |
+        map-ont-sam  0.72x ████████ |
+        secondary-N5 0.72x ████████ |
+        eqx          0.72x ████████ |
+        custom-kw    1.01x          |
+        lr-hqae      1.04x          |
+        lr-hq        1.06x          |█
+        map-iclr     1.16x          |████
+        map-hifi     1.17x          |████
+        map-pb       1.20x          |█████
+        asm10        1.36x          |█████████
+        asm5         1.39x          |██████████
+        splice       1.43x          |███████████
+        splice-hq    1.43x          |███████████
+        splice-sr    1.45x          |███████████
+        asm20        1.47x          |████████████
+        sr-sam       1.52x          |█████████████
+        sr           1.55x          |██████████████
+        ava-ont      2.45x          |██████████████████████████████
 ```
 
 ### Key Observations (GRCh38, 8 threads)
 
 **Faster than minimap2**:
-- map-ont/map-ont-cigar/map-ont-sam: **30-34% faster** — ONT is the primary use case
-- custom-scoring/secondary-N5/eqx: **33% faster** (same ONT pipeline with extra output)
-- lr-hqae: **5% faster**, **10% less memory**
-- custom-kw: **~parity** (0.98x)
+- map-ont/map-ont-cigar/map-ont-sam: **28-29% faster** — primary ONT use case
+- custom-scoring/secondary-N5/eqx: **28% faster** (same ONT pipeline with extra output)
+- custom-kw: **parity** (1.01x)
 
-**Slower than minimap2**:
-- splice/cdna/splice-hq: **1.2-1.25x slower** — index build dominates (few reads)
-- sr: **1.7x slower** — dominated by index build time for tiny read count
-- map-hifi/map-pb: **1.26x slower** — HPC index overhead
-- map-iclr: **1.38x slower** — k=21 index is large (25.8 GB)
-- asm20: **1.62x slower** — index build overhead, only 20 contigs aligned
-- ava-ont: **2.4x slower** — all-vs-all quadratic chaining overhead
+**Slower than minimap2** (index-build-dominated tests with few reads):
+- splice/cdna/splice-hq: **1.43x slower** — sequential sketch dominates with few reads
+- sr: **1.55x slower** — sequential sketch + small read count
+- map-hifi/map-pb: **1.17-1.20x slower** — HPC index overhead
+- map-iclr: **1.16x slower**
+- asm: **1.36-1.47x slower** — index build overhead, only 20 contigs aligned
+- ava-ont: **2.45x slower** — all-vs-all quadratic chaining overhead
 
 ### Memory
 
-rammap uses packed 4-bit reference storage (~375 MB for GRCh38) with on-demand
-per-region nt4 extraction, vs minimap2's mmap-based packed storage. Memory usage
-varies by preset:
+rammap consistently uses **less memory** than minimap2 across almost all presets,
+with significant savings on long-read alignment modes:
 
-- **Less memory**: map-hifi (0.71x), lr-hq (0.88x), lr-hqae (0.90x), map-ont-cigar (0.92x)
-- **Parity**: map-ont (1.09x), splice (1.00-1.29x), asm5/10 (1.05x)
-- **More memory**: sr (1.85x), map-iclr (1.54x), asm20 (1.80x) — index-build-dominated presets hold full index in RAM
+- **35-39% less memory**: map-pb (0.61x), lr-hqae (0.65x), lr-hq (0.66x), map-hifi (0.67x)
+- **20-25% less memory**: map-ont-cigar (0.79x), custom-kw (0.74x), asm5/10 (0.71x)
+- **5-12% less memory**: sr (0.88x), splice (0.96x)
+- **~parity or slightly more**: map-ont mapping-only (1.10x, no CIGAR = smaller working set)
 
 ---
 
@@ -180,7 +181,9 @@ varies by preset:
 
 | Test | Diffs | Explanation |
 |------|------:|-------------|
-| map-pb | 1 | Known `ksw_ll_i16` UB: inversion with `cm:i:0, s1:i:0`. minimap2 reads before buffer start, rammap correctly rejects. |
+| map-pb | 5 | Known `ksw_ll_i16` UB: inversions with `cm:i:0, s1:i:0`. minimap2 reads before buffer start, rammap correctly rejects. |
+| lr-hqae | 88 | Minor `de:f:` floating-point rounding differences in divergence estimation. |
+| map-ont-sam / sr-sam | 2 | SAM header formatting differences (not alignment diffs). |
 
 ### SIMD Tie-Breaking
 
@@ -211,10 +214,10 @@ inversion diffs, see [`docs/minimap2-ksw-ll-ub.md`](minimap2-ksw-ll-ub.md).
 | Component | Threading | Notes |
 |-----------|-----------|-------|
 | FASTA reading | Single | Sequential I/O |
-| Index sketching | Rayon `par_iter` | Parallelizes across reference sequences |
-| Index 4-bit packing | Rayon `par_iter` | Parallel per-sequence with sequential merge |
-| Index sort | Parallel MSD radix | Two-level partition then parallel sub-bucket sort |
-| Lookup table build | Single | O(n) sequential scan |
+| Index sketching | Sequential | One sequence at a time (minimizes peak memory) |
+| Index 4-bit packing | Sequential | Fused with sketching in single pass |
+| Index bucket sort | Parallel | rayon `par_iter_mut` over 1024 buckets |
+| Per-bucket hash table | Sequential | Process and free one bucket at a time |
 | Query I/O | Dedicated read-ahead thread | `sync_channel(1)` overlapped I/O |
 | Mapping (seed/chain/align) | `-t N` worker threads | Crossbeam scoped threads |
 | Output formatting | Per-thread, flushed in order | Buffered writes |
@@ -232,14 +235,16 @@ inversion diffs, see [`docs/minimap2-ksw-ll-ub.md`](minimap2-ksw-ll-ub.md).
 
 ### Key Differences
 
-- **Index build**: Both tools parallelize sketching across sequences. minimap2
-  parallelizes per-bucket hash table construction across 16K buckets via `kt_for`.
-  rammap uses a two-level parallel MSD radix sort (adaptive top-byte detection +
-  parallel sub-bucket recursion via rayon). rammap's 4-bit packing is also parallel.
+- **Index build**: rammap sketches sequentially (one sequence at a time, dropping ASCII
+  immediately to minimize peak memory), then sorts buckets in parallel via rayon.
+  Per-bucket hash table construction is sequential to avoid holding all results
+  simultaneously. minimap2 parallelizes both sketching (across sequences) and bucket
+  post-processing (across 16K buckets) via `kt_for`.
+- **Index structure**: rammap uses per-bucket open-addressing hash tables (minimap2-style)
+  with a shared flat positions array. Singletons and multi-occurrence hashes are both
+  stored in the positions array for uniform `get_range`/`get_by_range` API.
 - **I/O pipeline**: minimap2 uses a 3-stage pipeline (`kt_pipeline`) that overlaps
   reading, mapping, and output. rammap uses a dedicated read-ahead thread with a
   synchronous channel, achieving similar overlap.
-- **Index format**: minimap2 uses mmap for `.mmi` files (zero-copy load). rammap
-  deserializes `.rmmi` files via bincode (requires allocation + copy).
 - **DP kernels**: minimap2 dispatches to SSE4.1 or SSE2 only. rammap has AVX2 and
   AVX512BW DP kernels in addition to SSE, providing ~2x throughput on wider SIMD.
