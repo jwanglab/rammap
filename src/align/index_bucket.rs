@@ -10,7 +10,6 @@
 //! existing `get_range`/`get_by_range` API works without changes.
 
 use serde::{Serialize, Deserialize};
-#[cfg(feature = "parallel")]
 use super::index::SeedLookup;
 
 /// Sentinel for empty hash table slots.
