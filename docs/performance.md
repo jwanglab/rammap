@@ -14,7 +14,6 @@ rammap 0.1.0 vs minimap2 2.30-r1290
 | **SIMD** | SSE4.1, AVX2, AVX512BW |
 | **Rust** | 1.94.0, `-C target-cpu=native` |
 | **Profile** | `opt-level=3`, `lto="fat"`, `codegen-units=1` |
-| **Date** | 2026-03-29 |
 
 ## Test Data
 
@@ -125,12 +124,12 @@ FASTA at runtime. Wall ratio < 1.0 means rammap is faster.
 ```
 Faster  ============================|============================  Slower
                                     |
-        map-ont      0.71x ████████ |
-        custom-scor  0.71x ████████ |
-        map-ont-cig  0.72x ████████ |
-        map-ont-sam  0.72x ████████ |
-        secondary-N5 0.72x ████████ |
-        eqx          0.72x ████████ |
+        map-ont      0.71x  ████████|
+        custom-scor  0.71x  ████████|
+        map-ont-cig  0.72x  ████████|
+        map-ont-sam  0.72x  ████████|
+        secondary-N5 0.72x  ████████|
+        eqx          0.72x  ████████|
         custom-kw    1.01x          |
         lr-hqae      1.04x          |
         lr-hq        1.06x          |█
@@ -267,7 +266,7 @@ inversion diffs, see [`docs/minimap2-ksw-ll-ub.md`](minimap2-ksw-ll-ub.md).
 | File | Size | Reads |
 |------|------|------:|
 | T2T_chrXPAR_masked.fa | 2.9 GB | 25 target sequences |
-| SJ_Xeno_ID259.1m.fastq | 1.5 GB | 1,000,000 ONT reads |
+| 1m.fastq | 1.5 GB | 1,000,000 ONT reads |
 
 Preset: `map-ont` with CIGAR (`-cx map-ont`), 4 threads.
 
