@@ -249,6 +249,13 @@ pub fn chain_anchors(
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        return unsafe {
+            super::chain_simd::chain_anchors_wasm(opt, max_dist_x, max_dist_y, a, ctx)
+        };
+    }
+
     chain_anchors_scalar(opt, is_cdna, n_seg, max_dist_x, max_dist_y, a, ctx)
 }
 

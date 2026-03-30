@@ -27,7 +27,7 @@ pub mod align_simple;
 pub mod chain;
 pub mod chain_simple;
 pub mod chain_rmq;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32"))]
 pub(crate) mod chain_simd;
 pub mod dp;
 pub mod extend;

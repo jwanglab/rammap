@@ -1,4 +1,4 @@
-//! SIMD-optimized chaining for x86_64 (AVX2) and aarch64 (NEON).
+//! SIMD-optimized chaining for x86_64 (AVX2), aarch64 (NEON), and wasm32 (SIMD128).
 //!
 //! Two-phase approach:
 //! - Phase 1 (SIMD): Batch-compute chain scores for all predecessors using SIMD
@@ -12,6 +12,9 @@ use std::arch::x86_64::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+
+#[cfg(target_arch = "wasm32")]
+use std::arch::wasm32::*;
 
 use crate::align::chain::{chain_backtrack, compute_chain_score, fast_log2};
 use crate::align::map::{ChainingParams, ChainingBuffers};
@@ -990,6 +993,378 @@ pub(crate) unsafe fn chain_anchors_neon(
     ctx.soa_query_pos = soa_query_pos;
     ctx.soa_query_span = soa_query_span;
     ctx.soa_ref_id_strand = soa_rid_strand;
+    ctx.soa_scores_buf = soa_sc_buf;
+
+    (u2, b2)
+}}
+
+// =============================================================================
+// WASM SIMD128 implementation — 4-wide, mirrors NEON logic exactly
+// =============================================================================
+
+/// Vectorized fast_log2 for 4 floats (WASM SIMD128).
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn simd_fast_log2_wasm(x: v128) -> v128 {
+    let z = x; // reinterpret as i32x4 via bit ops
+
+    // exponent = ((z >> 23) & 255) - 128
+    let exp_raw = v128_and(i32x4_shr(z, 23), i32x4_splat(255));
+    let exp = i32x4_sub(exp_raw, i32x4_splat(128));
+    let log_2 = f32x4_convert_i32x4(exp);
+
+    // mantissa: clear exponent bits, set exponent to 127
+    let mant_bits = v128_or(
+        v128_and(z, i32x4_splat(!(255i32 << 23))),
+        i32x4_splat(127i32 << 23),
+    );
+    let z_f = mant_bits; // reinterpret as f32x4
+
+    // Horner's: ((-0.34484843 * z_f) + 2.0246658) * z_f + (-0.6748776)
+    let c0 = f32x4_splat(-0.34484843f32);
+    let c1 = f32x4_splat(2.024_665_8f32);
+    let c2 = f32x4_splat(-0.674_877_6f32);
+
+    let t1 = f32x4_mul(c0, z_f);
+    let t2 = f32x4_add(t1, c1);
+    let t3 = f32x4_mul(t2, z_f);
+    let poly = f32x4_add(t3, c2);
+
+    f32x4_add(log_2, poly)
+}
+
+/// Batch-compute chain scores for 4 predecessors at a time (WASM SIMD128).
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn compute_chain_scores_batch_wasm(
+    qi: i32,
+    ri: i32,
+    rid_strand_i: u32,
+    soa_ref_pos: &[i32],
+    soa_query_pos: &[i32],
+    soa_query_span: &[i32],
+    soa_rid_strand: &[u32],
+    max_dist_x: i32,
+    max_dist_y: i32,
+    bw: i32,
+    chn_pen_gap: f32,
+    chn_pen_skip: f32,
+    sc_buf: &mut [i32],
+    start: usize,
+    end: usize,
+) { unsafe {
+    if start >= end { return; }
+
+    let qi_v = i32x4_splat(qi);
+    let ri_v = i32x4_splat(ri);
+    let rid_i_v = i32x4_splat(rid_strand_i as i32);
+    let max_dx_v = i32x4_splat(max_dist_x);
+    let max_dy_v = i32x4_splat(max_dist_y);
+    let bw_v = i32x4_splat(bw);
+    let zero_v = i32x4_splat(0);
+    let one_v = i32x4_splat(1);
+    let min_val_v = i32x4_splat(i32::MIN);
+    let pen_gap_v = f32x4_splat(chn_pen_gap);
+    let pen_skip_v = f32x4_splat(chn_pen_skip);
+    let half_v = f32x4_splat(0.5f32);
+
+    let aligned_end = start + ((end - start) / 4) * 4;
+    let mut j = start;
+
+    while j < aligned_end {
+        let qj_v = v128_load(soa_query_pos.as_ptr().add(j) as *const v128);
+        let rj_v = v128_load(soa_ref_pos.as_ptr().add(j) as *const v128);
+        let span_v = v128_load(soa_query_span.as_ptr().add(j) as *const v128);
+        let rid_j_v = v128_load(soa_rid_strand.as_ptr().add(j) as *const v128);
+
+        let qdiff = i32x4_sub(qi_v, qj_v);
+        let rdiff = i32x4_sub(ri_v, rj_v);
+
+        // Build validity mask
+        let mut valid = i32x4_gt(qdiff, zero_v);
+        let qdiff_gt_max_dx = i32x4_gt(qdiff, max_dx_v);
+        valid = v128_andnot(valid, qdiff_gt_max_dx);  // valid & ~gt_max_dx
+        let same_rid = i32x4_eq(rid_i_v, rid_j_v);
+        valid = v128_and(valid, same_rid);
+        let rdiff_zero = i32x4_eq(rdiff, zero_v);
+        valid = v128_andnot(valid, rdiff_zero);
+        let qdiff_gt_max_dy = i32x4_gt(qdiff, max_dy_v);
+        valid = v128_andnot(valid, qdiff_gt_max_dy);
+
+        let diff = i32x4_sub(rdiff, qdiff);
+        let gap_w = i32x4_abs(diff);
+        let gw_gt_bw = i32x4_gt(gap_w, bw_v);
+        valid = v128_andnot(valid, gw_gt_bw);
+
+        // Score computation
+        let min_diff = i32x4_min(rdiff, qdiff);
+        let mut score = i32x4_min(span_v, min_diff);
+
+        // Penalty
+        let gw_gt_zero = i32x4_gt(gap_w, zero_v);
+        let md_gt_span = i32x4_gt(min_diff, span_v);
+        let needs_pen = v128_or(gw_gt_zero, md_gt_span);
+
+        let gap_w_f = f32x4_convert_i32x4(gap_w);
+        let min_diff_f = f32x4_convert_i32x4(min_diff);
+        let mul1 = f32x4_mul(pen_gap_v, gap_w_f);
+        let mul2 = f32x4_mul(pen_skip_v, min_diff_f);
+        let lin_pen = f32x4_add(mul1, mul2);
+
+        let gw_plus1 = i32x4_add(gap_w, one_v);
+        let gw_plus1_f = f32x4_convert_i32x4(gw_plus1);
+        let log2_val = simd_fast_log2_wasm(gw_plus1_f);
+        let log_pen = v128_and(gw_gt_zero, log2_val);
+
+        let half_log = f32x4_mul(half_v, log_pen);
+        let total_pen = f32x4_add(lin_pen, half_log);
+
+        let pen_i32 = i32x4_trunc_sat_f32x4(total_pen);
+
+        let pen_masked = v128_and(needs_pen, pen_i32);
+        score = i32x4_sub(score, pen_masked);
+
+        // Mask invalid to i32::MIN
+        score = v128_bitselect(score, min_val_v, valid);
+
+        v128_store(sc_buf.as_mut_ptr().add(j) as *mut v128, score);
+        j += 4;
+    }
+
+    // Scalar remainder
+    while j < end {
+        let qj = soa_query_pos[j];
+        let rj = soa_ref_pos[j];
+        let span_j = soa_query_span[j];
+        let rid_j = soa_rid_strand[j];
+
+        let query_diff = qi.wrapping_sub(qj);
+        if query_diff <= 0 || query_diff > max_dist_x {
+            sc_buf[j] = i32::MIN; j += 1; continue;
+        }
+        let ref_diff = ri.wrapping_sub(rj);
+        if rid_strand_i == rid_j && (ref_diff == 0 || query_diff > max_dist_y) {
+            sc_buf[j] = i32::MIN; j += 1; continue;
+        }
+        let gap_width = (ref_diff - query_diff).abs();
+        if rid_strand_i == rid_j && gap_width > bw {
+            sc_buf[j] = i32::MIN; j += 1; continue;
+        }
+        let min_diff = ref_diff.min(query_diff);
+        let mut sc = span_j.min(min_diff);
+        if gap_width > 0 || min_diff > span_j {
+            let lin_pen = chn_pen_gap * (gap_width as f32) + chn_pen_skip * (min_diff as f32);
+            let log_pen = if gap_width >= 1 { fast_log2((gap_width + 1) as f32) } else { 0.0f32 };
+            sc -= (lin_pen + 0.5f32 * log_pen) as i32;
+        }
+        sc_buf[j] = sc;
+        j += 1;
+    }
+}}
+
+/// WASM SIMD128 chaining — 4-wide, same structure as NEON/AVX2.
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub(crate) unsafe fn chain_anchors_wasm(
+    opt: &ChainingParams,
+    max_dist_x: i32,
+    max_dist_y: i32,
+    a: &mut [Minimizer],
+    ctx: &mut ChainingBuffers,
+) -> (Vec<u64>, Vec<Minimizer>) { unsafe {
+    let n = a.len();
+    if n == 0 { return (Vec::new(), Vec::new()); }
+
+    let bw = opt.bandwidth;
+    let mut max_dist_x = max_dist_x;
+    let mut max_dist_y = max_dist_y;
+    if max_dist_x < bw { max_dist_x = bw; }
+    if max_dist_y < bw { max_dist_y = bw; }
+
+    let real_max_drop = bw;
+    let no_chain_skip = opt.max_chain_skip <= 0;
+
+    let mut soa_ref_pos = std::mem::take(&mut ctx.soa_ref_pos);
+    let mut soa_query_pos = std::mem::take(&mut ctx.soa_query_pos);
+    let mut soa_query_span = std::mem::take(&mut ctx.soa_query_span);
+    let mut soa_rid_strand = std::mem::take(&mut ctx.soa_ref_id_strand);
+    let mut soa_sc_buf = std::mem::take(&mut ctx.soa_scores_buf);
+
+    soa_ref_pos.resize(n, 0);
+    soa_query_pos.resize(n, 0);
+    soa_query_span.resize(n, 0);
+    soa_rid_strand.resize(n, 0);
+    soa_sc_buf.resize(n, 0);
+
+    for j in 0..n {
+        soa_ref_pos[j] = a[j].ref_pos();
+        soa_query_pos[j] = a[j].query_pos();
+        soa_query_span[j] = a[j].query_span();
+        soa_rid_strand[j] = (a[j].x >> 32) as u32;
+    }
+
+    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut scores = std::mem::take(&mut ctx.scores);
+    let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
+    let mut visited = std::mem::take(&mut ctx.visited);
+    predecessors.resize(n, 0i64);
+    scores.resize(n, 0i32);
+    peak_scores.resize(n, 0i32);
+    visited.clear();
+    visited.resize(n, 0i32);
+
+    let mut global_max_score = 0;
+    let mut window_start: usize = 0;
+    let mut best_anchor_idx: i64 = -1;
+
+    for i in 0..n {
+        let mut best_predecessor: i64 = -1;
+        let mut best_score = a[i].query_span();
+        let mut skip_count: i32 = 0;
+
+        while window_start < i
+            && (a[i].ref_id_strand() != a[window_start].ref_id_strand()
+                || (a[i].x > a[window_start].x + max_dist_x as u64))
+        { window_start += 1; }
+
+        if !no_chain_skip && (i - window_start) > opt.max_chain_iter as usize {
+            window_start = i - opt.max_chain_iter as usize;
+        }
+
+        let mut end_j: i64 = if window_start > 0 { window_start as i64 - 1 } else { -1 };
+
+        if i > window_start {
+            compute_chain_scores_batch_wasm(
+                soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                max_dist_x, max_dist_y, bw,
+                opt.chn_pen_gap, opt.chn_pen_skip,
+                &mut soa_sc_buf, window_start, i,
+            );
+        }
+
+        if no_chain_skip {
+            for j in window_start..i {
+                let sc = soa_sc_buf[j];
+                if sc == i32::MIN { continue; }
+                let total_sc = sc + scores[j];
+                if total_sc > best_score {
+                    best_score = total_sc;
+                    best_predecessor = j as i64;
+                }
+            }
+        } else {
+            for j in (window_start..i).rev() {
+                let sc = soa_sc_buf[j];
+                if sc == i32::MIN { continue; }
+                let total_sc = sc + scores[j];
+                if total_sc > best_score {
+                    best_score = total_sc;
+                    best_predecessor = j as i64;
+                    if skip_count > 0 { skip_count -= 1; }
+                } else if visited[j] == i as i32 {
+                    skip_count += 1;
+                    if skip_count > opt.max_chain_skip {
+                        end_j = j as i64;
+                        break;
+                    }
+                }
+                if predecessors[j] >= 0 {
+                    visited[predecessors[j] as usize] = i as i32;
+                }
+            }
+
+            if best_anchor_idx < 0
+                || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64
+            {
+                let mut best = i32::MIN;
+                best_anchor_idx = -1;
+                for j in (window_start..i).rev() {
+                    if best < scores[j] {
+                        best = scores[j];
+                        best_anchor_idx = j as i64;
+                    }
+                }
+            }
+
+            if best_anchor_idx >= 0 && best_anchor_idx < end_j {
+                let sc = compute_chain_score(
+                    &a[i], &a[best_anchor_idx as usize],
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip, false, 1,
+                );
+                if sc != i32::MIN && best_score < sc + scores[best_anchor_idx as usize] {
+                    best_score = sc + scores[best_anchor_idx as usize];
+                    best_predecessor = best_anchor_idx;
+                }
+            }
+        }
+
+        scores[i] = best_score;
+        predecessors[i] = best_predecessor;
+        peak_scores[i] = if best_predecessor >= 0
+            && peak_scores[best_predecessor as usize] > best_score
+        { peak_scores[best_predecessor as usize] } else { best_score };
+
+        if best_anchor_idx < 0
+            || (a[i].x - a[best_anchor_idx as usize].x <= max_dist_x as u64
+                && scores[best_anchor_idx as usize] < scores[i])
+        { best_anchor_idx = i as i64; }
+
+        if global_max_score < best_score { global_max_score = best_score; }
+    }
+
+    let (u, n_u, n_v) = chain_backtrack(
+        n, &scores, &predecessors, &mut peak_scores, &mut visited,
+        opt.min_cnt, opt.min_chain_score, real_max_drop,
+    );
+
+    if n_u == 0 {
+        ctx.predecessors = predecessors; ctx.scores = scores;
+        ctx.peak_scores = peak_scores; ctx.visited = visited;
+        ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
+        ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
+        ctx.soa_scores_buf = soa_sc_buf;
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut b: Vec<Minimizer> = Vec::with_capacity(n_v);
+    let mut k = 0usize;
+    for &u_val in &u[..n_u] {
+        let ni = (u_val & 0xFFFFFFFF) as usize;
+        let k0 = k;
+        for j in 0..ni {
+            let idx = peak_scores[k0 + (ni - j - 1)] as usize;
+            b.push(a[idx]);
+            k += 1;
+        }
+    }
+
+    let mut w: Vec<Minimizer> = Vec::with_capacity(n_u);
+    let mut k_pos = 0usize;
+    for (i, &u_val) in u[..n_u].iter().enumerate() {
+        let ni = (u_val & 0xFFFFFFFF) as usize;
+        w.push(Minimizer { x: b[k_pos].x, y: ((k_pos as u64) << 32) | (i as u64) });
+        k_pos += ni;
+    }
+    radix_sort_128x(&mut w);
+
+    let mut u2: Vec<u64> = Vec::with_capacity(n_u);
+    let mut b2: Vec<Minimizer> = Vec::with_capacity(n_v);
+    for &w_val in &w[..n_u] {
+        let j = (w_val.y & 0xFFFFFFFF) as usize;
+        let offset = (w_val.y >> 32) as usize;
+        let ni = (u[j] & 0xFFFFFFFF) as usize;
+        u2.push(u[j]);
+        for idx in 0..ni { b2.push(b[offset + idx]); }
+    }
+
+    ctx.predecessors = predecessors; ctx.scores = scores;
+    ctx.peak_scores = peak_scores; ctx.visited = visited;
+    ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
+    ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
     ctx.soa_scores_buf = soa_sc_buf;
 
     (u2, b2)

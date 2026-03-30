@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rammap — sequence aligner</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #111;
+  background: #fff;
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+.subtitle { font-size: 12px; color: #666; margin-bottom: 24px; }
+.row { display: flex; gap: 16px; margin-bottom: 16px; }
+.col { flex: 1; }
+label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+select, button {
+  font-family: inherit; font-size: 13px;
+  border: 1px solid #999; background: #fff; color: #111;
+  padding: 6px 10px; cursor: pointer;
+}
+select:focus, button:focus { outline: 2px solid #111; outline-offset: -2px; }
+button { font-weight: 600; }
+button:hover { background: #111; color: #fff; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled:hover { background: #fff; color: #111; }
+.drop-zone {
+  border: 2px dashed #999; padding: 20px; text-align: center;
+  color: #666; min-height: 80px; display: flex; align-items: center;
+  justify-content: center; flex-direction: column; gap: 4px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.drop-zone.dragover { border-color: #111; background: #f5f5f5; }
+.drop-zone.loaded { border-style: solid; border-color: #111; color: #111; }
+.drop-zone .filename { font-weight: 600; }
+.drop-zone .filesize { font-size: 11px; color: #666; }
+.panel {
+  border: 1px solid #ccc; background: #fafafa;
+  padding: 12px; overflow: auto; white-space: pre-wrap;
+  word-break: break-all; font-size: 12px; line-height: 1.6;
+}
+.panel-log { height: 160px; }
+.panel-output { height: 400px; }
+.controls { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+.controls > div { display: flex; flex-direction: column; }
+.status { font-size: 12px; color: #666; margin-top: 8px; }
+.check { display: flex; align-items: center; gap: 6px; padding-top: 4px; }
+.check input { margin: 0; }
+hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+.tab {
+  font-size: 11px; padding: 2px 8px; border: 1px solid #ccc;
+  background: #f5f5f5; font-weight: normal; text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.tab:hover { background: #eee; }
+.tab.active { background: #111; color: #fff; border-color: #111; }
+.tab.active:hover { background: #333; }
+table.results {
+  width: 100%; border-collapse: collapse; font-size: 11px;
+}
+table.results th {
+  text-align: left; font-weight: 600; padding: 4px 8px;
+  border-bottom: 2px solid #111; white-space: nowrap;
+  position: sticky; top: 0; background: #fafafa;
+}
+table.results td {
+  padding: 3px 8px; border-bottom: 1px solid #eee;
+  white-space: nowrap; max-width: 200px; overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.results tr:hover td { background: #f5f5f5; }
+table.results td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.results td.cigar {
+  max-width: 300px; font-size: 10px; color: #666;
+  cursor: pointer;
+}
+table.results td.cigar:hover { color: #111; overflow: visible; white-space: normal; word-break: break-all; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.running { animation: pulse 1.2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<h1>rammap</h1>
+<div class="subtitle">minimap2-compatible sequence aligner, running in your browser via WebAssembly SIMD128</div>
+
+<div class="row">
+  <div class="col">
+    <label>Reference (FASTA)</label>
+    <div class="drop-zone" id="ref-drop">
+      Drop FASTA file here or click to select
+      <input type="file" id="ref-file" accept=".fa,.fasta,.fna" style="display:none">
+    </div>
+  </div>
+  <div class="col">
+    <label>Queries (FASTA/FASTQ)</label>
+    <div class="drop-zone" id="query-drop">
+      Drop FASTA/FASTQ file here or click to select
+      <input type="file" id="query-file" accept=".fa,.fasta,.fq,.fastq,.fna" style="display:none">
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <div>
+    <label>Preset</label>
+    <select id="preset">
+      <option value="map-ont" selected>map-ont (ONT long reads)</option>
+      <option value="map-hifi">map-hifi (PacBio HiFi)</option>
+      <option value="sr">sr (short reads)</option>
+      <option value="splice">splice (RNA)</option>
+      <option value="asm20">asm20 (assembly)</option>
+    </select>
+  </div>
+  <div>
+    <label>Output</label>
+    <select id="format">
+      <option value="paf" selected>PAF</option>
+      <option value="sam">SAM</option>
+    </select>
+  </div>
+  <div class="check">
+    <input type="checkbox" id="cigar" checked>
+    <label for="cigar" style="margin:0;text-transform:none;font-weight:normal">CIGAR</label>
+  </div>
+  <div>
+    <button id="run-btn" disabled>Align</button>
+  </div>
+</div>
+
+<hr>
+
+<label>Log</label>
+<div class="panel panel-log" id="log-panel"></div>
+
+<div style="margin-top: 16px">
+  <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px;">
+    <label style="margin: 0;">Output</label>
+    <div style="display: flex; gap: 2px;">
+      <button class="tab active" id="tab-raw" onclick="setTab('raw')">Raw</button>
+      <button class="tab" id="tab-table" onclick="setTab('table')">Table</button>
+    </div>
+  </div>
+  <div class="panel panel-output" id="output-raw"></div>
+  <div class="panel panel-output" id="output-table" style="display:none; white-space: normal;"></div>
+</div>
+
+<div class="status" id="status"></div>
+
+<script type="module">
+let refText = null;
+let queryText = null;
+let workerReady = false;
+let running = false;
+let currentTab = 'raw';
+let lastOutput = '';
+let lastFormat = 'paf';
+
+const logPanel = document.getElementById('log-panel');
+const rawPanel = document.getElementById('output-raw');
+const tablePanel = document.getElementById('output-table');
+
+window.setTab = function(tab) {
+  currentTab = tab;
+  document.getElementById('tab-raw').classList.toggle('active', tab === 'raw');
+  document.getElementById('tab-table').classList.toggle('active', tab === 'table');
+  rawPanel.style.display = tab === 'raw' ? '' : 'none';
+  tablePanel.style.display = tab === 'table' ? '' : 'none';
+  if (tab === 'table' && lastOutput) renderTable(lastOutput, lastFormat);
+};
+
+function renderTable(text, format) {
+  if (!text.trim()) { tablePanel.innerHTML = '<em>(no alignments)</em>'; return; }
+  const lines = text.trim().split('\n').filter(l => l && !l.startsWith('@'));
+  if (lines.length === 0) { tablePanel.innerHTML = '<em>(no alignments)</em>'; return; }
+
+  if (format === 'sam') {
+    renderSamTable(lines);
+  } else {
+    renderPafTable(lines);
+  }
+}
+
+function renderPafTable(lines) {
+  const cols = [
+    { key: 0, label: 'Query', cls: '' },
+    { key: 1, label: 'QLen', cls: 'num' },
+    { key: 2, label: 'QStart', cls: 'num' },
+    { key: 3, label: 'QEnd', cls: 'num' },
+    { key: 4, label: 'Strand', cls: '' },
+    { key: 5, label: 'Target', cls: '' },
+    { key: 6, label: 'TLen', cls: 'num' },
+    { key: 7, label: 'TStart', cls: 'num' },
+    { key: 8, label: 'TEnd', cls: 'num' },
+    { key: 9, label: 'Matches', cls: 'num' },
+    { key: 10, label: 'Block', cls: 'num' },
+    { key: 11, label: 'MAPQ', cls: 'num' },
+  ];
+  // Tags we care about
+  const tagCols = ['NM', 'AS', 'ms', 'tp', 'cm', 'de', 'cg'];
+
+  let html = '<table class="results"><thead><tr>';
+  for (const c of cols) html += `<th>${c.label}</th>`;
+  for (const t of tagCols) html += `<th>${t}</th>`;
+  html += '</tr></thead><tbody>';
+
+  for (const line of lines) {
+    const f = line.split('\t');
+    if (f.length < 12) continue;
+    html += '<tr>';
+    for (const c of cols) {
+      const cls = c.cls ? ` class="${c.cls}"` : '';
+      html += `<td${cls}>${esc(f[c.key] || '')}</td>`;
+    }
+    // Parse tags from fields 12+
+    const tags = {};
+    for (let i = 12; i < f.length; i++) {
+      const m = f[i].match(/^(\w+):\w:(.*)$/);
+      if (m) tags[m[1]] = m[2];
+    }
+    for (const t of tagCols) {
+      let val = tags[t] || '';
+      if (t === 'cg' && val.length > 40) {
+        html += `<td class="cigar" title="${esc(val)}">${esc(val)}</td>`;
+      } else if (t === 'de' && val) {
+        html += `<td class="num">${parseFloat(val).toFixed(4)}</td>`;
+      } else {
+        html += `<td class="num">${esc(val)}</td>`;
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  tablePanel.innerHTML = html;
+}
+
+function renderSamTable(lines) {
+  const cols = [
+    { key: 0, label: 'QName', cls: '' },
+    { key: 1, label: 'Flag', cls: 'num' },
+    { key: 2, label: 'RName', cls: '' },
+    { key: 3, label: 'Pos', cls: 'num' },
+    { key: 4, label: 'MAPQ', cls: 'num' },
+    { key: 5, label: 'CIGAR', cls: 'cigar' },
+    { key: 8, label: 'TLen', cls: 'num' },
+  ];
+  const tagCols = ['NM', 'AS', 'ms', 'tp', 'de'];
+
+  let html = '<table class="results"><thead><tr>';
+  for (const c of cols) html += `<th>${c.label}</th>`;
+  for (const t of tagCols) html += `<th>${t}</th>`;
+  html += '</tr></thead><tbody>';
+
+  for (const line of lines) {
+    const f = line.split('\t');
+    if (f.length < 11) continue;
+    html += '<tr>';
+    for (const c of cols) {
+      const cls = c.cls ? ` class="${c.cls}"` : '';
+      let val = f[c.key] || '';
+      if (c.cls === 'cigar' && val.length > 40) {
+        html += `<td class="cigar" title="${esc(val)}">${esc(val)}</td>`;
+      } else {
+        html += `<td${cls}>${esc(val)}</td>`;
+      }
+    }
+    const tags = {};
+    for (let i = 11; i < f.length; i++) {
+      const m = f[i].match(/^(\w+):\w:(.*)$/);
+      if (m) tags[m[1]] = m[2];
+    }
+    for (const t of tagCols) {
+      let val = tags[t] || '';
+      if (t === 'de' && val) val = parseFloat(val).toFixed(4);
+      html += `<td class="num">${esc(val)}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  tablePanel.innerHTML = html;
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+const statusEl = document.getElementById('status');
+const runBtn = document.getElementById('run-btn');
+
+function log(msg) {
+  logPanel.textContent += msg + '\n';
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+function updateRunBtn() {
+  runBtn.disabled = !(workerReady && refText && queryText && !running);
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function setupDropZone(zoneId, fileId, onLoad) {
+  const zone = document.getElementById(zoneId);
+  const input = document.getElementById(fileId);
+
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault();
+    zone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], zone, onLoad);
+  });
+  input.addEventListener('change', () => {
+    if (input.files.length) handleFile(input.files[0], zone, onLoad);
+  });
+}
+
+function handleFile(file, zone, onLoad) {
+  zone.classList.add('loaded');
+  zone.innerHTML = `<span class="filename">${file.name}</span><span class="filesize">${formatSize(file.size)}</span>`;
+  log(`[*] Loading ${file.name} (${formatSize(file.size)})...`);
+  const reader = new FileReader();
+  reader.onload = () => {
+    onLoad(reader.result);
+    log(`[*] ${file.name} loaded`);
+    updateRunBtn();
+  };
+  reader.readAsText(file);
+}
+
+setupDropZone('ref-drop', 'ref-file', text => { refText = text; });
+setupDropZone('query-drop', 'query-file', text => { queryText = text; });
+
+// --- Web Worker for background alignment ---
+const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+
+worker.onmessage = function(e) {
+  const { type, text, output, log: wasmLog } = e.data;
+
+  if (type === 'ready') {
+    workerReady = true;
+    log('[*] WASM ready (SIMD128, background worker)');
+    updateRunBtn();
+  }
+
+  if (type === 'log') {
+    // Real-time log messages from WASM console.log override
+    log(text);
+  }
+
+  if (type === 'result') {
+    running = false;
+    runBtn.classList.remove('running');
+    const elapsed = ((performance.now() - window._alignStart) / 1000).toFixed(3);
+    if (wasmLog) log(wasmLog.trim());
+    log(`[*] Total wall time: ${elapsed}s`);
+
+    lastOutput = output || '';
+    lastFormat = document.getElementById('format').value === 'sam' ? 'sam' : 'paf';
+    rawPanel.textContent = lastOutput || '(no alignments)';
+    if (currentTab === 'table') renderTable(lastOutput, lastFormat);
+
+    const nLines = lastOutput.trim().split('\n').filter(l => l).length;
+    statusEl.textContent = `Done in ${elapsed}s — ${nLines} alignment(s)`;
+    updateRunBtn();
+  }
+
+  if (type === 'error') {
+    running = false;
+    runBtn.classList.remove('running');
+    log(`[ERROR] ${text}`);
+    statusEl.textContent = 'Error';
+    updateRunBtn();
+  }
+};
+
+// Initialize the worker
+log('[*] Loading WASM module in background worker...');
+worker.postMessage({ type: 'init' });
+
+runBtn.addEventListener('click', () => {
+  if (!refText || !queryText || running) return;
+
+  running = true;
+  updateRunBtn();
+  runBtn.classList.add('running');
+  rawPanel.textContent = '';
+  tablePanel.innerHTML = '';
+  logPanel.textContent = '';
+  lastOutput = '';
+  statusEl.textContent = 'Aligning...';
+
+  const preset = document.getElementById('preset').value;
+  const outputSam = document.getElementById('format').value === 'sam';
+  const cigar = document.getElementById('cigar').checked;
+
+  log(`[*] Starting alignment: preset=${preset}, format=${outputSam ? 'SAM' : 'PAF'}, cigar=${cigar}`);
+
+  window._alignStart = performance.now();
+  worker.postMessage({
+    type: 'align',
+    data: { refText, queryText, preset, outputSam, outputCigar: cigar }
+  });
+});
+</script>
+
+</body>
+</html>
