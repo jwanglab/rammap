@@ -4,7 +4,7 @@ A pure-Rust extensible sequence aligner and mapper intended to mirror the interf
 
 Supports all major minimap2 presets (map-ont, map-hifi, sr, splice, asm, ava)
 with full CIGAR, CS/MD tags, SAM, and PAF output. SIMD-optimized DP kernels
-(SSE2, AVX2, AVX512BW) with scalar fallback.
+(NEON, SSE2, SSE4.1, AVX2, AVX512BW, WASM v128) with scalar fallback.
 
 ## Quick Start (CLI)
 
