@@ -185,6 +185,16 @@ pub(super) unsafe fn extend_dual_affine_neon_impl(
     let qe2_ = vdupq_n_u8((gap_open2 as i32 + gap_extend2 as i32) as u8);
     let sc_mch_ = vdupq_n_s8(score_matrix[0]); // clamp value for dual-affine (signed)
 
+    // Scoring constants for NEON SIMD scoring loop (hoisted from inner loop)
+    let sc_mis_v = vdupq_n_u8(score_matrix[1] as u8);
+    let sc_mch_v = vdupq_n_u8(score_matrix[0] as u8);
+    let sc_n_v = vdupq_n_u8(if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
+        (-gap_extend2) as u8
+    } else {
+        score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] as u8
+    });
+    let m1_v = vdupq_n_u8((alphabet_size - 1) as u8);
+
     let flag1_ = vdupq_n_u8(1);
     let flag2_ = vdupq_n_u8(2);
     let flag3_ = vdupq_n_u8(3);
@@ -349,33 +359,17 @@ pub(super) unsafe fn extend_dual_affine_neon_impl(
             };
         }
 
-        // Set scores (16-element chunks, SIMD scoring loop)
+        // Set scores (16-element NEON SIMD scoring loop)
         if (flags & GENERIC_SCORING) == 0 {
-            // Simple match/mismatch scoring (uniform penalties)
-            let sc_mis_val = score_matrix[1] as u8;
-            let sc_mch_val = score_matrix[0] as u8;
-            let sc_n_val = if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
-                (-gap_extend2) as u8
-            } else {
-                score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] as u8
-            };
-            let m1_val = (alphabet_size - 1) as u8;
             let mut t = st0;
             while t <= en0 {
-                for k in 0..16i32 {
-                    let pos = (t + k) as usize;
-                    let sf_val = *sf.add(pos);
-                    let qr_val = *qrr.add(pos);
-                    let is_n = sf_val == m1_val || qr_val == m1_val;
-                    let score = if is_n {
-                        sc_n_val
-                    } else if sf_val == qr_val {
-                        sc_mch_val
-                    } else {
-                        sc_mis_val
-                    };
-                    *(s as *mut u8).add(pos) = score;
-                }
+                let sq = vld1q_u8(sf.add(t as usize));
+                let st_v = vld1q_u8(qrr.add(t as usize));
+                let n_mask = vorrq_u8(vceqq_u8(sq, m1_v), vceqq_u8(st_v, m1_v));
+                let eq_mask = vceqq_u8(sq, st_v);
+                let tmp = vbslq_u8(eq_mask, sc_mch_v, sc_mis_v);
+                let tmp = vbslq_u8(n_mask, sc_n_v, tmp);
+                vst1q_u8((s as *mut u8).add(t as usize), tmp);
                 t += 16;
             }
         } else {

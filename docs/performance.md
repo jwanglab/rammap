@@ -246,5 +246,71 @@ inversion diffs, see [`docs/minimap2-ksw-ll-ub.md`](minimap2-ksw-ll-ub.md).
 - **I/O pipeline**: minimap2 uses a 3-stage pipeline (`kt_pipeline`) that overlaps
   reading, mapping, and output. rammap uses a dedicated read-ahead thread with a
   synchronous channel, achieving similar overlap.
-- **DP kernels**: minimap2 dispatches to SSE4.1 or SSE2 only. rammap has AVX2 and
-  AVX512BW DP kernels in addition to SSE, providing ~2x throughput on wider SIMD.
+- **DP kernels**: minimap2 dispatches to SSE4.1 or SSE2 only (NEON via sse2neon on
+  aarch64). rammap has native NEON, AVX2, and AVX512BW DP kernels in addition to
+  SSE, providing wider SIMD on all platforms.
+
+---
+
+## aarch64 (Apple Silicon) Benchmark — ONT 1M Reads
+
+### System
+
+| | |
+|---|---|
+| **CPU** | Apple M-series (aarch64) |
+| **SIMD** | NEON (128-bit, 16 lanes) |
+| **Rust** | stable, `opt-level=3`, `lto="fat"`, `codegen-units=1` |
+
+### Test Data
+
+| File | Size | Reads |
+|------|------|------:|
+| T2T_chrXPAR_masked.fa | 2.9 GB | 25 target sequences |
+| SJ_Xeno_ID259.1m.fastq | 1.5 GB | 1,000,000 ONT reads |
+
+Preset: `map-ont` with CIGAR (`-cx map-ont`), 4 threads.
+
+### Overall Performance
+
+| Metric | minimap2 | rammap | Ratio |
+|--------|----------|--------|-------|
+| **Wall time** | 174s | 204s | 1.18x |
+| **CPU time** | 605s | 634s | 1.05x |
+| **Peak RSS** | 19.0 GB | 14.7 GB | **0.77x** |
+| Index build | 37s | 43s | 1.16x |
+| Mapping | 135s | 204s | — |
+| Output | identical | identical | — |
+
+### Stage-Level CPU Breakdown (4 threads, summed)
+
+| Stage | minimap2 | rammap | Ratio | Notes |
+|-------|----------|--------|-------|-------|
+| Sketching | 9.1s | 8.2s | 0.91x | |
+| Seeding | 234.5s | 208.1s | **0.89x** | FxHashMap lookup faster than khash |
+| Initial DP chain | 96.3s | 129.5s | 1.34x | |
+| RMQ rescue chain | 87.0s | 117.1s | 1.35x | Arena AVL vs intrusive AVL (krmq) |
+| Post-chain | 4.1s | 6.1s | 1.49x | |
+| Alignment (DP ext) | 102.0s | 116.0s | 1.14x | NEON SIMD scoring |
+| **Total measured** | **533s** | **585s** | **1.10x** | |
+
+### Key Observations (aarch64)
+
+**Faster than minimap2:**
+- **Seeding 11% faster**: Per-bucket open-addressing hash tables (u32 keys, linear
+  probing) with O(1) lookup. Cached `get_range`/`get_by_range` avoids double lookup
+  in the seed collection hot path.
+- **23% less peak memory**: Sequential sketch-and-distribute pipeline processes one
+  chromosome at a time (sketch, pack 4-bit, distribute to buckets, free ASCII), so
+  peak memory is just the growing buckets + packed sequences. Parallel bucket sort via
+  rayon, then sequential per-bucket hash table build (each bucket processed and freed
+  independently, matching minimap2's `worker_post`). Shared flat `Vec<u64>` positions
+  array for all hashes (including singletons).
+
+**Slower than minimap2:**
+- **Alignment 1.14x slower**: NEON DP kernels use native intrinsics; minimap2 uses
+  SSE2 intrinsics auto-translated to NEON via sse2neon. Remaining gap is likely
+  register allocation and bounds-check overhead in Rust.
+- **Index build 1.16x slower**: Sequential sketching (one chromosome at a time for
+  lower peak memory) vs minimap2's parallel `kt_for` over sequences. Parallelism
+  recovered in the bucket sort phase (rayon `par_iter_mut` over 1024 buckets).
