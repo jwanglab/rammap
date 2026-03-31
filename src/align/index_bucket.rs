@@ -229,6 +229,56 @@ impl BucketHashLookup {
     }
 }
 
+impl BucketHashLookup {
+    /// Prefetch the bucket for a hash value into L1 cache.
+    /// Call this 5-10 iterations ahead of the actual lookup.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let mask = (1u64 << self.bucket_bits) - 1;
+        let bi = (hash & mask) as usize;
+        if bi < self.buckets.len() {
+            let bucket = &self.buckets[bi];
+            if bucket.mask > 0 {
+                let key = (hash >> self.bucket_bits) as u32;
+                let idx = (key & bucket.mask) as usize;
+                // Prefetch the keys and vals arrays at the expected probe position
+                unsafe {
+                    let keys_ptr = bucket.keys.as_ptr().add(idx) as *const u8;
+                    let vals_ptr = bucket.vals.as_ptr().add(idx) as *const u8;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        std::arch::x86_64::_mm_prefetch(keys_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(vals_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        std::arch::aarch64::_prefetch(keys_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                        std::arch::aarch64::_prefetch(vals_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                    }
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    { let _ = (keys_ptr, vals_ptr); }
+                }
+            }
+        }
+    }
+
+    /// Prefetch a positions range into L1 cache.
+    #[inline]
+    pub fn prefetch_positions(&self, range: (u32, u32)) {
+        if (range.0 as usize) < self.positions.len() {
+            unsafe {
+                let ptr = self.positions.as_ptr().add(range.0 as usize) as *const u8;
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                #[cfg(target_arch = "aarch64")]
+                std::arch::aarch64::_prefetch(ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                { let _ = ptr; }
+            }
+        }
+    }
+}
+
 impl SeedLookup for BucketHashLookup {
     #[inline]
     fn get(&self, hash: u64) -> Option<&[u64]> {
