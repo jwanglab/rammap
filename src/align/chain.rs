@@ -232,9 +232,20 @@ pub fn chain_anchors(
     {
         let force_scalar = std::env::var("RAMMAP_FORCE_SCALAR_CHAIN").is_ok()
             || std::env::var("RAMMAP_FORCE_SSE").is_ok();
+        let force_avx2 = std::env::var("RAMALIGN_FORCE_AVX2").is_ok();
+        if !force_scalar && !force_avx2 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            return unsafe {
+                super::chain_simd::chain_anchors_avx512(opt, max_dist_x, max_dist_y, a, ctx)
+            };
+        }
         if !force_scalar && is_x86_feature_detected!("avx2") {
             return unsafe {
                 super::chain_simd::chain_anchors_avx2(opt, max_dist_x, max_dist_y, a, ctx)
+            };
+        }
+        if !force_scalar {
+            return unsafe {
+                super::chain_simd::chain_anchors_sse(opt, max_dist_x, max_dist_y, a, ctx)
             };
         }
     }
@@ -257,6 +268,82 @@ pub fn chain_anchors(
     }
 
     chain_anchors_scalar(opt, is_cdna, n_seg, max_dist_x, max_dist_y, a, ctx)
+}
+
+/// Partition anchors by (ref_id, strand) and chain each partition independently
+/// in parallel via rayon. Since anchors on different reference sequences cannot
+/// form chains, partitions are completely independent.
+///
+/// Returns merged (u, chains) identical to what `chain_anchors` would produce,
+/// but with partitions processed in parallel for better throughput on reads
+/// with anchors spanning many reference sequences.
+#[cfg(feature = "parallel")]
+pub fn chain_anchors_partitioned(
+    opt: &ChainingParams,
+    max_dist_x: i32,
+    max_dist_y: i32,
+    a: &mut [Minimizer],
+) -> (Vec<u64>, Vec<Minimizer>) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Find partition boundaries by ref_id (NOT ref_id_strand).
+    // Both strands of the same ref must stay together because minimap2's chaining
+    // allows cross-strand connections (inversions). Anchors are sorted by
+    // x = (ref_id << 33 | strand << 32 | ref_pos), so both strands of the same
+    // ref_id are contiguous.
+    let mut boundaries: Vec<usize> = vec![0];
+    for i in 1..n {
+        if a[i].ref_id() != a[i - 1].ref_id() {
+            boundaries.push(i);
+        }
+    }
+    boundaries.push(n);
+
+    let n_partitions = boundaries.len() - 1;
+
+    // If only one partition (common for short reads mapping to one chromosome),
+    // skip the partitioning overhead and chain directly.
+    if n_partitions <= 1 {
+        let mut ctx = ChainingBuffers::new();
+        return chain_anchors(opt, false, 1, max_dist_x, max_dist_y, a, &mut ctx);
+    }
+
+    // Split anchors into non-overlapping mutable slices for each partition.
+    // We use raw pointer arithmetic because Rust can't prove non-overlapping
+    // borrows from a single &mut [Minimizer].
+    let base = a.as_mut_ptr() as usize;
+
+    let results: Vec<(Vec<u64>, Vec<Minimizer>)> = (0..n_partitions)
+        .into_par_iter()
+        .map(|pi| {
+            let start = boundaries[pi];
+            let end = boundaries[pi + 1];
+            let len = end - start;
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut((base as *mut Minimizer).add(start), len)
+            };
+            let mut ctx = ChainingBuffers::new();
+            chain_anchors(opt, false, 1, max_dist_x, max_dist_y, slice, &mut ctx)
+        })
+        .collect();
+
+    // Merge: concatenate all u vectors and chain anchor arrays.
+    let total_u: usize = results.iter().map(|(u, _)| u.len()).sum();
+    let total_chains: usize = results.iter().map(|(_, c)| c.len()).sum();
+    let mut merged_u = Vec::with_capacity(total_u);
+    let mut merged_chains = Vec::with_capacity(total_chains);
+
+    for (u, chains) in results {
+        merged_u.extend_from_slice(&u);
+        merged_chains.extend_from_slice(&chains);
+    }
+
+    (merged_u, merged_chains)
 }
 
 // Port of mg_lchain_dp (scalar implementation)
