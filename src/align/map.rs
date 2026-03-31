@@ -31,6 +31,8 @@ pub fn print_post_chain_breakdown() {
 use crate::align::sketch::{sketch_sequence, sketch_sequence_append, Minimizer};
 use crate::align::index::Index;
 use crate::align::chain::chain_anchors;
+#[cfg(feature = "parallel")]
+use crate::align::chain::chain_anchors_partitioned;
 use crate::align::chain_rmq::chain_anchors_rmq;
 use crate::align::sort::radix_sort_128x;
 use crate::align::filter::{FilterParams, ParentState, Filterable, check_secondary_filter, scale_alt_score};
@@ -74,6 +76,11 @@ bitflags! {
         const WEAK_PAIRING     = 0x4000000000;
         const SR_RNA           = 0x8000000000;
         const OUT_JUNC         = 0x10000000000;
+        /// Partition anchors by ref_id and chain partitions in parallel.
+        /// Beneficial for assembly-to-assembly (asm2asm) workloads where a
+        /// single query has millions of anchors across many references.
+        /// Causes minor non-determinism in chain selection (~0.01% of output).
+        const PAR_CHAIN        = 0x20000000000;
     }
 }
 
@@ -1269,6 +1276,18 @@ pub fn map_query(
     let (mut u, mut chains) = if opt.flags.contains(AlignFlags::RMQ_CHAIN) {
         chain_anchors_rmq(&opt.chaining, &mut anchors, &mut ctx.chain_bufs)
     } else {
+        // Use partitioned parallel chaining when there are enough anchors
+        // to benefit from parallelism across reference sequences.
+        // Partitioned parallel chaining: split anchors by ref_id and chain
+        // each partition independently. Only when PAR_CHAIN flag is set
+        // (asm2asm workloads with many anchors across many references).
+        #[cfg(feature = "parallel")]
+        if opt.flags.contains(AlignFlags::PAR_CHAIN) && anchors.len() >= 5000 {
+            chain_anchors_partitioned(&opt.chaining, max_chain_gap_ref, max_chain_gap_qry, &mut anchors)
+        } else {
+            chain_anchors(&opt.chaining, opt.filtering.is_splice, 1, max_chain_gap_ref, max_chain_gap_qry, &mut anchors, &mut ctx.chain_bufs)
+        }
+        #[cfg(not(feature = "parallel"))]
         chain_anchors(&opt.chaining, opt.filtering.is_splice, 1, max_chain_gap_ref, max_chain_gap_qry, &mut anchors, &mut ctx.chain_bufs)
     };
     ctx.anchors = anchors;

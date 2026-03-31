@@ -196,8 +196,22 @@ fn collect_anchor_matches(
 
     // Phase 1: Collect seed info (like mm_seed_collect_all)
     // Use get_range to capture the entry range so we can skip the binary search later.
+    // Software prefetch: issue prefetch for upcoming hash table bucket while
+    // processing the current one, hiding memory latency.
+    const PREFETCH_AHEAD: usize = 8;
     let mut seeds: Vec<SeedInfo> = Vec::with_capacity(n_qm);
+
+    // Issue initial prefetches
+    for mn in q_minimizers.iter().take(PREFETCH_AHEAD.min(n_qm)) {
+        mi.prefetch(mn.x >> 8);
+    }
+
     for (mi_idx, m) in q_minimizers.iter().enumerate() {
+        // Prefetch ahead
+        if mi_idx + PREFETCH_AHEAD < n_qm {
+            mi.prefetch(q_minimizers[mi_idx + PREFETCH_AHEAD].x >> 8);
+        }
+
         let hash = m.x >> 8;
         let q_span = (m.x & 0xFF) as u32;
         let q_pos = m.y as u32; // includes strand bit
@@ -281,7 +295,12 @@ pub(crate) fn collect_seed_hits_with_occ(
     let seed_tandem: u64 = crate::align::sketch::SEED_TANDEM;
     let skip_flags = opt.flags & (AlignFlags::NO_DIAG | AlignFlags::NO_DUAL);
 
-    for seed in &matched_seeds {
+    for (si, seed) in matched_seeds.iter().enumerate() {
+        // Prefetch positions for the next seed
+        if si + 1 < matched_seeds.len() {
+            mi.prefetch_positions(matched_seeds[si + 1].entry_range);
+        }
+
         let m = &q_minimizers[seed.mi_idx];
         let q_span = seed.q_span as usize;
         let q_pos = ((m.y as u32) >> 1) as usize;

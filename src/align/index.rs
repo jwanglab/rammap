@@ -476,6 +476,23 @@ impl Index {
         self.backend.get_by_range(range)
     }
 
+    /// Prefetch the hash table bucket for a hash value into L1 cache.
+    /// Call a few iterations ahead of the actual `get_range` for that hash.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        match &self.backend {
+            LookupBackend::BucketHash(b) => b.prefetch(hash),
+        }
+    }
+
+    /// Prefetch a positions range into L1 cache.
+    #[inline]
+    pub fn prefetch_positions(&self, range: (u32, u32)) {
+        match &self.backend {
+            LookupBackend::BucketHash(b) => b.prefetch_positions(range),
+        }
+    }
+
     /// Calculate mid_occ threshold to filter top `frac` fraction of repetitive minimizers.
     pub fn cal_mid_occ(&self, frac: f32, min_mid_occ: i32, max_mid_occ: i32) -> usize {
         let min_mid = min_mid_occ.max(1) as usize;

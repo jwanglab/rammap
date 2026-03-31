@@ -370,6 +370,10 @@ struct AlignArgs {
     #[arg(long)]
     pub qstrand: bool,
 
+    /// Parallel chaining across reference sequences (asm2asm workloads)
+    #[arg(long)]
+    pub par_chain: bool,
+
     /// Enable splice alignment mode
     #[arg(long)]
     pub splice: bool,
@@ -603,6 +607,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if cli.no_hash_name { opt.flags.insert(AlignFlags::NO_HASH_NAME); }
     if cli.write_junc { opt.flags.insert(AlignFlags::OUT_JUNC); }
     if cli.qstrand { opt.flags.insert(AlignFlags::QSTRAND | AlignFlags::NO_INV); }
+    if cli.par_chain { opt.flags.insert(AlignFlags::PAR_CHAIN); }
     if cli.splice { opt.flags.insert(AlignFlags::SPLICE); }
     if let Some(ref val) = cli.sr {
         match val.as_str() {
