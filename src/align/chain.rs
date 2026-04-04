@@ -232,7 +232,7 @@ pub fn chain_anchors(
     {
         let force_scalar = std::env::var("RAMMAP_FORCE_SCALAR_CHAIN").is_ok()
             || std::env::var("RAMMAP_FORCE_SSE").is_ok();
-        let force_avx2 = std::env::var("RAMALIGN_FORCE_AVX2").is_ok();
+        let force_avx2 = std::env::var("RAMMAP_FORCE_AVX2").is_ok();
         if !force_scalar && !force_avx2 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
             return unsafe {
                 super::chain_simd::chain_anchors_avx512(opt, max_dist_x, max_dist_y, a, ctx)
