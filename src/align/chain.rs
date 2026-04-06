@@ -243,11 +243,9 @@ pub fn chain_anchors(
                 super::chain_simd::chain_anchors_avx2(opt, max_dist_x, max_dist_y, a, ctx)
             };
         }
-        if !force_scalar {
-            return unsafe {
-                super::chain_simd::chain_anchors_sse(opt, max_dist_x, max_dist_y, a, ctx)
-            };
-        }
+        // Note: SSE chaining (chain_anchors_sse) computes scores for the entire
+        // predecessor window before applying max_chain_skip, making it slower than
+        // scalar chaining which terminates early. Fall through to scalar instead.
     }
 
     #[cfg(target_arch = "aarch64")]

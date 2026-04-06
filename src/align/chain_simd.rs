@@ -521,6 +521,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
 /// Vectorized fast_log2 for 4 floats (SSE2).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 #[inline]
 unsafe fn simd_fast_log2_sse(x: __m128) -> __m128 {
     let z = _mm_castps_si128(x);
@@ -545,6 +546,7 @@ unsafe fn simd_fast_log2_sse(x: __m128) -> __m128 {
 /// SSE2 helper: absolute value of i32x4 (no _mm_abs_epi32 in SSE2).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 #[inline]
 unsafe fn sse2_abs_epi32(v: __m128i) -> __m128i {
     let neg = _mm_sub_epi32(_mm_setzero_si128(), v);
@@ -555,6 +557,7 @@ unsafe fn sse2_abs_epi32(v: __m128i) -> __m128i {
 /// SSE2 helper: min of i32x4 (no _mm_min_epi32 in SSE2, added in SSE4.1).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 #[inline]
 unsafe fn sse2_min_epi32(a: __m128i, b: __m128i) -> __m128i {
     let mask = _mm_cmpgt_epi32(a, b); // mask = a > b
@@ -564,6 +567,7 @@ unsafe fn sse2_min_epi32(a: __m128i, b: __m128i) -> __m128i {
 /// Batch-compute chain scores for 4 predecessors at a time (SSE2).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 unsafe fn compute_chain_scores_batch_sse(
     qi: i32, ri: i32, rid_strand_i: u32,
     soa_ref_pos: &[i32], soa_query_pos: &[i32],
@@ -673,6 +677,7 @@ unsafe fn compute_chain_scores_batch_sse(
 /// SSE2 SIMD-optimized chaining — 4-wide, for x86_64 CPUs without AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 pub(crate) unsafe fn chain_anchors_sse(
     opt: &ChainingParams,
     max_dist_x: i32,

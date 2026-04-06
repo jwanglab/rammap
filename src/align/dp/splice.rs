@@ -809,7 +809,7 @@ macro_rules! extend_splice_impl {
 #[cfg(target_arch = "x86_64")]
 extend_splice_impl!(extend_splice2_impl, sse2_max_epi8, false, "sse2");
 #[cfg(target_arch = "x86_64")]
-extend_splice_impl!(extend_splice41_impl, _mm_max_epi8, true, "sse2");
+extend_splice_impl!(extend_splice41_impl, _mm_max_epi8, true, "sse4.1");
 #[cfg(target_arch = "wasm32")]
 extend_splice_impl!(extend_splice_wasm_impl, _mm_max_epi8, true, "simd128");
 

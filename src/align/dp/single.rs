@@ -830,7 +830,7 @@ macro_rules! extend_single_affine_impl {
 #[cfg(target_arch = "x86_64")]
 extend_single_affine_impl!(extend_single_affine2_impl, sse2_max_epi8, false, "sse2");
 #[cfg(target_arch = "x86_64")]
-extend_single_affine_impl!(extend_single_affine41_impl, _mm_max_epi8, true, "sse2");
+extend_single_affine_impl!(extend_single_affine41_impl, _mm_max_epi8, true, "sse4.1");
 #[cfg(target_arch = "wasm32")]
 extend_single_affine_impl!(extend_single_affine_wasm_impl, _mm_max_epi8, true, "simd128");
 

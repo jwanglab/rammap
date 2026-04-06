@@ -1353,7 +1353,7 @@ macro_rules! extend_dual_affine_impl {
 #[cfg(target_arch = "x86_64")]
 extend_dual_affine_impl!(extend_dual_affine2_impl, sse2_max_epi8, sse2_min_epi8, false, "sse2");
 #[cfg(target_arch = "x86_64")]
-extend_dual_affine_impl!(extend_dual_affine41_impl, _mm_max_epi8, _mm_min_epi8, true, "sse2");
+extend_dual_affine_impl!(extend_dual_affine41_impl, _mm_max_epi8, _mm_min_epi8, true, "sse4.1");
 #[cfg(target_arch = "wasm32")]
 extend_dual_affine_impl!(extend_dual_affine_wasm_impl, _mm_max_epi8, _mm_min_epi8, true, "simd128");
 
