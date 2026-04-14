@@ -29,6 +29,15 @@ cargo build --release
 | `asm5` / `asm10` / `asm20` | Assembly-to-reference (1-5% / 10% / 20% divergence) |
 | `ava-ont` / `ava-pb` | All-vs-all overlap |
 
+### aarch64 (including macOS)
+
+On ARM64/Mac systems, to enable index prefetch instructions (required), you must use the Rust nightly build:
+
+```bash
+rustup toolchain install nightly
+cargo +nightly build --release
+```
+
 ## Library API
 
 rammap can be used as a Rust library for programmatic alignment, with an API
