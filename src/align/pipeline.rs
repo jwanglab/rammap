@@ -1095,7 +1095,7 @@ fn compute_mapping_qualities(
 }
 
 /// Post-alignment filtering.
-/// Removes results that fail min_cnt, min_chain_score, or min_dp_max thresholds.
+/// Removes results that fail min_cnt, min_chain_score, min_dp_max, or max_clip_ratio thresholds.
 /// When `recalc_infos` is Some, filters both results and recalc_infos in parallel.
 fn filter_alignment_results(
     results: &mut Vec<AlnResult>,
@@ -1103,9 +1103,12 @@ fn filter_alignment_results(
     min_cnt: i32,
     min_chain_score: i32,
     min_dp_max: i32,
+    max_clip_ratio: f32,
+    qlen: usize,
     debug: bool,
 ) {
     let pre_len = results.len();
+    let clip_thresh = qlen as f32 * max_clip_ratio;
     if let Some(recalc) = recalc_infos {
         // Filter both results and recalc_infos together
         if debug {
@@ -1129,6 +1132,12 @@ fn filter_alignment_results(
                 if debug { eprintln!("[DBG] FILTER_OUT[{}] dp_max={} < min_dp_max={}", i, r.dp_score, min_dp_max); }
                 keep[i] = false;
             }
+            if (r.query_start as f32) > clip_thresh
+                && ((qlen.saturating_sub(r.query_end)) as f32) > clip_thresh
+            {
+                if debug { eprintln!("[DBG] FILTER_OUT[{}] both ends clipped > qlen*{}", i, max_clip_ratio); }
+                keep[i] = false;
+            }
         }
         let mut new_results = Vec::with_capacity(results.len());
         let mut new_recalc = Vec::with_capacity(recalc.len());
@@ -1147,7 +1156,9 @@ fn filter_alignment_results(
         results.retain(|r| {
             let flt = (!r.inv && !r.seg_split && r.effective_cnt < min_cnt)
                 || (r.matches as i32) < min_chain_score
-                || r.dp_score < min_dp_max;
+                || r.dp_score < min_dp_max
+                || ((r.query_start as f32) > clip_thresh
+                    && ((qlen.saturating_sub(r.query_end)) as f32) > clip_thresh);
             !flt
         });
         if debug && results.len() < pre_len {
@@ -1216,9 +1227,8 @@ fn assign_parents_and_select(
             }
         }
 
-        // Post-alignment filtering: always runs after alignment, filters by min_cnt/min_chain_score/min_dp_max
         if out.do_cigar {
-            filter_alignment_results(&mut results, None, opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, debug);
+            filter_alignment_results(&mut results, None, opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen, debug);
         }
 
         // Propagate is_alt from index sequences to results
@@ -1609,7 +1619,7 @@ fn process_query_core(
 
     // Post-alignment filtering
     if out.do_cigar {
-        filter_alignment_results(&mut results, Some(&mut recalc_infos), opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, debug);
+        filter_alignment_results(&mut results, Some(&mut recalc_infos), opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen, debug);
     }
 
     // Parent assignment, secondary selection, dp_max ranking

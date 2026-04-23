@@ -250,7 +250,7 @@ struct AlignArgs {
     #[arg(long)]
     pub end_seed_pen: Option<i32>,
 
-    /// Max clip ratio for filtering
+    /// Drop an alignment if BOTH ends are clipped above this ratio of qlen [1.0]
     #[arg(long)]
     pub max_clip_ratio: Option<f32>,
 
