@@ -226,7 +226,15 @@ impl Aligner {
     /// Load an aligner from a pre-built minimap2 `.mmi` index file.
     pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
         let index = Index::load(path)?;
-        let (options, out_cfg) = build_options(preset, index.kmer_size, index.window_size);
+        let (mut options, out_cfg) = build_options(preset, index.kmer_size, index.window_size);
+        // Calibrate the seed occurrence threshold using the loaded index — matches
+        // what from_fasta/from_seqs do. Without this, mid_occ stays at its default
+        // (unset) and all seeds are rejected, producing zero alignments.
+        options.seeding.mid_occ = index.cal_mid_occ(
+            2e-4,
+            options.seeding.min_mid_occ,
+            options.seeding.max_mid_occ,
+        );
         Ok(Aligner { index, options, out_cfg })
     }
 

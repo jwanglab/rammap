@@ -1,4 +1,4 @@
-#![feature(stdarch_aarch64_prefetch)]
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_aarch64_prefetch))]
 
 pub mod align;
 pub mod api;
