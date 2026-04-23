@@ -232,16 +232,16 @@ merge_split_results(prefix, n_parts, opt, mi)
 
 ---
 
-### index.rs + index_bucket.rs — Reference Index
+### index.rs + index\_bucket.rs — Reference Index
 
 **Purpose**: Build, save, and load searchable minimizer hash tables from reference sequences. Uses per-bucket hash tables for lookup.
 
 **Key types**:
 - `Index` — `{kmer_size, window_size, homopolymer_compressed, index (part#), seqs: Vec<TargetSequence>, backend: LookupBackend, packed_seqs: Vec<u32>}`
-- `TargetSequence` — `{name, len, offset, is_alt}` (metadata only; sequence data in packed_seqs)
+- `TargetSequence` — `{name, len, offset, is_alt}` (metadata only; sequence data in packed\_seqs)
 - `SeedLookup` trait — `get()`, `get_range()`, `get_by_range()`, `occurrence_counts()`, `is_empty()`
 - `LookupBackend` enum — currently `BucketHash(BucketHashLookup)`, extensible for future backends
-- `BucketHashLookup` (index_bucket.rs) — per-bucket open-addressing hash tables with shared flat positions array. Each bucket maps hash suffixes to (offset, count) ranges.
+- `BucketHashLookup` (index\_bucket.rs) — per-bucket open-addressing hash tables with shared flat positions array. Each bucket maps hash suffixes to (offset, count) ranges.
 
 **Key methods**:
 - `Index::build(seqs, w, k, is_hpc) -> Self` — Fused per-sequence pack+sketch (sequential, dropping each sequence's ASCII immediately), parallel bucket sort, sequential per-bucket hash table build
