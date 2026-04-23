@@ -119,6 +119,7 @@ pub struct CigarStats {
 pub struct OutputConfig {
     pub do_cigar: bool,
     pub do_cs: bool,
+    pub cs_long: bool,
     pub do_md: bool,
     pub do_ds: bool,
     pub eqx: bool,
@@ -651,7 +652,7 @@ fn align_single_mapping(
 
         cigar_str = fmt_cigar(&ops, out.eqx);
         if out.do_cs {
-            cs_str = fmt_cs(&ops, &query_seq_for_aln, target_region, new_qs, rgn_rs);
+            cs_str = fmt_cs(&ops, &query_seq_for_aln, target_region, new_qs, rgn_rs, out.cs_long);
         }
         if out.do_md {
             md_str = fmt_md(&ops, target_region, rgn_rs);
@@ -839,7 +840,7 @@ fn try_align_inversion(
     let cigar_str = fmt_cigar(&condensed, out.eqx);
     // fmt_cs/md/ds now accept nt4-encoded sequences directly
     let cs_str = if out.do_cs {
-        fmt_cs(&condensed, &qseq, &tseq, q_off as usize, t_off as usize)
+        fmt_cs(&condensed, &qseq, &tseq, q_off as usize, t_off as usize, out.cs_long)
     } else {
         String::new()
     };
@@ -2613,6 +2614,7 @@ mod tests {
         let out_cfg = OutputConfig {
             do_cigar: true,
             do_cs: false,
+            cs_long: false,
             do_md: false,
             do_ds: false,
             eqx: false,

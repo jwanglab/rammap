@@ -57,6 +57,9 @@ pub fn encode_nt4_rc(ascii_seq: &[u8]) -> Vec<u8> {
 /// nt4 value to lowercase ASCII base.
 const NT4_TO_LOWER: [u8; 5] = [b'a', b'c', b'g', b't', b'n'];
 
+/// nt4 value to uppercase ASCII base.
+const NT4_TO_UPPER: [u8; 5] = [b'A', b'C', b'G', b'T', b'N'];
+
 // Re-export anchor flags from sketch.rs (canonical home for Minimizer bit-fields)
 pub use crate::align::sketch::{SEED_IGNORE, SEED_LONG_JOIN, SEED_TANDEM};
 
@@ -935,12 +938,25 @@ struct CsVisitor<'a> {
     tseq: &'a [u8],
     qs: usize,
     rs: usize,
+    long: bool,
     cs: String,
 }
 
 impl<'a> CsVisitor<'a> {
-    fn new(qseq: &'a [u8], tseq: &'a [u8], qs: usize, rs: usize) -> Self {
-        Self { qseq, tseq, qs, rs, cs: String::new() }
+    fn new(qseq: &'a [u8], tseq: &'a [u8], qs: usize, rs: usize, long: bool) -> Self {
+        Self { qseq, tseq, qs, rs, long, cs: String::new() }
+    }
+
+    #[inline]
+    fn flush_match(&mut self, run: &mut Vec<u8>) {
+        if run.is_empty() { return; }
+        if self.long {
+            self.cs.push('=');
+            self.cs.extend(run.iter().map(|&b| b as char));
+        } else {
+            self.cs.push_str(&format!(":{}", run.len()));
+        }
+        run.clear();
     }
 }
 
@@ -951,7 +967,16 @@ impl CigarTagVisitor for CsVisitor<'_> {
         let r_idx = self.rs + ti;
         match op {
             '=' => {
-                self.cs.push_str(&format!(":{}", len));
+                if self.long {
+                    self.cs.push('=');
+                    for j in 0..len {
+                        if q_idx + j < self.qseq.len() {
+                            self.cs.push(NT4_TO_UPPER[self.qseq[q_idx + j].min(4) as usize] as char);
+                        }
+                    }
+                } else {
+                    self.cs.push_str(&format!(":{}", len));
+                }
             }
             'X' => {
                 for j in 0..len {
@@ -961,18 +986,15 @@ impl CigarTagVisitor for CsVisitor<'_> {
                 }
             }
             'M' => {
-                let mut match_len = 0u32;
+                let mut run: Vec<u8> = Vec::new();
                 for j in 0..len {
                     if (q_idx + j) < self.qseq.len() && (r_idx + j) < self.tseq.len() {
                         let qb = self.qseq[q_idx + j];
                         let rb = self.tseq[r_idx + j];
                         if qb == rb {
-                            match_len += 1;
+                            run.push(NT4_TO_UPPER[qb.min(4) as usize]);
                         } else {
-                            if match_len > 0 {
-                                self.cs.push_str(&format!(":{}", match_len));
-                                match_len = 0;
-                            }
+                            self.flush_match(&mut run);
                             self.cs.push_str(&format!(
                                 "*{}{}",
                                 NT4_TO_LOWER[rb.min(4) as usize] as char,
@@ -981,9 +1003,7 @@ impl CigarTagVisitor for CsVisitor<'_> {
                         }
                     }
                 }
-                if match_len > 0 {
-                    self.cs.push_str(&format!(":{}", match_len));
-                }
+                self.flush_match(&mut run);
             }
             _ => {}
         }
@@ -2055,8 +2075,9 @@ pub fn fmt_cs(
     tseq: &[u8],
     qs: usize,
     rs: usize,
+    long: bool,
 ) -> String {
-    let mut visitor = CsVisitor::new(qseq, tseq, qs, rs);
+    let mut visitor = CsVisitor::new(qseq, tseq, qs, rs, long);
     walk_cigar_ops(ops, &mut visitor)
 }
 

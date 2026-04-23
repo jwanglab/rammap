@@ -95,7 +95,7 @@ struct AlignArgs {
     pub z_drop: Option<String>,
 
     /// Output CS tag (short/long/none)
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "short")]
     pub cs: Option<Option<String>>,
 
     /// Output SAM format
@@ -475,8 +475,16 @@ fn apply_preset(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut
 
 fn run(cli: AlignArgs) -> anyhow::Result<()> {
     let do_ds = cli.ds;
+    let cs_mode: Option<&str> = cli.cs.as_ref().map(|v| v.as_deref().unwrap_or("short"));
+    if let Some(m) = cs_mode {
+        if m != "short" && m != "long" && m != "none" {
+            eprintln!("[WARNING] --cs only takes 'short', 'long', or 'none'. '{}' is treated as 'short'.", m);
+        }
+    }
+    let cs_is_none = cs_mode == Some("none");
+    let cs_long = cs_mode == Some("long");
     let do_cigar = cli.output_cigar || cli.output_sam || cli.cs.is_some() || cli.output_md || do_ds || cli.write_junc;
-    let do_cs = cli.cs.is_some();
+    let do_cs = cli.cs.is_some() && !cs_is_none;
     let do_md = cli.output_md;
     let rg_id: Option<String> = if let Some(rg_line) = &cli.sam_rg {
         let expanded = rg_line.replace("\\t", "\t");
@@ -487,6 +495,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     let out_cfg = OutputConfig {
         do_cigar,
         do_cs,
+        cs_long,
         do_md,
         do_ds,
         eqx: cli.eqx,
@@ -651,7 +660,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if cli.paf_no_hit { opt.flags.insert(AlignFlags::PAF_NO_HIT); }
     if cli.sam_hit_only { opt.flags.insert(AlignFlags::SAM_HIT_ONLY); }
     if cli.secondary_seq { opt.flags.insert(AlignFlags::SECONDARY_SEQ); }
-    if cli.output_cigar { opt.flags.insert(AlignFlags::OUT_CIGAR); }
+    if cli.output_cigar || cli.cs.is_some() { opt.flags.insert(AlignFlags::OUT_CIGAR); }
     if let Some(s) = &cli.secondary {
         match s.as_str() {
             "yes" => { opt.flags.remove(AlignFlags::NO_PRINT_2ND); }

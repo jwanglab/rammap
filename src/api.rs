@@ -249,7 +249,7 @@ impl Aligner {
         let seqs = crate::fasta::read_fasta(path)?;
         let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
         let out_cfg = OutputConfig {
-            do_cigar: true, do_cs: false, do_md: false, do_ds: false,
+            do_cigar: true, do_cs: false, cs_long: false, do_md: false, do_ds: false,
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
         opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
@@ -277,7 +277,7 @@ impl Aligner {
         let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
         opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
         let out_cfg = OutputConfig {
-            do_cigar: true, do_cs: false, do_md: false, do_ds: false,
+            do_cigar: true, do_cs: false, cs_long: false, do_md: false, do_ds: false,
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
         Aligner { index, options: opt, out_cfg }
@@ -386,6 +386,7 @@ fn build_options(preset: Preset, index_k: usize, index_w: usize) -> (MapOptions,
     let out_cfg = OutputConfig {
         do_cigar: true,
         do_cs: false,
+        cs_long: false,
         do_md: false,
         do_ds: false,
         eqx: false,

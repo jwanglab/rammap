@@ -167,6 +167,7 @@ pub fn align_wasm_full(
     let out_cfg = OutputConfig {
         do_cigar: output_cigar,
         do_cs: false,
+        cs_long: false,
         do_md: false,
         do_ds: false,
         eqx: false,
