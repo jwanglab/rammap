@@ -2471,7 +2471,9 @@ pub fn align_and_format_pair(
     let qseq1_work = if flip_r1 { rev_comp(qseq1) } else { qseq1.to_vec() };
     let qseq2_work = if flip_r2 { rev_comp(qseq2) } else { qseq2.to_vec() };
 
-    let is_weak = opt.flags.contains(AlignFlags::WEAK_PAIRING);
+    // Weak pairing per-segment chaining is only activated when CIGAR is requested;
+    // without CIGAR it decays into joint (strong) chaining.
+    let is_weak = opt.flags.contains(AlignFlags::WEAK_PAIRING) && out.do_cigar;
     let is_independ = opt.flags.contains(AlignFlags::INDEPEND_SEG);
 
     // frag_gap: gap parameter for pair assignment (strong path uses computed max_chain_gap_ref,
