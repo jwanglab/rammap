@@ -345,8 +345,6 @@ score[i] = max(
 - `RmqTree::erase(y, i)` — O(log n) deletion
 - `RmqTree::rmq(lo_y, hi_y) -> (min_val, min_i)` — Range minimum query on closed interval [`lo_y`, `hi_y`]
 
-**Performance**: Reduced RMQ rescue rechain from 27.9s to 7.7s single-thread for map-ont.
-
 ---
 
 ### filter.rs — Parent Assignment & Secondary Filtering
@@ -1132,28 +1130,6 @@ Located in `#[cfg(test)] mod tests` blocks within source files. Cover:
 - Index build/save/load round-trip (index.rs)
 - Various edge cases
 
-### Integration Tests (29/29 pass)
-
-`tests/integration_test.sh --mode=quick` compares rammap vs minimap2 across all major presets plus SIMD concordance:
-
-| Test | Status | Notes |
-|------|--------|-------|
-| map-ont, map-ont-cigar, map-ont-sam, map-ont-cs-md | 100% match | |
-| lr-hq, lr-hqae, map-hifi | 100% match | |
-| splice, splice-hq, cdna, splice-sr | 100% match | |
-| sr, sr-sam | 100% match | |
-| asm5, asm10, asm20 | 100% match | |
-| ava-ont | 100% match | |
-| split-perpart | 100% match | |
-| split-merge | PASS | 4239 diffs (4238 real, 1 MAPQ/de:f) |
-| custom-scoring, custom-kw | 100% match | custom-kw: 1 known inversion UB diff |
-| secondary-N5, eqx | 100% match | |
-| map-pb | PASS | 1 known inversion UB diff |
-| map-iclr | PASS | 1 known inversion UB diff |
-| simd-ont, simd-hifi, simd-splice, simd-sr | 0 diffs | SSE vs AVX2 vs AVX512 vs scalar-chain |
-
-Test data: `tests/inttest/` (chr20 reference, 5000 reads per preset).
-
 ### WASM Tests
 
 7 WASM tests pass via `wasm-pack test --node -- --lib`.
@@ -1257,42 +1233,3 @@ Index loading (`index.rs`) and FASTA reading (`fasta/reader.rs`) are fully safe.
 Index binary parsing uses `read_u32_vec`/`read_u64_vec` helpers that read into
 byte buffers and parse with `from_le_bytes`. FASTA loading uses `std::fs::read`
 (no memory mapping).
-
----
-
-## 13. Compatibility notes
-
-Key behavioral details for anyone modifying alignment code.
-
-### Seeding & Indexing
-- **mid_occ calculate-once**: minimap2 calculates `mid_occ` from first index part only. Must NOT recalculate per-part for split index.
-- **Seed heap tie-breaking**: When seed counts tie, minimap2 breaks ties by position.
-
-### Chaining
-- **RMQ boundary semantics**: minimap2's `krmq_rmq` uses CLOSED interval `[lo_y, hi_y]`. Our `rmq()` must include elements at exactly `hi_y`.
-- **compact_a sorting**: After backtracking, chains are re-sorted by `ref_pos` of first anchor, then anchors reordered accordingly.
-
-### Alignment
-- **split_inv left extension zdrop**: When `split_inv=true`, left extension uses `zdrop_inv` instead of `zdrop` (align.c:791). Without this, left extension overextends, breaking inversion detection.
-- **Case-insensitive CIGAR**: FASTA may have lowercase (soft-masked) bases. Must `.to_ascii_uppercase()` both sides for `M -> =/X` expansion.
-- **fix_bad_ends_splice**: Splice mode trims weakly-supported terminal exons before main alignment.
-### SIMD Tie-Breaking
-- **Non-deterministic gap placement across SIMD widths**: When multiple DP cells have equal scores, the traceback direction depends on which cell is processed last within a SIMD register. Different SIMD widths (SSE=16, AVX2=32, AVX512=64 bytes) process cells in different orders, producing different gap placements in the CIGAR for the same score. This is inherent to the DP design (including minimap2's C implementation) and is NOT a bug — the alignments are equally valid alternatives. It does not affect scores, alignment boundaries, or the mapper's output (the chaining/filtering pipeline eliminates borderline alignments).
-
-### minimap2 Undefined Behavior
-- **ksw_ll_i16 query_end overflow**: When `qlen % 8 != 0`, the lightweight Smith-Waterman can return `query_end` at a SIMD padding position beyond `qlen`. minimap2's `mm_align1_inv` uses this value to compute a negative buffer offset (reading before the query buffer start — undefined behavior in C). rammap clamps `query_end` to `pos < qlen` and rejects the inversion. This causes ~6 known diffs across integration tests (all `tp:A:I` inversions with `cm:i:0, s1:i:0`). See [`docs/minimap2-ksw-ll-ub.md`](minimap2-ksw-ll-ub.md) for details.
-
-### Output Formatting
-- **MD tag format**: Each mismatch outputs `{match_count}{base}` individually. Consecutive mismatches: `0A0B0C`. Deletions prefix with count: `{match_count}^{bases}`.
-- **CS/MD priority**: When both `--cs` and `--MD` set, only MD is output (minimap2 if/else).
-- **PE PAF qname**: Append `/{seg_idx+1}` to raw qname. Does NOT trim existing `/1`/`/2` suffix.
-- **Non-CIGAR s2/MAPQ**: In non-CIGAR mode, use `post_subsc` from chain score, not `dp_max`. `has_p` = `!cigar_str.is_empty()`.
-
-### Filtering
-- **ALL_CHAINS outside do_cigar gate**: ava presets have `do_cigar=false`. `ALL_CHAINS` handling must run regardless.
-- **mm_filter_regs skip for inversions**: Must check `!r.inv && cnt < min_cnt` in BOTH filter passes.
-- **Inversion MAPQ=0**: Set mapq=0 for inversions BEFORE the `dp_max > dp_max2` promotion.
-
-### Split Index
-- **rl:i:0 in merge**: minimap2's merge doesn't update `rep_len`, so output tag is always 0.
-- **No mm_filter_regs in merge**: Merge only runs `mm_hit_sort + mm_set_parent + mm_select_sub`.
