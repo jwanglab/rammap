@@ -12,7 +12,7 @@ use crate::align::map::{MapOptions, map_query, map_query_multi, MapContext, Mapp
 use crate::align::pair::{PeReg, pair_alignments};
 use crate::align::sketch::Minimizer;
 use crate::align::index::Index;
-use crate::align::extend::{AlignmentContext, AlignAnchorContext, align_anchors, build_scoring_matrix_full, convert_cigar_to_eqx_pub, fmt_cigar, fmt_cs, fmt_ds, fmt_md, CigarOp};
+use crate::align::extend::{AlignmentContext, AlignAnchorContext, align_anchors, build_scoring_matrix_full, convert_cigar_to_eqx_pub, fix_cigar_pub, fmt_cigar, fmt_cs, fmt_ds, fmt_md, CigarOp};
 use crate::align::filter::{FilterParams, ParentState, FilterableItem, check_secondary_filter, scale_alt_score};
 use crate::align::extend::{rev_comp, rev_comp_nt4, encode_nt4_rc};
 use std::fmt::Write;
@@ -766,16 +766,16 @@ fn try_align_inversion(
         eprintln!("[DBG] try_align_inversion: ql={} tl={} ll_score={} raw_q_off={} raw_t_off={} min_dp_max={}", ql, tl, score, q_off, t_off, opt.alignment.min_dp_max);
     }
     if score < opt.alignment.min_dp_max { return None; }
+    if q_off < 0 || t_off < 0 { return None; }
 
-    // Adjust offsets
+    // Adjust offsets. Lightweight guarantees in-bounds positions, so post-transform
+    // q_off in [0, ql-1] and t_off in [0, tl-1].
     q_off = ql - (q_off + 1);
     t_off = tl - (t_off + 1);
 
-    // Guard against invalid offsets
     if std::env::var("RAMMAP_DEBUG").is_ok() {
         eprintln!("[DBG] try_align_inversion: adjusted q_off={} t_off={} ql={} tl={}", q_off, t_off, ql, tl);
     }
-    if q_off < 0 || q_off >= ql || t_off < 0 || t_off >= tl { return None; }
 
     // Full alignment
     let bw = (opt.chaining.bandwidth as f64 * 1.5) as i32;
@@ -799,26 +799,34 @@ fn try_align_inversion(
     }
     if ez.cigar.is_empty() { return None; }
 
-    // Build inversion result
+    // Normalize CIGAR (left-align indels, merge ops, strip leading I/D). Returns
+    // (qshift, tshift) — bases removed from the alignment start. The alignment END
+    // position is unchanged; only the START moves forward by the shift.
+    let (qshift, tshift) = fix_cigar_pub(&mut ez.cigar, &qseq, &tseq, q_off, t_off);
+
+    // Build inversion result. End coords use the original (pre-shift) offsets
+    // because ez.max_score_*_pos is relative to the DP's original starting point.
     let inv_rev = !r1.is_reverse;
     let rid = r1.ref_id;
 
     let (inv_qs, inv_qe) = if !inv_rev {
-        // inv_rev == false: forward inversion
-        let qs = r2.query_end + q_off as usize;
-        let qe = qs + ez.max_score_query_pos as usize + 1;
+        let qs = r2.query_end + (q_off + qshift) as usize;
+        let qe = r2.query_end + q_off as usize + ez.max_score_query_pos as usize + 1;
         (qs, qe)
     } else {
-        // inv_rev == true: reverse inversion
-        let qe = r2.query_start - q_off as usize;
-        let qs = qe - (ez.max_score_query_pos as usize + 1);
+        let qe = r2.query_start - (q_off + qshift) as usize;
+        let qs = (r2.query_start - q_off as usize) - (ez.max_score_query_pos as usize + 1);
         (qs, qe)
     };
-    let inv_rs = r1.ref_end + t_off as usize;
-    let inv_re = inv_rs + ez.max_score_target_pos as usize + 1;
+    let inv_rs = r1.ref_end + (t_off + tshift) as usize;
+    let inv_re = r1.ref_end + t_off as usize + ez.max_score_target_pos as usize + 1;
+
+    // CIGAR processing below uses post-shift offsets (the leading op was stripped,
+    // so the remaining CIGAR aligns starting at q_off+qshift / t_off+tshift).
+    q_off += qshift;
+    t_off += tshift;
 
     // Convert CIGAR to =/X ops
-    // First convert raw u32 CIGAR to CigarOps
     let raw_cigar = &ez.cigar;
     let ops = convert_cigar_to_eqx_pub(raw_cigar, &qseq, &tseq, q_off as usize, t_off as usize);
     let mut condensed: Vec<CigarOp> = Vec::new();
@@ -831,9 +839,15 @@ fn try_align_inversion(
     }
 
     // Compute stats
-    let align_score = ez.max;
     let log_gap = !opt.flags.intersects(AlignFlags::SHORT_READ | AlignFlags::SR_RNA);
     let dp_max = compute_alignment_score_max(&condensed, &mat, opt.scoring.gap_open, opt.scoring.gap_extend, &qseq[q_off as usize..], &tseq[t_off as usize..], log_gap);
+    // Add back the cost of the stripped leading gap
+    let stripped_gap_len = qshift + tshift; // exactly one of qshift/tshift is non-zero
+    let align_score = if stripped_gap_len > 0 {
+        ez.max + opt.scoring.gap_open + opt.scoring.gap_extend * stripped_gap_len
+    } else {
+        ez.max
+    };
 
     let cigar_str = fmt_cigar(&condensed, out.eqx);
     // fmt_cs/md/ds now accept nt4-encoded sequences directly

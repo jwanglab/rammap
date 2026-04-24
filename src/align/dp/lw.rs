@@ -174,13 +174,23 @@ unsafe fn lightweight_align_i16_sse2(qp: &mut LightweightProfile, target_len: i3
         std::mem::swap(&mut qp.h0, &mut qp.h1);
     }
 
-    // Find query_end from Hmax by scanning for positions matching gmax
-    // Clamp to valid positions (< qlen) to avoid returning SIMD padding positions.
+    // Find query_end from Hmax. Prefer an in-bounds position with value == gmax;
+    // fall back to the highest-scoring in-bounds position when gmax was achieved
+    // only at SIMD padding cells. The score returned is still gmax.
     for i in 0..qlen8 {
         let val = qp.hmax[i as usize] as i32;
         if val == gmax {
             let pos = i / 8 + (i % 8) * slen;
-            if pos < qp.qlen {
+            if pos < qp.qlen { query_end = pos; }
+        }
+    }
+    if query_end < 0 {
+        let mut best_val: i32 = i32::MIN;
+        for i in 0..qlen8 {
+            let val = qp.hmax[i as usize] as i32;
+            let pos = i / 8 + (i % 8) * slen;
+            if pos < qp.qlen && val > best_val {
+                best_val = val;
                 query_end = pos;
             }
         }
@@ -264,13 +274,23 @@ unsafe fn lightweight_align_i16_neon(qp: &mut LightweightProfile, target_len: i3
         std::mem::swap(&mut qp.h0, &mut qp.h1);
     }
 
-    // Find query_end from Hmax by scanning for positions matching gmax
-    // Clamp to valid positions (< qlen) to avoid returning SIMD padding positions.
+    // Find query_end from Hmax. Prefer an in-bounds position with value == gmax;
+    // fall back to the highest-scoring in-bounds position when gmax was achieved
+    // only at SIMD padding cells. The score returned is still gmax.
     for i in 0..qlen8 {
         let val = qp.hmax[i as usize] as i32;
         if val == gmax {
             let pos = i / 8 + (i % 8) * slen;
-            if pos < qp.qlen {
+            if pos < qp.qlen { query_end = pos; }
+        }
+    }
+    if query_end < 0 {
+        let mut best_val: i32 = i32::MIN;
+        for i in 0..qlen8 {
+            let val = qp.hmax[i as usize] as i32;
+            let pos = i / 8 + (i % 8) * slen;
+            if pos < qp.qlen && val > best_val {
+                best_val = val;
                 query_end = pos;
             }
         }
@@ -354,13 +374,23 @@ unsafe fn lightweight_align_i16_wasm(qp: &mut LightweightProfile, target_len: i3
         std::mem::swap(&mut qp.h0, &mut qp.h1);
     }
 
-    // Find query_end from Hmax by scanning for positions matching gmax
-    // Clamp to valid positions (< qlen) to avoid returning SIMD padding positions.
+    // Find query_end from Hmax. Prefer an in-bounds position with value == gmax;
+    // fall back to the highest-scoring in-bounds position when gmax was achieved
+    // only at SIMD padding cells. The score returned is still gmax.
     for i in 0..qlen8 {
         let val = qp.hmax[i as usize] as i32;
         if val == gmax {
             let pos = i / 8 + (i % 8) * slen;
-            if pos < qp.qlen {
+            if pos < qp.qlen { query_end = pos; }
+        }
+    }
+    if query_end < 0 {
+        let mut best_val: i32 = i32::MIN;
+        for i in 0..qlen8 {
+            let val = qp.hmax[i as usize] as i32;
+            let pos = i / 8 + (i % 8) * slen;
+            if pos < qp.qlen && val > best_val {
+                best_val = val;
                 query_end = pos;
             }
         }

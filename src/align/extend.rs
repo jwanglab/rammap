@@ -2001,6 +2001,11 @@ pub fn convert_cigar_to_eqx_pub(raw_cigar: &[u32], qseq: &[u8], tseq: &[u8], qs:
     convert_cigar_to_eqx(raw_cigar, qseq, tseq, qs, rs)
 }
 
+/// Public wrapper for fix_cigar (used by pipeline.rs for inversion alignment)
+pub fn fix_cigar_pub(cigar: &mut Vec<u32>, qseq: &[u8], tseq: &[u8], qs: i32, rs: i32) -> (i32, i32) {
+    fix_cigar(cigar, qseq, tseq, qs, rs)
+}
+
 /// Convert M ops to =/X ops (EQX mode).
 fn convert_cigar_to_eqx(raw_cigar: &[u32], qseq: &[u8], tseq: &[u8], qs: usize, rs: usize) -> Vec<CigarOp> {
     let mut ops = Vec::new();
