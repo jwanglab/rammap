@@ -2062,6 +2062,41 @@ fn format_unmapped_record(
 
 /// Format a single mapped SAM record.
 /// `idx` is the index of this result in the results array (needed for SA tag).
+/// Count CIGAR operations in a run-length-encoded CIGAR string like "10M2I5D".
+/// Counts one op per run (each `<digits><letter>` chunk).
+fn count_cigar_ops(cigar: &str) -> usize {
+    cigar.bytes().filter(|&b| !b.is_ascii_digit()).count()
+}
+
+/// Map a CIGAR op letter to its BAM op code.
+#[inline]
+fn bam_op_code(op: u8) -> u32 {
+    match op {
+        b'M' => 0, b'I' => 1, b'D' => 2, b'N' => 3,
+        b'S' => 4, b'H' => 5, b'P' => 6, b'=' => 7, b'X' => 8,
+        _ => 0,
+    }
+}
+
+/// Encode a run-length CIGAR string as comma-separated BAM uint32 values
+/// (`,<len<<4 | op>,...`) appended to `out`. Does NOT emit soft/hard clip ops —
+/// the caller adds those.
+fn write_cigar_as_bam_uints(out: &mut String, cigar: &str) {
+    let bytes = cigar.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut len: u32 = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            len = len * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        if i >= bytes.len() { break; }
+        let op = bytes[i];
+        i += 1;
+        write!(out, ",{}", (len << 4) | bam_op_code(op)).ok();
+    }
+}
+
 fn format_sam_record(
     output_buffer: &mut String,
     r: &AlnResult,
@@ -2124,6 +2159,33 @@ fn format_sam_record(
     full_cigar.push_str(&r.cigar_str);
     if clip_tail > 0 { full_cigar.push_str(&format!("{}{}", clip_tail, clip_char)); }
 
+    // BAM n_cigar_op is a uint16. When -L (LONG_CIGAR) is set and the CIGAR would
+    // exceed 65535 ops, move it into a CG:B:I tag and emit a placeholder <slen>S<rlen>N
+    // in the CIGAR column so samtools view/convert can round-trip.
+    const MAX_BAM_CIGAR_OP: usize = 65535;
+    let long_cigar_enabled = opt.flags.contains(AlignFlags::LONG_CIGAR);
+    let mid_op_count = count_cigar_ops(&r.cigar_str);
+    let total_cigar_ops = mid_op_count
+        + if clip_head > 0 { 1 } else { 0 }
+        + if clip_tail > 0 { 1 } else { 0 };
+    let cigar_in_tag = long_cigar_enabled
+        && !r.cigar_str.is_empty()
+        && total_cigar_ops > MAX_BAM_CIGAR_OP;
+
+    let placeholder_cigar = if cigar_in_tag {
+        let slen = if flag & 0x900 == 0 || opt.flags.contains(AlignFlags::SOFTCLIP) {
+            qlen
+        } else if flag & 0x100 != 0 && !opt.flags.contains(AlignFlags::SECONDARY_SEQ) {
+            0
+        } else {
+            r.query_end - r.query_start
+        };
+        let rlen = r.ref_end - r.ref_start;
+        Some(format!("{}S{}N", slen, rlen))
+    } else {
+        None
+    };
+
     let no_qual = opt.flags.contains(AlignFlags::NO_QUAL);
     let sec_seq = opt.flags.contains(AlignFlags::SECONDARY_SEQ);
     let soft_supp = opt.flags.contains(AlignFlags::SOFTCLIP);
@@ -2162,8 +2224,9 @@ fn format_sam_record(
     };
 
     // Write QNAME, FLAG, RNAME, POS, MAPQ, CIGAR
+    let cigar_col: &str = placeholder_cigar.as_deref().unwrap_or(&full_cigar);
     write!(output_buffer, "{}\t{}\t{}\t{}\t{}\t{}\t",
-        out_qname, flag, tname, r.ref_start + 1, mapq, full_cigar).ok();
+        out_qname, flag, tname, r.ref_start + 1, mapq, cigar_col).ok();
 
     // Write RNEXT/PNEXT/TLEN
     if n_seg > 1 {
@@ -2267,6 +2330,17 @@ fn format_sam_record(
     if out.do_md { write!(output_buffer, "\tMD:Z:{}", r.md_str).ok(); }
     else if out.do_ds { write!(output_buffer, "\tds:Z:{}", r.ds_str).ok(); }
     else if out.do_cs { write!(output_buffer, "\tcs:Z:{}", r.cs_str).ok(); }
+    if cigar_in_tag {
+        let clip_op_code: u32 = if clip_char == 'H' { 5 } else { 4 };
+        write!(output_buffer, "\tCG:B:I").ok();
+        if clip_head > 0 {
+            write!(output_buffer, ",{}", ((clip_head as u32) << 4) | clip_op_code).ok();
+        }
+        write_cigar_as_bam_uints(output_buffer, &r.cigar_str);
+        if clip_tail > 0 {
+            write!(output_buffer, ",{}", ((clip_tail as u32) << 4) | clip_op_code).ok();
+        }
+    }
     write!(output_buffer, "\trl:i:{}", rep_len).ok();
     if let Some(c) = comment { write!(output_buffer, "\t{}", c).ok(); }
     writeln!(output_buffer).ok();
@@ -2618,6 +2692,24 @@ mod tests {
     use super::*;
     use crate::align::index::Index;
     use crate::align::extend::AlignmentContext;
+
+    #[test]
+    fn test_count_cigar_ops() {
+        assert_eq!(count_cigar_ops(""), 0);
+        assert_eq!(count_cigar_ops("10M"), 1);
+        assert_eq!(count_cigar_ops("10M2I5D"), 3);
+        assert_eq!(count_cigar_ops("3=1X2=1I4="), 5);
+        assert_eq!(count_cigar_ops("100M"), 1);
+    }
+
+    #[test]
+    fn test_write_cigar_as_bam_uints() {
+        let mut s = String::new();
+        write_cigar_as_bam_uints(&mut s, "10M2I5D3N1S7=2X");
+        // op codes: M=0, I=1, D=2, N=3, S=4, ==7, X=8
+        // 10<<4|0=160, 2<<4|1=33, 5<<4|2=82, 3<<4|3=51, 1<<4|4=20, 7<<4|7=119, 2<<4|8=40
+        assert_eq!(s, ",160,33,82,51,20,119,40");
+    }
 
     #[test]
     fn test_align_and_format_simple() {
