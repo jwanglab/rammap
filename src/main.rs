@@ -556,7 +556,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if let Some(v) = cli.min_cnt { opt.chaining.min_cnt = v; }
     if let Some(v) = cli.max_gap { opt.chaining.max_gap = v; }
     if let Some(v) = cli.chain_gap_scale {
-        opt.chaining.chn_pen_gap = (v as f64 * 0.01 * (k as f64)) as f32;
+        opt.chaining.chain_gap_scale = v;
     }
     if let Some(v) = cli.mid_occ { opt.seeding.mid_occ = v; }
     if let Some(v) = cli.scor_a { opt.scoring.match_score = v; }
@@ -708,9 +708,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     }
 
     // Recompute chaining penalties after all CLI overrides
-    if cli.chain_gap_scale.is_none() {
-        opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * (k as f64)) as f32;
-    }
+    opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * (k as f64)) as f32;
     if let Some(v) = cli.chain_skip_scale {
         opt.filtering.chain_skip_scale = v;
     }
