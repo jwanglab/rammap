@@ -677,7 +677,7 @@ fn collect_minimizers_multi(
     seqs: &[&[u8]],
     qlens: &[usize],
     minimizers: &mut Vec<Minimizer>,
-) -> usize {
+) {
     minimizers.clear();
     let mut sum: usize = 0;
     for i in 0..seqs.len() {
@@ -688,7 +688,6 @@ fn collect_minimizers_multi(
         }
         sum += qlens[i];
     }
-    sum
 }
 
 /// Port of mm_filter_suboptimal_multi_segment (pe.c:6-43).
@@ -943,7 +942,7 @@ pub fn map_query_multi(
     let read_hash = compute_read_hash(qname, qlen_sum, opt.filtering.seed as u32, opt.flags);
 
     let t0 = Instant::now();
-    let _qlen_sum_check = collect_minimizers_multi(mi, seqs, qlens, &mut ctx.minimizers);
+    collect_minimizers_multi(mi, seqs, qlens, &mut ctx.minimizers);
 
     // mm_filter_minimizers_by_occ (map.c:251)
     if opt.seeding.q_occ_frac > 0.0 && opt.seeding.mid_occ > 0 && ctx.minimizers.len() > opt.seeding.mid_occ {

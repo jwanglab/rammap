@@ -370,7 +370,6 @@ unsafe fn lightweight_align_i16_wasm(qp: &mut LightweightProfile, target_len: i3
 }
 
 /// Scalar fallback for lightweight_align_i16
-#[allow(dead_code)]
 pub fn lightweight_align_i16_scalar(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
     // Simple scalar Smith-Waterman for non-SIMD platforms
     let qlen = qp.qlen as usize;

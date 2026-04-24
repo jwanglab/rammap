@@ -1629,7 +1629,7 @@ fn map_one_part_split(
 
             let qname1 = rec1.name().to_string();
             let qseq1 = rec1.sequence().to_vec();
-            let _qname2 = rec2.name().to_string();
+            let qname2 = rec2.name().to_string();
             let qseq2 = rec2.sequence().to_vec();
 
             let qseq1_work = if flip_r1 { rev_comp(&qseq1) } else { qseq1.clone() };
@@ -1638,7 +1638,7 @@ fn map_one_part_split(
             let (pq1, pq2, frag_gap) = if is_independ {
                 let pq1 = process_query(opt, mi, &qname1, &qseq1_work, &mut ctx, &mut map_ctx,
                     junc_db.as_ref(), out_cfg);
-                let pq2 = process_query(opt, mi, &_qname2, &qseq2_work, &mut ctx, &mut map_ctx,
+                let pq2 = process_query(opt, mi, &qname2, &qseq2_work, &mut ctx, &mut map_ctx,
                     junc_db.as_ref(), out_cfg);
                 (pq1, pq2, opt.chaining.max_gap_ref)
             } else if is_weak {

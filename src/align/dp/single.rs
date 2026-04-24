@@ -27,7 +27,6 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
 ) { unsafe {
     let query_len = qseq.len();
     let target_len = tseq.len();
-    let _n_col_ = if (query_len + target_len - 1) * 16 < query_len * target_len { (query_len + target_len - 1).div_ceil(16) } else { query_len.div_ceil(16) + target_len.div_ceil(16) }; // simplified
     let approx_max = (flags & APPROX_MAX) != 0;
     
     if alphabet_size <= 0 {
@@ -43,16 +42,7 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     let flag8_ = vdupq_n_u8(0x08);
     let flag16_ = vdupq_n_u8(0x10);
     
-    let _sc_mch_ = vdupq_n_s8(score_matrix[0]);
-    let _sc_mis_ = vdupq_n_s8(score_matrix[1]);
-    let _sc_n = if score_matrix[(alphabet_size as usize)*(alphabet_size as usize)-1] == 0 { 
-        vdupq_n_s8(-gap_extend) 
-    } else { 
-        vdupq_n_s8(score_matrix[(alphabet_size as usize)*(alphabet_size as usize)-1]) 
-    };
-    
     let _m1_ = vdupq_n_u8((alphabet_size - 1) as u8);
-    let _max_sc_ = vdupq_n_u8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as u8);
 
     // Scoring constants for NEON SIMD scoring loop (unsigned u8 for vbslq_u8)
     let sc_mis_v = vdupq_n_u8(score_matrix[1] as u8);
@@ -67,10 +57,8 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     // Dimension calculations
     let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
     let wl = bandwidth;
-    let _wr = bandwidth;
-    
+
     let tlen_ = target_len.div_ceil(16); // Number of 16-byte blocks for target_len
-    let _qlen_ = query_len.div_ceil(16); // Number of 16-byte blocks for query_len
 
     // _n_col_ is for traceback arrays p, off, off_end
     let mut _n_col_ = if query_len < target_len { query_len } else { target_len };
@@ -113,16 +101,6 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     let u = mem.as_ptr() as *mut uint8x16_t;
     let base_ptr = mem.as_ptr();
 
-    // ... (rest of pointer init)
-    
-    // Core Loop
-    // ...
-    
-         // Score calc logic
-         // ...
-         
-
-    
     // definitions based on offsets
     let v = u.add(tlen_);
     let x = v.add(tlen_);
@@ -150,13 +128,8 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     }
     
     // Copy target to sf
-    let _sf_slice = std::slice::from_raw_parts_mut(sf, target_len);
     std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-    // ... continue implementation ...
-    
-    // Core Loop
-    // for (r = 0; r < query_len + target_len - 1; ++r)
     let mut last_st = -1;
     let mut last_en = -1;
     let valid_range = (query_len + target_len - 1) as i32;
@@ -189,12 +162,10 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
         let st0 = st;
         let en0 = en;
         
-        // Alignment to 16-byte boundaries (simulating C logic)
         // Align st down to 16, en up to 16-1
         st = (st / 16) * 16;
         en = ((en + 16) / 16) * 16 - 1;
         
-        // set boundary conditions
         // set boundary conditions
         if st > 0 {
              if st > last_st && st - 1 <= last_en {
@@ -213,20 +184,6 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
              *(y as *mut i8).add(r as usize) = 0;
              *(u as *mut i8).add(r as usize) = if r == 0 { 0 } else { gap_open };
         }
-        // Unlike C which checks GENERIC_SCORING, we assume match/mismatch logic for now for speed?
-        // Actually, let's implement the generic case logic first if flags suggests, or just the standard match/mismatch
-        // C implementation uses the standard match/mismatch block usually.
-        
-        let _st_idx = st0 as usize;
-        let _en_idx = en0 as usize;
-        
-        // Scalar loop for scoring setup (easier to port safely first, optimize later?)
-        // C uses SIMD here too.
-        // Let's use scalar for now to ensure correctness of logic then upgrade to SIMD if needed.
-        // Actually, the SIMD setup is quite complex with blends.
-        
-        // C logic:
-        // for (t = st0; t <= en0; t += 16) { set scores }
         
         // Set scores (16-element NEON SIMD scoring loop)
         if (flags & GENERIC_SCORING) == 0 {
@@ -262,33 +219,25 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
              let xt_val = vld1q_u8((x as *const u8).add(ti*16));
              let mut xt1 = xt_val;
              
-             // tmp = _mm_srli_si128(xt1, 15);
              let tmp = vextq_u8(xt1, zero_, 15);
              
-             // xt1 = _mm_or_si128(_mm_slli_si128(xt1, 1), x1_);
              let shifted_xt1 = vextq_u8(zero_, xt1, 15); 
              xt1 = vorrq_u8(shifted_xt1, x1_);
              x1_ = tmp;
              
-             // vt1 = _mm_load_si128(&v[t]);
              let vt_val = vld1q_u8((v as *const u8).add(ti*16));
              let mut vt1 = vt_val;
              
-             // tmp = _mm_srli_si128(vt1, 15);
              let tmp_v = vextq_u8(vt1, zero_, 15);
              
-             // vt1 = _mm_or_si128(_mm_slli_si128(vt1, 1), v1_);
              let shifted_vt1 = vextq_u8(zero_, vt1, 15);
              vt1 = vorrq_u8(shifted_vt1, v1_);
              v1_ = tmp_v;
              
-             // a = _mm_add_epi8(xt1, vt1);
              let mut a = vaddq_u8(xt1, vt1);
              
-             // ut = _mm_load_si128(&u[t]); 
              let ut = vld1q_u8((u as *const u8).add(ti*16));
              
-             // b = _mm_add_epi8(_mm_load_si128(&y[t]), ut);
              let yt = vld1q_u8((y as *const u8).add(ti*16));
              let mut b = vaddq_u8(yt, ut);
              
@@ -322,11 +271,7 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
                  // z = max(z, b) (Signed)
                  let z_s8_final = vmaxq_s8(z_s8_curr, b_s8);
                  z = vreinterpretq_u8_s8(z_s8_final);
-                 
-                 // Remove vminq_u8 logic for now, C uses signed logic primarily
-                 // But we should cap at 127 if possible? C doesn't seem to explicitly cap in SSE4.1 path
-                 // z = vminq_u8(z, _max_sc_); // Removed
-                 
+
                  vst1q_u8((u as *mut u8).add(ti*16), vsubq_u8(z, vt1));
                  vst1q_u8((v as *mut u8).add(ti*16), vsubq_u8(z, ut));
                  z = vsubq_u8(z, q_);
@@ -357,7 +302,6 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
                  // score only
                  // z = max(z, a) (Signed)
                  let z_s8_new = vmaxq_s8(z_s8, a_s8);
-                 let _z_un = vreinterpretq_u8_s8(z_s8_new);
                  // z = max(z, b) (Signed)
                  let z_s8_final = vmaxq_s8(z_s8_new, b_s8);
                  z = vreinterpretq_u8_s8(z_s8_final);
@@ -378,62 +322,55 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
              }
         }
         
-        // Debug
-        // println!("r={} st={} en={} max_sc={}", r, st, en, score_matrix[0]); 
-        
-        // Approx Logic
-        if !approx_max {
-             // ...
-        } else {
-             // Approx max logic
-             if r > 0 {
-                 if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                     let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                     let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
-                     let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
-                     let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
-                     
-                     if d0 > d1 {
-                         h0 += d0;
-                     } else {
-                         h0 += d1;
-                         last_h0_t += 1;
-                     }
-                 } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                      let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                      h0 += d0_val - (gap_open as i32 + gap_extend as i32);
-                 } else {
-                      last_h0_t += 1;
-                      let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
-                      h0 += d1_val - (gap_open as i32 + gap_extend as i32);
-                 }
-                 
-                 // Update max score (approx)
-                 if h0 > result.max {
-                      result.max = h0;
-                      result.max_score_target_pos = last_h0_t;
-                      result.max_score_query_pos = r - last_h0_t;
-                 }
-                 
-                 // Check z_drop
-                 if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                      let tl = last_h0_t - result.max_score_target_pos;
-                      let ql = (r - last_h0_t) - result.max_score_query_pos;
-                      let l = if tl > ql { tl - ql } else { ql - tl };
-                      if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                          result.zdropped = 1;
-                          break;
-                      }
-                 }
-             } else {
-                 // r == 0
-                 let v0 = *v8_ptr.add(0) as i8 as i32;
-                 h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
-                 last_h0_t = 0;
-                 if h0 > result.max {
-                     result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
-                 }
-             }
+        // Score and max tracking
+        if approx_max {
+            if r > 0 {
+                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
+                    let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
+                    let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
+                    let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
+                    let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
+
+                    if d0 > d1 {
+                        h0 += d0;
+                    } else {
+                        h0 += d1;
+                        last_h0_t += 1;
+                    }
+                } else if last_h0_t >= st0 && last_h0_t <= en0 {
+                    let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
+                    h0 += d0_val - (gap_open as i32 + gap_extend as i32);
+                } else {
+                    last_h0_t += 1;
+                    let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
+                    h0 += d1_val - (gap_open as i32 + gap_extend as i32);
+                }
+
+                if h0 > result.max {
+                    result.max = h0;
+                    result.max_score_target_pos = last_h0_t;
+                    result.max_score_query_pos = r - last_h0_t;
+                }
+
+                // Check z_drop
+                if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                    let tl = last_h0_t - result.max_score_target_pos;
+                    let ql = (r - last_h0_t) - result.max_score_query_pos;
+                    let l = if tl > ql { tl - ql } else { ql - tl };
+                    if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
+                        result.zdropped = 1;
+                        break;
+                    }
+                }
+            } else {
+                // r == 0
+                let v0 = *v8_ptr.add(0) as i8 as i32;
+                h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
+                last_h0_t = 0;
+                if h0 > result.max {
+                    result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
+                }
+            }
         }
         
         // Final score update
@@ -457,10 +394,15 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
 // SSE2/SSE4.1 Unified Implementation - Single-Affine Alignment
 // ============================================================================
 //
-// Macro generates both SSE2 and SSE4.1 variants. The only differences are:
-// - max_epi8: SSE2 uses sse2_max_epi8 helper, SSE4.1 uses native _mm_max_epi8
-// - blend: SSE2 uses and/andnot/or pattern, SSE4.1 uses _mm_blendv_epi8
-// Both variants require only SSE2 target_feature (SSE4.1 is detected at runtime).
+// The macro below expands into three variants that differ only in how they
+// realize a handful of intrinsics (signed max_epi8 and blendv_epi8 are SSE4.1
+// additions). Each variant is compiled with the narrowest target_feature it
+// actually needs, so LLVM does not emit emulation when native instructions
+// are available:
+//   extend_single_affine2_impl    → target_feature("sse2"),    emulated helpers
+//   extend_single_affine41_impl   → target_feature("sse4.1"),  native intrinsics
+//   extend_single_affine_wasm_impl → target_feature("simd128"), native intrinsics
+// Runtime dispatch selects among them in the parent function.
 
 #[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
 macro_rules! extend_single_affine_impl {
@@ -504,7 +446,6 @@ macro_rules! extend_single_affine_impl {
             };
 
             let _m1_ = _mm_set1_epi8((alphabet_size - 1) as i8);
-            let _max_sc_ = _mm_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
 
             // Dimension calculations
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -569,7 +510,6 @@ macro_rules! extend_single_affine_impl {
             // Copy target
             std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-            // Initialize result
             init_dp_result(result);
 
             let mut last_st: i32 = -1;
@@ -721,7 +661,7 @@ macro_rules! extend_single_affine_impl {
                         a = _mm_sub_epi8(a, z);
                         b = _mm_sub_epi8(b, z);
 
-                        // x = max(a, 0) - qe2
+                        // x = max(a, 0)
                         let x_res = $max_epi8(a, zero_);
                         _mm_storeu_si128(x.add(ti), x_res);
 
@@ -729,7 +669,7 @@ macro_rules! extend_single_affine_impl {
                         let mask_a = _mm_cmpgt_epi8(a, zero_);
                         d = _mm_or_si128(d, _mm_and_si128(flag8_, mask_a));
 
-                        // y = max(b, 0) - qe2
+                        // y = max(b, 0)
                         let y_res = $max_epi8(b, zero_);
                         _mm_storeu_si128(y.add(ti), y_res);
 
@@ -880,7 +820,6 @@ macro_rules! extend_single_affine_avx2_impl {
             };
 
             let _m1_ = _mm256_set1_epi8((alphabet_size - 1) as i8);
-            let _max_sc_ = _mm256_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
 
             // Dimension calculations (width=32)
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -1113,7 +1052,7 @@ macro_rules! extend_single_affine_avx2_impl {
                         a = _mm256_sub_epi8(a, z);
                         b = _mm256_sub_epi8(b, z);
 
-                        // x = max(a, 0) - qe2
+                        // x = max(a, 0)
                         let x_res = _mm256_max_epi8(a, zero_);
                         _mm256_storeu_si256(x_b.add(bp) as *mut __m256i, x_res);
 
@@ -1121,7 +1060,7 @@ macro_rules! extend_single_affine_avx2_impl {
                         let mask_a = _mm256_cmpgt_epi8(a, zero_);
                         d = _mm256_or_si256(d, _mm256_and_si256(flag8_, mask_a));
 
-                        // y = max(b, 0) - qe2
+                        // y = max(b, 0)
                         let y_res = _mm256_max_epi8(b, zero_);
                         _mm256_storeu_si256(y_b.add(bp) as *mut __m256i, y_res);
 
@@ -1145,7 +1084,7 @@ macro_rules! extend_single_affine_avx2_impl {
                     bp += 32;
                 }
 
-                // Approx max logic (scalar — identical to SSE version)
+                // Score and max tracking (scalar — identical to SSE version)
                 {
                     if r > 0 {
                         if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
@@ -1261,7 +1200,6 @@ macro_rules! extend_single_affine_avx512_impl {
             };
 
             let _m1_ = _mm512_set1_epi8((alphabet_size - 1) as i8);
-            let _max_sc_ = _mm512_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
 
             // Dimension calculations (width=64)
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -1325,7 +1263,6 @@ macro_rules! extend_single_affine_avx512_impl {
             // Copy target
             std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-            // Initialize result
             init_dp_result(result);
 
             let mut last_st: i32 = -1;
@@ -1521,7 +1458,7 @@ macro_rules! extend_single_affine_avx512_impl {
                     bp += 64;
                 }
 
-                // Approx max logic (scalar — identical to SSE/AVX2 version)
+                // Score and max tracking (scalar — identical to SSE/AVX2 version)
                 {
                     if r > 0 {
                         if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
@@ -1872,19 +1809,14 @@ pub fn extend_single_affine_scalar(
             }
         }
 
-        // Track endpoint scores
-        if en0 == target_len as i32 - 1 {
-            let h_en = if r > 0 {
-                // Reconstruct H[en0] from accumulated v values
-                // This is approximate but matches h0 tracking at the boundary
-                h0 // when last_h0_t == en0, h0 IS H[en0]
-            } else {
-                h0
-            };
-            if last_h0_t == en0 && h_en > result.max_target_end_score {
-                result.max_target_end_score = h_en;
-                result.max_target_end_query_pos = r - en0;
-            }
+        // Track endpoint scores. h0 equals H[last_h0_t], so the right-boundary
+        // score H[en0] is available exactly when the diagonal has reached en0.
+        if en0 == target_len as i32 - 1
+            && last_h0_t == en0
+            && h0 > result.max_target_end_score
+        {
+            result.max_target_end_score = h0;
+            result.max_target_end_query_pos = r - en0;
         }
         if r - st0 == query_len as i32 - 1 && last_h0_t == st0
             && h0 > result.max_query_end_score {

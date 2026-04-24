@@ -781,8 +781,6 @@ fn try_align_inversion(
     let bw = (opt.chaining.bandwidth as f64 * 1.5) as i32;
     let q_sub = &qseq[q_off as usize..];
     let t_sub = &tseq[t_off as usize..];
-    let _ql_sub = ql - q_off;
-    let _tl_sub = tl - t_off;
 
     let mut ez = crate::align::dp::DpResult::default();
     let mut dp_flag = crate::align::dp::EXTENSION_ONLY;

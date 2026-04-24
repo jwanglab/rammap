@@ -95,7 +95,6 @@ impl<R: BufRead> Reader<R> {
                 self.line_number += 1;
                 continue;
             }
-            let _header_line_num = self.line_number;
             self.line_number += 1;
 
             let l1_end = trim_newline(&self.buf);
