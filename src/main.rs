@@ -38,8 +38,21 @@ struct AlignArgs {
     #[arg(short = 'd', long)]
     pub dump_index: Option<String>,
 
-    /// Preset (map-ont, asm5, asm10, asm20, sr, splice)
-    #[arg(short = 'x', long)]
+    /// Preset applied before other options. Accepted values:
+    ///   lr / map-ont     — Nanopore vs reference (default-like)
+    ///   map-pb / map10k  — PacBio CLR vs reference (HPC seeds)
+    ///   map-hifi / map-ccs — PacBio HiFi vs reference
+    ///   map-iclr         — Illumina Complete Long Reads vs reference
+    ///   map-iclr-prerender — ICLR pre-render variant
+    ///   lr:hq            — accurate long reads (<1% error) vs reference
+    ///   lr:hqae          — HQ long-read assembly eval (k=25 w=51, RMQ)
+    ///   asm5 / asm10 / asm20 — asm-to-ref ~0.1/1/5% divergence
+    ///   ava-ont / ava-pb — all-vs-all Nanopore / PacBio read overlap
+    ///   short / sr       — short reads vs reference
+    ///   splice / splice:hq — spliced long reads / accurate long reads
+    ///   splice:sr        — spliced short RNA-seq reads
+    ///   cdna             — cDNA / splice alias
+    #[arg(short = 'x', long, verbatim_doc_comment)]
     pub preset: Option<String>,
 
     /// Minimizer k-mer length
@@ -469,8 +482,8 @@ fn parse_num(s: &str) -> i64 {
 
 /// Apply preset configurations.
 /// The `is_hpc` output indicates whether homopolymer compression should be used.
-fn apply_preset(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) {
-    rammap::api::apply_preset_str(opt, k, w, is_hpc, preset);
+fn apply_preset(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) -> anyhow::Result<()> {
+    rammap::api::apply_preset_str(opt, k, w, is_hpc, preset).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn run(cli: AlignArgs) -> anyhow::Result<()> {
@@ -526,7 +539,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     let mut opt = MapOptions::default();
 
     if let Some(preset) = &cli.preset {
-        apply_preset(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
+        apply_preset(&mut opt, &mut k, &mut w, &mut is_hpc, preset)?;
     }
 
     // CLI overrides (applied after preset)

@@ -244,7 +244,7 @@ impl Aligner {
         let mut w = 10usize;
         let mut is_hpc = false;
         let mut opt = MapOptions::default();
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str());
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
 
         let seqs = crate::fasta::read_fasta(path)?;
         let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
@@ -271,7 +271,7 @@ impl Aligner {
         let mut w = 10usize;
         let mut is_hpc = false;
         let mut opt = MapOptions::default();
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str());
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
         opt.flags.insert(AlignFlags::OUT_CIGAR);
 
         let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
@@ -381,7 +381,7 @@ fn build_options(preset: Preset, index_k: usize, index_w: usize) -> (MapOptions,
     let mut w = index_w;
     let mut is_hpc = false;
     let mut opt = MapOptions::default();
-    apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str());
+    apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
 
     let out_cfg = OutputConfig {
         do_cigar: true,
@@ -528,8 +528,10 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
 /// Apply a preset by string name (e.g., "map-ont", "sr", "splice").
 ///
 /// This is the same function used by the CLI's `-x` flag. Modifies `opt`,
-/// `k`, `w`, and `is_hpc` in place.
-pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) {
+/// `k`, `w`, and `is_hpc` in place. Returns an error if the preset name
+/// is not recognized so the caller can abort rather than silently using
+/// the default configuration.
+pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) -> Result<(), String> {
     match preset {
         "lr" | "map-ont" => {
             *k = 15; *w = 10;
@@ -591,7 +593,7 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
                     *w = 10;
                 },
                 _ => {
-                    eprintln!("Warning: Unknown asm preset '{}', using asm20 defaults", p);
+                    return Err(format!("unrecognized asm preset '{}' (expected asm5, asm10, or asm20)", p));
                 }
             }
         },
@@ -657,11 +659,12 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             opt.seeding.occ_dist = 0;
         },
         _ => {
-            eprintln!("Warning: Unknown preset '{}', using default", preset);
+            return Err(format!("unrecognized preset '{}'", preset));
         }
     }
     opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * (*k as f64)) as f32;
     opt.chaining.chn_pen_skip = 0.0;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1008,7 @@ mod tests {
     fn test_apply_preset_sr() {
         let mut opt = MapOptions::default();
         let mut k = 15; let mut w = 10; let mut is_hpc = false;
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "sr");
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "sr").unwrap();
         assert_eq!(k, 21);
         assert_eq!(w, 11);
         assert!(opt.flags.contains(AlignFlags::SHORT_READ));
