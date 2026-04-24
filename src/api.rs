@@ -347,7 +347,7 @@ impl Aligner {
 
     /// Save the index to a file (RMMI format).
     pub fn save_index(&self, path: &str) -> io::Result<()> {
-        self.index.save(path).map_err(|e| io::Error::other(e))
+        self.index.save(path).map_err(io::Error::other)
     }
 
     /// Access the underlying index.

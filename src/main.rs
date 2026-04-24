@@ -489,10 +489,8 @@ fn apply_preset(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut
 fn run(cli: AlignArgs) -> anyhow::Result<()> {
     let do_ds = cli.ds;
     let cs_mode: Option<&str> = cli.cs.as_ref().map(|v| v.as_deref().unwrap_or("short"));
-    if let Some(m) = cs_mode {
-        if m != "short" && m != "long" && m != "none" {
-            eprintln!("[WARNING] --cs only takes 'short', 'long', or 'none'. '{}' is treated as 'short'.", m);
-        }
+    if let Some(m) = cs_mode && m != "short" && m != "long" && m != "none" {
+        eprintln!("[WARNING] --cs only takes 'short', 'long', or 'none'. '{}' is treated as 'short'.", m);
     }
     let cs_is_none = cs_mode == Some("none");
     let cs_long = cs_mode == Some("long");
