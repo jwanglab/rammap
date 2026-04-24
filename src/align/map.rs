@@ -1293,7 +1293,12 @@ pub fn map_query(
     let t2 = Instant::now();
 
     // Compute max chaining gaps
-    let max_chain_gap_qry = opt.chaining.max_gap;
+    let is_sr = opt.flags.contains(AlignFlags::SHORT_READ);
+    let max_chain_gap_qry = if is_sr {
+        if qlen as i32 > opt.chaining.max_gap { qlen as i32 } else { opt.chaining.max_gap }
+    } else {
+        opt.chaining.max_gap
+    };
     let max_chain_gap_ref = if opt.chaining.max_gap_ref > 0 {
         opt.chaining.max_gap_ref
     } else if opt.pairing.max_frag_len > 0 {
