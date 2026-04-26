@@ -1867,7 +1867,6 @@ pub fn align_anchors(
                     let remaining = cnt1 as i32 - (j_split + 1);
                     if remaining >= min_cnt {
                         // Split: save right part anchors from original chain
-                        // n = as1 + j + 1 - r->as in mm2 terms
                         // In our terms: split_offset = as1_offset + (j_split + 1) as usize
                         let split_off = as1_offset + (j_split + 1) as usize;
                         if split_off < anchors.len() {

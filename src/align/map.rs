@@ -492,6 +492,7 @@ pub fn compute_bounds_from_squeezed(
     let rs0_pre = first.ref_pos() + 1 - first_q_span;
     let qs0_pre = first.query_pos() + 1 - first_q_span;
 
+
     // Left nearby-seed inspection (align.c:711-722)
     let mut left_rs1 = 0i32;
     let mut left_qs1 = 0i32;
@@ -1646,70 +1647,64 @@ pub fn map_query(
         }
     }
 
-    // In-place compaction for secondary filtering
-    // Critical: parent score reads come from the partially-compacted array.
-    // As items are compacted forward (copy, not swap), parent pointers (which reference
-    // original indices) may end up pointing to items that were moved from later positions,
-    // reading a different score than the actual parent. We must replicate this behavior
-    // by using clone-copy (not swap) to match the C assignment semantics.
-    let mut k = 0usize;
-    let mut n_second = 0i32;
+    // Two-pass secondary filtering. Parent score/strand lookups in the first pass
+    // read from the original (unmodified) regs. Compaction happens in the second
+    // pass so no parent read ever sees a slot overwritten by a later entry.
     let n = regs.len();
-    // Track original-index → compacted-index mapping for parent lookups
-    let mut orig_to_compact: Vec<usize> = vec![0; n];
+    let mut keep = vec![false; n];
+    let mut n_second = 0i32;
     for i in 0..n {
         let p = parent_state.parent[i];
         if p == i {
-            // Primary: always kept (hit.c:261-262)
-            // r[k++] = r[i] — copy forward
-            orig_to_compact[i] = k;
-            regs[i].compact_parent = k; // primary is its own parent
-            if k != i {
-                regs[k] = regs[i].clone();
-            }
-            k += 1;
-        } else {
-            // Secondary: read parent score from current (partially-compacted) array
-            // Parent score reads from the in-place array
-            let p_score = regs[p].score;
-            let p_rev = regs[p].is_reverse;
-            let filter_result = check_secondary_filter(
-                regs[i].score,
-                regs[i].is_reverse,
-                p_score,
-                p_rev,
-                &filter_params,
-                true, // check_strand=true for pre-alignment (map.c:210)
-            );
+            keep[i] = true;
+            continue;
+        }
+        let p_score = regs[p].score;
+        let p_rev = regs[p].is_reverse;
+        let filter_result = check_secondary_filter(
+            regs[i].score,
+            regs[i].is_reverse,
+            p_score,
+            p_rev,
+            &filter_params,
+            true, // check_strand=true for pre-alignment (map.c:210)
+        );
 
-            if filter_result.passes && n_second < opt.filtering.best_n {
-                // Check not identical hits (hit.c:264)
-                let p_qs = regs[p].query_start;
-                let p_qe = regs[p].query_end;
-                let p_rid = regs[p].ref_id;
-                let p_rs = regs[p].ref_start;
-                let p_re = regs[p].ref_end;
-                let identical = regs[i].query_start == p_qs && regs[i].query_end == p_qe
-                    && regs[i].ref_id == p_rid && regs[i].ref_start == p_rs && regs[i].ref_end == p_re;
-                if !identical {
-                    regs[i].is_secondary = true;
-                    // Track strand-retained chains (hit.c:276)
-                    if filter_result.passes_strand && !filter_result.passes_ratio && !filter_result.passes_min_diff {
-                        regs[i].strand_retained = true;
-                    }
-                    // Store parent's compacted index for filter_strand_retained
-                    regs[i].compact_parent = orig_to_compact[parent_state.parent[i]];
-                    orig_to_compact[i] = k;
-                    if k != i {
-                        regs[k] = regs[i].clone();
-                    }
-                    k += 1;
-                    n_second += 1;
+        if filter_result.passes && n_second < opt.filtering.best_n {
+            let p_qs = regs[p].query_start;
+            let p_qe = regs[p].query_end;
+            let p_rid = regs[p].ref_id;
+            let p_rs = regs[p].ref_start;
+            let p_re = regs[p].ref_end;
+            let identical = regs[i].query_start == p_qs && regs[i].query_end == p_qe
+                && regs[i].ref_id == p_rid && regs[i].ref_start == p_rs && regs[i].ref_end == p_re;
+            if !identical {
+                regs[i].is_secondary = true;
+                if filter_result.passes_strand && !filter_result.passes_ratio && !filter_result.passes_min_diff {
+                    regs[i].strand_retained = true;
                 }
+                keep[i] = true;
+                n_second += 1;
             }
         }
     }
-    regs.truncate(k);
+
+    // Compact regs based on `keep[]`. Build the orig→compacted index map first,
+    // then populate compact_parent using parent_state (which indexes original slots).
+    let mut orig_to_compact: Vec<usize> = vec![usize::MAX; n];
+    let mut k = 0usize;
+    for i in 0..n {
+        if keep[i] { orig_to_compact[i] = k; k += 1; }
+    }
+    let mut compacted: Vec<Mapping> = Vec::with_capacity(k);
+    for (orig, r) in regs.drain(..).enumerate() {
+        if !keep[orig] { continue; }
+        let mut r = r;
+        let orig_parent = parent_state.parent[orig];
+        r.compact_parent = orig_to_compact[orig_parent];
+        compacted.push(r);
+    }
+    regs = compacted;
     let mut filtered_regs = regs;
     let pc3 = Instant::now();
     PC_PARENT_NS.fetch_add((pc3 - pc2).as_nanos() as u64, Relaxed);

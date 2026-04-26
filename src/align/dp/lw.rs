@@ -48,7 +48,7 @@ pub fn lightweight_profile_init(qlen: i32, query: &[u8], alphabet_size: i32, sco
                 let mut k = i;
                 while k < nlen {
                     qp[t] = if (k as i32) >= qlen {
-                        0
+                        -1
                     } else {
                         ma[query[k] as usize] as i16
                     };

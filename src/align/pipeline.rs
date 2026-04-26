@@ -235,12 +235,12 @@ impl CigarStats {
 
 // Stats needed for dp_max recalculation
 pub struct DpRecalcInfo {
-    match_len: i32,
-    block_len: i32,
-    num_ambiguous: i32,
-    gap_bases: i32,
-    gap_opens: i32,
-    sum_log_gap: f64,
+    pub match_len: i32,
+    pub block_len: i32,
+    pub num_ambiguous: i32,
+    pub gap_bases: i32,
+    pub gap_opens: i32,
+    pub sum_log_gap: f64,
 }
 
 impl DpRecalcInfo {
@@ -1352,22 +1352,20 @@ fn assign_parents_and_select(
 
         // Select secondaries
         let n = results.len();
-        let mut score_at: Vec<(i32, bool)> = results.iter().map(|r| (r.chain_score, r.is_reverse)).collect();
+        let score_at: Vec<(i32, bool)> = results.iter().map(|r| (r.chain_score, r.is_reverse)).collect();
         let mut keep = vec![false; n];
         let mut is_sec = vec![false; n];
         let mut k = 0usize;
         let mut n_second = 0i32;
 
+        // Two-pass: mark `keep[i]` using ORIGINAL parent scores. Compaction in the
+        // second pass (via filtered_results below) so parent lookups never read a
+        // slot that was overwritten by earlier iterations.
         for i in 0..n {
             let p = parent_state.parent[i];
             if p == i || results[i].inv {
-                // Primary or inversion: always keep
-                if k != i {
-                    score_at[k] = score_at[i];
-                }
                 k += 1;
                 keep[i] = true;
-                // Inversions with parent != self are secondary inversions
                 if results[i].inv && p != i {
                     is_sec[i] = true;
                 }
@@ -1386,9 +1384,6 @@ fn assign_parents_and_select(
                     let identical = results[i].query_start == results[p].query_start && results[i].query_end == results[p].query_end
                         && results[i].ref_id == results[p].ref_id && results[i].ref_start == results[p].ref_start && results[i].ref_end == results[p].ref_end;
                     if !identical {
-                        if k != i {
-                            score_at[k] = score_at[i];
-                        }
                         k += 1;
                         n_second += 1;
                         keep[i] = true;
@@ -1617,7 +1612,16 @@ fn process_query_core(
                         eprintln!("[DBG] INV_FOUND qs={} qe={} rs={} re={} score={}",
                             inv_result.query_start, inv_result.query_end, inv_result.ref_start, inv_result.ref_end, inv_result.align_score);
                     }
-                    let inv_recalc = DpRecalcInfo { match_len: 0, block_len: 0, num_ambiguous: 0, gap_bases: 0, gap_opens: 0, sum_log_gap: 0.0 };
+                    // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi
+                    // come from per-base comparison in CigarStats; gap stats come from CIGAR
+                    // ops). from_cigar_str alone treats M as all matches, which over-inflates
+                    // mlen for high-divergence inversions and lets them pass the post-recalc
+                    // dp_max filter that mm2 (via mm_update_extra → mm_recal_max_dp) would
+                    // collapse to 0.
+                    let mut inv_recalc = DpRecalcInfo::from_cigar_str(&inv_result.cigar_str);
+                    inv_recalc.match_len = inv_result.matches as i32;
+                    inv_recalc.block_len = inv_result.block_len as i32;
+                    inv_recalc.num_ambiguous = inv_result.num_ambiguous as i32;
                     results.push(inv_result);
                     recalc_infos.push(inv_recalc);
                 } else if debug {

@@ -82,14 +82,21 @@ impl RmqTree {
     #[inline]
     fn update_sub_min(&mut self, idx: u32) {
         let i = idx as usize;
-        let mut best = idx;
         let l = self.nodes[i].left;
         let r = self.nodes[i].right;
-        if l != NIL && self.nodes[self.nodes[l as usize].sub_min_idx as usize].pri < self.nodes[best as usize].pri {
-            best = self.nodes[l as usize].sub_min_idx;
-        }
-        if r != NIL && self.nodes[self.nodes[r as usize].sub_min_idx as usize].pri < self.nodes[best as usize].pri {
-            best = self.nodes[r as usize].sub_min_idx;
+        let cur_pri = self.nodes[i].pri;
+        let mut best = if l == NIL {
+            idx
+        } else {
+            let l_min = self.nodes[l as usize].sub_min_idx;
+            if cur_pri < self.nodes[l_min as usize].pri { idx } else { l_min }
+        };
+        if r != NIL {
+            let r_min = self.nodes[r as usize].sub_min_idx;
+            let best_pri = self.nodes[best as usize].pri;
+            if !(best_pri < self.nodes[r_min as usize].pri) {
+                best = r_min;
+            }
         }
         self.nodes[i].sub_min_idx = best;
     }
@@ -475,8 +482,9 @@ impl<'a> Iterator for RmqRevIter<'a> {
     }
 }
 
-/// Simplified score computation for RMQ chaining (matches comput_sc_simple)
-/// Returns (score, is_exact, width)
+/// Simplified score computation for RMQ chaining.
+/// Returns (score, is_exact, width). `width` is the diagonal deviation
+/// `|ref_diff - query_diff|`, used to gate by bandwidth in the chaining loop.
 #[inline(always)]
 fn compute_chain_score_simple(
     ai: &Minimizer,
