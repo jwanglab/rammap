@@ -346,20 +346,23 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
                     h0 += d1_val - (gap_open as i32 + gap_extend as i32);
                 }
 
-                if h0 > result.max {
-                    result.max = h0;
-                    result.max_score_target_pos = last_h0_t;
-                    result.max_score_query_pos = r - last_h0_t;
-                }
-
-                // Check z_drop
-                if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                    let tl = last_h0_t - result.max_score_target_pos;
-                    let ql = (r - last_h0_t) - result.max_score_query_pos;
-                    let l = if tl > ql { tl - ql } else { ql - tl };
-                    if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                        result.zdropped = 1;
-                        break;
+                // Track max when not in pure APPROX_MAX mode (i.e. either exact-equivalent approx_max=false,or APPROX_DROP also set).
+                // z-drop check only under APPROX_DROP.
+                if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
+                    if h0 > result.max {
+                        result.max = h0;
+                        result.max_score_target_pos = last_h0_t;
+                        result.max_score_query_pos = r - last_h0_t;
+                    } else if (flags & APPROX_DROP) != 0
+                        && last_h0_t >= result.max_score_target_pos
+                        && (r - last_h0_t) >= result.max_score_query_pos {
+                        let tl = last_h0_t - result.max_score_target_pos;
+                        let ql = (r - last_h0_t) - result.max_score_query_pos;
+                        let l = if tl > ql { tl - ql } else { ql - tl };
+                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
+                            result.zdropped = 1;
+                            break;
+                        }
                     }
                 }
             } else {
@@ -367,7 +370,7 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
                 let v0 = *v8_ptr.add(0) as i8 as i32;
                 h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
                 last_h0_t = 0;
-                if h0 > result.max {
+                if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
                     result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
                 }
             }
@@ -721,16 +724,14 @@ macro_rules! extend_single_affine_impl {
                             h0 += d1_val - (gap_open as i32 + gap_extend as i32);
                         }
 
-                        // Update max score
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        // Check z_drop
-                        if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if (flags & APPROX_DROP) != 0
+                                && last_h0_t >= result.max_score_target_pos
+                                && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -745,7 +746,7 @@ macro_rules! extend_single_affine_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
                             result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
                         }
                     }
@@ -1108,14 +1109,14 @@ macro_rules! extend_single_affine_avx2_impl {
                             h0 += d1_val - (gap_open as i32 + gap_extend as i32);
                         }
 
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if (flags & APPROX_DROP) != 0
+                                && last_h0_t >= result.max_score_target_pos
+                                && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -1129,7 +1130,7 @@ macro_rules! extend_single_affine_avx2_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
                             result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
                         }
                     }
@@ -1482,14 +1483,14 @@ macro_rules! extend_single_affine_avx512_impl {
                             h0 += d1_val - (gap_open as i32 + gap_extend as i32);
                         }
 
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if (flags & APPROX_DROP) != 0
+                                && last_h0_t >= result.max_score_target_pos
+                                && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -1503,7 +1504,7 @@ macro_rules! extend_single_affine_avx512_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
                             result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
                         }
                     }
@@ -1785,23 +1786,27 @@ pub fn extend_single_affine_scalar(
                     last_h0_t += 1;
                     h0 += u_arr[last_h0_t as usize] as i32 - qe_i32;
                 }
-                if h0 > result.max {
-                    result.max = h0;
-                    result.max_score_target_pos = last_h0_t;
-                    result.max_score_query_pos = r - last_h0_t;
-                } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                    let tl = last_h0_t - result.max_score_target_pos;
-                    let ql = (r - last_h0_t) - result.max_score_query_pos;
-                    let l = if tl > ql { tl - ql } else { ql - tl };
-                    if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend) {
-                        result.zdropped = 1;
-                        break;
+                if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
+                    if h0 > result.max {
+                        result.max = h0;
+                        result.max_score_target_pos = last_h0_t;
+                        result.max_score_query_pos = r - last_h0_t;
+                    } else if (flags & APPROX_DROP) != 0
+                        && last_h0_t >= result.max_score_target_pos
+                        && (r - last_h0_t) >= result.max_score_query_pos {
+                        let tl = last_h0_t - result.max_score_target_pos;
+                        let ql = (r - last_h0_t) - result.max_score_query_pos;
+                        let l = if tl > ql { tl - ql } else { ql - tl };
+                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend) {
+                            result.zdropped = 1;
+                            break;
+                        }
                     }
                 }
             } else {
                 h0 = v_arr[0] as i32 - qe_i32 - qe_i32;
                 last_h0_t = 0;
-                if h0 > result.max {
+                if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
                     result.max = h0;
                     result.max_score_target_pos = 0;
                     result.max_score_query_pos = 0;

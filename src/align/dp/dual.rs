@@ -672,21 +672,19 @@ pub(super) unsafe fn extend_dual_affine_neon_impl(
                     h0 += *u8_ptr.add(last_h0_t as usize) as i8 as i32;
                 }
 
-                if h0 > result.max {
-                    result.max = h0;
-                    result.max_score_target_pos = last_h0_t;
-                    result.max_score_query_pos = r - last_h0_t;
-                }
-
-                // Check z_drop
-                if (flags & APPROX_DROP) != 0 && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                    let tl = last_h0_t - result.max_score_target_pos;
-                    let ql = (r - last_h0_t) - result.max_score_query_pos;
-                    let l = if tl > ql { tl - ql } else { ql - tl };
-                    // Dual-affine uses gap_extend2 for z-drop
-                    if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend2 as i32) {
-                        result.zdropped = 1;
-                        break;
+                if (flags & APPROX_DROP) != 0 {
+                    if h0 > result.max {
+                        result.max = h0;
+                        result.max_score_target_pos = last_h0_t;
+                        result.max_score_query_pos = r - last_h0_t;
+                    } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                        let tl = last_h0_t - result.max_score_target_pos;
+                        let ql = (r - last_h0_t) - result.max_score_query_pos;
+                        let l = if tl > ql { tl - ql } else { ql - tl };
+                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend2 as i32) {
+                            result.zdropped = 1;
+                            break;
+                        }
                     }
                 }
             } else {
@@ -694,7 +692,7 @@ pub(super) unsafe fn extend_dual_affine_neon_impl(
                 let v0 = *v8_ptr.add(0) as i8 as i32;
                 h0 = v0 - qe_scalar;
                 last_h0_t = 0;
-                if h0 > result.max {
+                if (flags & APPROX_DROP) != 0 && h0 > result.max {
                     result.max = h0;
                     result.max_score_target_pos = 0;
                     result.max_score_query_pos = 0;
@@ -1298,15 +1296,12 @@ macro_rules! extend_dual_affine_impl {
                             h0 += *u8_ptr.add(last_h0_t as usize) as i8 as i32;
                         }
 
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        // Check z_drop
                         if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -1321,7 +1316,7 @@ macro_rules! extend_dual_affine_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - qe_scalar;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if (flags & APPROX_DROP) != 0 && h0 > result.max {
                             result.max = h0;
                             result.max_score_target_pos = 0;
                             result.max_score_query_pos = 0;
@@ -1908,15 +1903,12 @@ macro_rules! extend_dual_affine_avx2_impl {
                             h0 += *u8_ptr.add(last_h0_t as usize) as i8 as i32;
                         }
 
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        // Check z_drop
                         if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -1931,7 +1923,7 @@ macro_rules! extend_dual_affine_avx2_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - qe_scalar;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if (flags & APPROX_DROP) != 0 && h0 > result.max {
                             result.max = h0;
                             result.max_score_target_pos = 0;
                             result.max_score_query_pos = 0;
@@ -2520,15 +2512,12 @@ macro_rules! extend_dual_affine_avx512_impl {
                             h0 += *u8_ptr.add(last_h0_t as usize) as i8 as i32;
                         }
 
-                        if h0 > result.max {
-                            result.max = h0;
-                            result.max_score_target_pos = last_h0_t;
-                            result.max_score_query_pos = r - last_h0_t;
-                        }
-
-                        // Check z_drop
                         if (flags & APPROX_DROP) != 0 {
-                            if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                            if h0 > result.max {
+                                result.max = h0;
+                                result.max_score_target_pos = last_h0_t;
+                                result.max_score_query_pos = r - last_h0_t;
+                            } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
                                 let tl = last_h0_t - result.max_score_target_pos;
                                 let ql = (r - last_h0_t) - result.max_score_query_pos;
                                 let l = if tl > ql { tl - ql } else { ql - tl };
@@ -2543,7 +2532,7 @@ macro_rules! extend_dual_affine_avx512_impl {
                         let v0 = *v8_ptr.add(0) as i8 as i32;
                         h0 = v0 - qe_scalar;
                         last_h0_t = 0;
-                        if h0 > result.max {
+                        if (flags & APPROX_DROP) != 0 && h0 > result.max {
                             result.max = h0;
                             result.max_score_target_pos = 0;
                             result.max_score_query_pos = 0;
@@ -3017,16 +3006,13 @@ pub fn extend_dual_affine_scalar(
                 last_h0_t = 0;
             }
 
-            // Unconditional max update
-            if h0 > result.max {
-                result.max = h0;
-                result.max_score_target_pos = last_h0_t;
-                result.max_score_query_pos = r - last_h0_t;
-            }
-
-            // Z-drop only when APPROX_DROP
-            if (flags & APPROX_DROP) != 0
-                && last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+            // Max + z-drop tracking only when APPROX_DROP
+            if (flags & APPROX_DROP) != 0 {
+                if h0 > result.max {
+                    result.max = h0;
+                    result.max_score_target_pos = last_h0_t;
+                    result.max_score_query_pos = r - last_h0_t;
+                } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
                     let tl = last_h0_t - result.max_score_target_pos;
                     let ql = (r - last_h0_t) - result.max_score_query_pos;
                     let l = if tl > ql { tl - ql } else { ql - tl };
@@ -3035,6 +3021,7 @@ pub fn extend_dual_affine_scalar(
                         break;
                     }
                 }
+            }
 
             // Score at final corner
             if r == query_len as i32 + target_len as i32 - 2 && en0 == target_len as i32 - 1 {

@@ -875,13 +875,13 @@ pub fn dp_extension(query: &[u8], target: &[u8], scoring: &DpScoring, bandwidth:
             query, target, 5, &mat,
             scoring.gap_open as i8, scoring.gap_extend as i8,
             scoring.gap_open2 as i8, scoring.gap_extend2 as i8,
-            bandwidth, zdrop, 0, EXTENSION_ONLY | dp::APPROX_MAX, &mut ez,
+            bandwidth, zdrop, 0, EXTENSION_ONLY, &mut ez,
         );
     } else {
         dp::extend_single_affine(
             query, target, 5, &mat,
             scoring.gap_open as i8, scoring.gap_extend as i8,
-            bandwidth, zdrop, 0, EXTENSION_ONLY | dp::APPROX_MAX, &mut ez,
+            bandwidth, zdrop, 0, EXTENSION_ONLY, &mut ez,
         );
     }
 
