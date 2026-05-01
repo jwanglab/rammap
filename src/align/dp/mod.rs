@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extd2_matches_mm2() {
+    fn test_extd2() {
         // target: ACGTACGTACGTACGT (16 bases)
         // query:  ACGTACGT (8 bases)
         // map-ont: a=2, b=4, gap_open=4, gap_extend=2, gap_open2=24, gap_extend2=1
@@ -623,17 +623,17 @@ mod tests {
         let mut result = DpResult::default();
         extend_dual_affine(&query, &target, alphabet_size, &score_matrix, 4, 2, 24, 1, -1, 400, 0, 0, &mut result);
 
-        // mm2 gives: score=-4 max=16 max_q=7 max_t=7 mqe=16 mqe_t=7
-        assert_eq!(result.score, -4, "score should match mm2");
-        assert_eq!(result.max, 16, "max should match mm2");
-        assert_eq!(result.max_score_query_pos, 7, "max_q should match mm2");
-        assert_eq!(result.max_score_target_pos, 7, "max_t should match mm2");
-        assert_eq!(result.max_query_end_score, 16, "mqe should match mm2");
-        assert_eq!(result.max_query_end_target_pos, 7, "mqe_t should match mm2");
+        // expect: score=-4 max=16 max_q=7 max_t=7 mqe=16 mqe_t=7
+        assert_eq!(result.score, -4, "score mismatch");
+        assert_eq!(result.max, 16, "max mismatch");
+        assert_eq!(result.max_score_query_pos, 7, "max_q mismatch");
+        assert_eq!(result.max_score_target_pos, 7, "max_t mismatch");
+        assert_eq!(result.max_query_end_score, 16, "mqe mismatch");
+        assert_eq!(result.max_query_end_target_pos, 7, "mqe_t mismatch");
     }
 
     #[test]
-    fn test_extd2_score_only_matches_mm2() {
+    fn test_extd2_score_only() {
         // Same test but with SCORE_ONLY (no CIGAR traceback)
         let target: Vec<u8> = vec![0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3];
         let query: Vec<u8>  = vec![0,1,2,3,0,1,2,3];
@@ -650,11 +650,11 @@ mod tests {
         extend_dual_affine(&query, &target, alphabet_size, &score_matrix, 4, 2, 24, 1, -1, 400, 0, SCORE_ONLY, &mut result);
         println!("score_only extd2: score={} max={} mqe={} mte={}",
             result.score, result.max, result.max_query_end_score, result.max_target_end_score);
-        assert_eq!(result.score, -4, "score_only score should match mm2");
+        assert_eq!(result.score, -4, "score_only score mismatch");
     }
 
     #[test]
-    fn test_extd2_scalar_matches_mm2() {
+    fn test_extd2_scalar() {
         let target: Vec<u8> = vec![0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3];
         let query: Vec<u8>  = vec![0,1,2,3,0,1,2,3];
         let alphabet_size = 5i8;
@@ -671,7 +671,7 @@ mod tests {
         extend_dual_affine_scalar(&query, &target, alphabet_size, &score_matrix, 4, 2, 24, 1, -1, 400, 0, 0, &mut result);
         println!("scalar extd2: score={} max={} max_q={} max_t={} mqe={} mqe_t={} mte={} mte_q={} zd={}",
             result.score, result.max, result.max_score_query_pos, result.max_score_target_pos, result.max_query_end_score, result.max_query_end_target_pos, result.max_target_end_score, result.max_target_end_query_pos, result.zdropped);
-        assert_eq!(result.score, -4, "scalar score should match mm2");
+        assert_eq!(result.score, -4, "scalar score mismatch");
     }
 
     #[cfg(target_arch = "x86_64")]

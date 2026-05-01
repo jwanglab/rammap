@@ -38,7 +38,6 @@ fn encode_nt4(b: u8) -> u8 {
     }
 }
 
-// Fast log2 approximation
 #[inline]
 fn fast_log2(x: f32) -> f32 {
     let bits = x.to_bits();
@@ -47,7 +46,7 @@ fn fast_log2(x: f32) -> f32 {
     z_bits &= !(255 << 23);
     z_bits += 127 << 23;
     let z = f32::from_bits(z_bits);
-    log_2 + (-0.34484843 * z + 2.024_665_8) * z - 0.674_877_6
+    log_2 + ((-0.34484843 * z + 2.024_665_8) * z - 0.674_877_6)
 }
 
 // Compute dp_max (maximum segment alignment score) with log-gap scoring
@@ -1255,11 +1254,7 @@ fn assign_parents_and_select(
             // ALL_CHAINS: parent assignment already done above; skip sort + parent + select_sub
         } else {
 
-        // Sort by (dp_max, hash) descending — replicates mm2 mm_hit_sort exactly.
-        // mm2 builds aux=(score<<32|hash, idx), runs unstable ksort radix_sort_128x,
-        // then iterates from end to start to reverse into descending order. The radix
-        // sort is implementation-defined for tied keys; we port the same algorithm so
-        // ties resolve identically.
+        // Sort by (dp_max, hash) descending with unstable but deterministic paired radix sort
         {
             let alt_drop = opt.filtering.alt_drop;
             let mut aux: Vec<(u64, u64)> = results.iter().enumerate().map(|(i, r)| {
@@ -1614,12 +1609,7 @@ fn process_query_core(
                         eprintln!("[DBG] INV_FOUND qs={} qe={} rs={} re={} score={}",
                             inv_result.query_start, inv_result.query_end, inv_result.ref_start, inv_result.ref_end, inv_result.align_score);
                     }
-                    // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi
-                    // come from per-base comparison in CigarStats; gap stats come from CIGAR
-                    // ops). from_cigar_str alone treats M as all matches, which over-inflates
-                    // mlen for high-divergence inversions and lets them pass the post-recalc
-                    // dp_max filter that mm2 (via mm_update_extra → mm_recal_max_dp) would
-                    // collapse to 0.
+                    // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi come from per-base comparison in CigarStats; gap stats come from CIGAR ops)
                     let mut inv_recalc = DpRecalcInfo::from_cigar_str(&inv_result.cigar_str);
                     inv_recalc.match_len = inv_result.matches as i32;
                     inv_recalc.block_len = inv_result.block_len as i32;
