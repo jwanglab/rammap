@@ -14,6 +14,7 @@ use crate::align::sketch::Minimizer;
 use crate::align::index::Index;
 use crate::align::extend::{AlignmentContext, AlignAnchorContext, align_anchors, build_scoring_matrix_full, convert_cigar_to_eqx_pub, fix_cigar_pub, fmt_cigar, fmt_cs, fmt_ds, fmt_md, CigarOp};
 use crate::align::filter::{FilterParams, ParentState, FilterableItem, check_secondary_filter, scale_alt_score};
+use crate::align::sort::radix_sort_128x_pair;
 use crate::align::extend::{rev_comp, rev_comp_nt4, encode_nt4_rc};
 use std::fmt::Write;
 use crate::align::stats::AlignmentStats;
@@ -1254,20 +1255,21 @@ fn assign_parents_and_select(
             // ALL_CHAINS: parent assignment already done above; skip sort + parent + select_sub
         } else {
 
-        // Sort by (dp_max, hash) descending
-        // ALT results get penalized scores for sort ranking
+        // Sort by (dp_max, hash) descending — replicates mm2 mm_hit_sort exactly.
+        // mm2 builds aux=(score<<32|hash, idx), runs unstable ksort radix_sort_128x,
+        // then iterates from end to start to reverse into descending order. The radix
+        // sort is implementation-defined for tied keys; we port the same algorithm so
+        // ties resolve identically.
         {
             let alt_drop = opt.filtering.alt_drop;
-            let mut order: Vec<usize> = (0..results.len()).collect();
-            order.sort_by(|&ia, &ib| {
-                let sa = if results[ia].is_alt { scale_alt_score(results[ia].dp_score, alt_drop) } else { results[ia].dp_score };
-                let sb = if results[ib].is_alt { scale_alt_score(results[ib].dp_score, alt_drop) } else { results[ib].dp_score };
-                sb.cmp(&sa)
-                    .then_with(|| results[ib].hash.cmp(&results[ia].hash))
-                    .then_with(|| ib.cmp(&ia))
-            });
+            let mut aux: Vec<(u64, u64)> = results.iter().enumerate().map(|(i, r)| {
+                let score = if r.is_alt { scale_alt_score(r.dp_score, alt_drop) } else { r.dp_score };
+                let key = ((score as u64) << 32) | (r.hash as u64);
+                (key, i as u64)
+            }).collect();
+            radix_sort_128x_pair(&mut aux);
             let mut opt_results: Vec<Option<AlnResult>> = results.into_iter().map(Some).collect();
-            results = order.iter().map(|&i| opt_results[i].take().unwrap()).collect();
+            results = aux.iter().rev().map(|&(_, i)| opt_results[i as usize].take().unwrap()).collect();
         }
 
         let filter_items: Vec<FilterableItem> = results
@@ -1710,19 +1712,18 @@ pub fn refilter_merged_results(
             }
             parent_indices = vec![usize::MAX; results.len()];
         } else {
-            // Sort by (dp_score, hash) descending with ALT penalty
+            // Sort by (dp_score, hash) descending — same mm_hit_sort port as the
+            // earlier site. See comment there for the unstable-tie behavior.
             {
                 let alt_drop = opt.filtering.alt_drop;
-                let mut order: Vec<usize> = (0..results.len()).collect();
-                order.sort_by(|&ia, &ib| {
-                    let sa = if results[ia].is_alt { scale_alt_score(results[ia].dp_score, alt_drop) } else { results[ia].dp_score };
-                    let sb = if results[ib].is_alt { scale_alt_score(results[ib].dp_score, alt_drop) } else { results[ib].dp_score };
-                    sb.cmp(&sa)
-                        .then_with(|| results[ib].hash.cmp(&results[ia].hash))
-                        .then_with(|| ib.cmp(&ia))
-                });
+                let mut aux: Vec<(u64, u64)> = results.iter().enumerate().map(|(i, r)| {
+                    let score = if r.is_alt { scale_alt_score(r.dp_score, alt_drop) } else { r.dp_score };
+                    let key = ((score as u64) << 32) | (r.hash as u64);
+                    (key, i as u64)
+                }).collect();
+                radix_sort_128x_pair(&mut aux);
                 let mut opt_results: Vec<Option<AlnResult>> = results.into_iter().map(Some).collect();
-                results = order.iter().map(|&i| opt_results[i].take().unwrap()).collect();
+                results = aux.iter().rev().map(|&(_, i)| opt_results[i as usize].take().unwrap()).collect();
             }
 
             // 5. Assign parents

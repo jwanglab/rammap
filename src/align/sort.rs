@@ -122,6 +122,18 @@ pub fn radix_sort_128x(arr: &mut [Minimizer]) {
     }
 }
 
+/// MSD in-place radix sort for `(u64, u64)` aux entries by `.0`.
+/// Bit-identical to minimap2's `radix_sort_128x` on `mm128_t` (sort_key = .x):
+/// same cycle-leader bucket-shuffle algorithm, same bucket order, same
+/// implementation-defined ordering of ties. Used for `mm_hit_sort` parity.
+pub fn radix_sort_128x_pair(arr: &mut [(u64, u64)]) {
+    if arr.len() <= RS_MIN_SIZE {
+        rs_insertsort(arr);
+    } else {
+        rs_sort(arr, RS_MAX_BITS, (8 - 1) * RS_MAX_BITS);
+    }
+}
+
 /// Perform the top-level MSD radix partition: count, prefix-sum, and in-place
 /// cyclic permutation for the most significant byte. Returns (bb, be) bucket
 /// boundaries so the caller can recurse into each bucket independently.

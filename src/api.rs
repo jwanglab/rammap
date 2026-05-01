@@ -839,7 +839,7 @@ pub fn dp_local(query: &[u8], target: &[u8], scoring: &DpScoring) -> DpAlignment
         &q_rev, &t_rev, 5, &mat,
         scoring.gap_open as i8, scoring.gap_extend as i8,
         -1, score, 0,
-        dp::EXTENSION_ONLY | dp::REV_CIGAR | dp::APPROX_MAX,
+        dp::EXTENSION_ONLY | dp::REV_CIGAR,
         &mut ez,
     );
 
