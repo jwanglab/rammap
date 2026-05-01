@@ -114,13 +114,18 @@ impl RmqTree {
         if dir == 0 { self.nodes[idx as usize].left } else { self.nodes[idx as usize].right }
     }
 
-    /// Single rotation: rotate node x up over its parent p.
+    /// Single rotation: rotate x up over its parent p.
     /// dir=0: left rotation (x is right child of p), dir=1: right rotation.
+    ///
+    /// `x` inherits p's old sub_min; p's sub_min is recomputed from
+    /// (p.p[dir], q.p[dir]) — for dir=1 this is reversed from natural left/right,
+    /// which matters for tie-breaking among equal-pri descendants.
     fn rotate(&mut self, p: u32, dir: usize) -> u32 {
         let x = self.child(p, 1 - dir);
         let mid = self.child(x, dir);
         let gp = self.nodes[p as usize].parent;
-        // x takes p's place under gp
+        let saved_p_sub = self.nodes[p as usize].sub_min_idx;
+        let p_dir_child = self.child(p, dir);
         self.set_child(x, dir, p);
         self.set_child(p, 1 - dir, mid);
         self.nodes[x as usize].parent = gp;
@@ -128,9 +133,61 @@ impl RmqTree {
             if self.nodes[gp as usize].left == p { self.nodes[gp as usize].left = x; }
             else { self.nodes[gp as usize].right = x; }
         }
-        self.update_sub_min(p);
-        self.update_sub_min(x);
+        self.update_sub_min_with_children(p, p_dir_child, mid);
+        self.nodes[x as usize].sub_min_idx = saved_p_sub;
         x
+    }
+
+    /// Fused double rotation. Layout:
+    ///   before: (a, ((b, c)r, d)q)p  with dir=0
+    ///   after:  ((a, b)p, (c, d)q)r
+    /// `r` inherits p's old sub_min; p and q are recomputed from explicit
+    /// post-rotation children using update_sub_min_with_children, since the
+    /// arg order to that helper carries tie-break preference.
+    fn rotate2(&mut self, p: u32, dir: usize) -> u32 {
+        let opp = 1 - dir;
+        let q = self.child(p, opp);
+        let r = self.child(q, dir);
+        let saved_p_sub = self.nodes[p as usize].sub_min_idx;
+        let gp = self.nodes[p as usize].parent;
+        let p_dir = self.child(p, dir);
+        let r_dir = self.child(r, dir);
+        let q_opp = self.child(q, opp);
+        let r_opp = self.child(r, opp);
+        self.update_sub_min_with_children(p, p_dir, r_dir);
+        self.update_sub_min_with_children(q, q_opp, r_opp);
+        self.nodes[r as usize].sub_min_idx = saved_p_sub;
+        self.set_child(p, opp, r_dir);
+        self.set_child(r, dir, p);
+        self.set_child(q, dir, r_opp);
+        self.set_child(r, opp, q);
+        self.nodes[r as usize].parent = gp;
+        if gp != NIL {
+            if self.nodes[gp as usize].left == p { self.nodes[gp as usize].left = r; }
+            else { self.nodes[gp as usize].right = r; }
+        }
+        r
+    }
+
+    /// Compute sub_min for `idx` from explicit children rather than reading
+    /// `idx`'s current left/right. `q` is preferred over `r` on equal-pri.
+    #[inline]
+    fn update_sub_min_with_children(&mut self, idx: u32, q: u32, r: u32) {
+        let cur_pri = self.nodes[idx as usize].pri;
+        let mut best = idx;
+        if q != NIL {
+            let q_min = self.nodes[q as usize].sub_min_idx;
+            if !(cur_pri < self.nodes[q_min as usize].pri) {
+                best = q_min;
+            }
+        }
+        if r != NIL {
+            let r_min = self.nodes[r as usize].sub_min_idx;
+            if !(self.nodes[best as usize].pri < self.nodes[r_min as usize].pri) {
+                best = r_min;
+            }
+        }
+        self.nodes[idx as usize].sub_min_idx = best;
     }
 
     fn insert_elem(&mut self, y: i32, i: usize, pri: f64) {
@@ -175,21 +232,19 @@ impl RmqTree {
                 let heavy_dir = if new_balance > 0 { 1usize } else { 0 };
                 let heavy_child = self.child(p, heavy_dir);
                 let hb = self.nodes[heavy_child as usize].balance;
+                let opposite = 1 - heavy_dir;
+                let new_root;
                 if (heavy_dir == 1 && hb >= 0) || (heavy_dir == 0 && hb <= 0) {
                     // Single rotation
-                    let opposite = 1 - heavy_dir;
-                    let new_root = self.rotate(p, opposite);
+                    new_root = self.rotate(p, opposite);
                     self.nodes[p as usize].balance = if hb == 0 { if heavy_dir == 1 { 1 } else { -1 } } else { 0 };
                     self.nodes[new_root as usize].balance = if hb == 0 { if heavy_dir == 1 { -1 } else { 1 } } else { 0 };
                     if self.root == p { self.root = new_root; }
                 } else {
-                    // Double rotation
-                    let opposite = 1 - heavy_dir;
+                    // Double rotation (fused).
                     let inner = self.child(heavy_child, opposite);
                     let inner_bal = self.nodes[inner as usize].balance;
-                    self.rotate(heavy_child, heavy_dir);
-                    let new_root = self.rotate(p, opposite);
-                    // Set balance factors based on inner node's old balance
+                    new_root = self.rotate2(p, opposite);
                     self.nodes[p as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
                         if heavy_dir == 1 { -1 } else { 1 }
                     } else { 0 };
@@ -198,17 +253,31 @@ impl RmqTree {
                     } else { 0 };
                     self.nodes[new_root as usize].balance = 0;
                     if self.root == p { self.root = new_root; }
+                    let _ = inner;
                 }
-                break; // AVL insert: at most one rotation needed, then done
+                // Rotated nodes already had sub_min set with the rotation-specific
+                // arg order; recomputing them here with natural left/right would
+                // change tie-breaking. Walk from the rotation root's parent upward
+                // with natural args, stopping when the new node is no longer the
+                // subtree min.
+                let mut anc = self.nodes[new_root as usize].parent;
+                while anc != NIL {
+                    self.update_sub_min(anc);
+                    if self.nodes[anc as usize].sub_min_idx != new_idx { break; }
+                    anc = self.nodes[anc as usize].parent;
+                }
+                return;
             } else {
                 // |balance| == 1, tree grew taller, continue up
                 child = p;
                 p = self.nodes[p as usize].parent;
             }
         }
-        // Continue updating sub_min for remaining ancestors
+        // No rotation happened (balance hit 0). Walk up updating sub_min until
+        // the new node is no longer the subtree min.
         while p != NIL {
             self.update_sub_min(p);
+            if self.nodes[p as usize].sub_min_idx != new_idx { break; }
             p = self.nodes[p as usize].parent;
         }
     }
@@ -309,11 +378,10 @@ impl RmqTree {
                         p = pp;
                     }
                 } else {
-                    // Double rotation
+                    // Double rotation (fused).
                     let inner = self.child(heavy_child, opposite);
                     let inner_bal = self.nodes[inner as usize].balance;
-                    self.rotate(heavy_child, heavy_dir);
-                    let new_root = self.rotate(p, opposite);
+                    let new_root = self.rotate2(p, opposite);
                     self.nodes[p as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
                         if heavy_dir == 1 { -1 } else { 1 }
                     } else { 0 };
@@ -322,6 +390,7 @@ impl RmqTree {
                     } else { 0 };
                     self.nodes[new_root as usize].balance = 0;
                     if self.root == p { self.root = new_root; }
+                    let _ = inner;
                     // Height decreased, continue propagating
                     let pp = self.nodes[new_root as usize].parent;
                     if pp != NIL {
@@ -347,10 +416,9 @@ impl RmqTree {
         true
     }
 
-    /// Two-path LCA range minimum query (port of krmq.h __KRMQ_RMQ).
-    /// Finds element with minimum pri in CLOSED interval [lo, hi] where
-    /// lo = (lo_y, u32::MAX) and hi = (hi_y, 0).
-    /// This means: y > lo_y (exclusive lower), y < hi_y (all), y == hi_y only if i == 0.
+    /// Two-path LCA range minimum query: returns the element with minimum pri
+    /// in the closed key interval [(lo_y, u32::MAX), (hi_y, 0)] — i.e. y > lo_y
+    /// strictly, y < hi_y, or y == hi_y with i == 0.
     fn rmq(&self, lo_y: i32, hi_y: i32) -> Option<(i32, usize, f64)> {
         if self.root == NIL { return None; }
 
@@ -600,7 +668,7 @@ pub fn chain_anchors_rmq(
         let lo_y = a[i].query_pos() - max_dist;
         let hi_y = a[i].query_pos();
 
-        if let Some((_, q_i, _)) = root.rmq(lo_y, hi_y) {
+        if let Some((_q_y, q_i, _q_pri)) = root.rmq(lo_y, hi_y) {
             let j = q_i;
             let (sc, exact, width) = compute_chain_score_simple(&a[i], &a[j], opt.chn_pen_gap, opt.chn_pen_skip);
             let total_sc = scores[j] + sc;

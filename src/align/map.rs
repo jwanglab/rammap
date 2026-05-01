@@ -431,7 +431,7 @@ pub struct Mapping {
     pub s2_score: Option<i32>,
     pub is_secondary: bool,
     pub hash: u32,
-    /// Pre-alignment n_sub from mm_set_parent (persists into post-alignment for r[0])
+    /// Pre-alignment n_sub from parent assignment (persists for the root chain).
     pub pre_num_suboptimal: i32,
     /// Nearby-seed bounds for extension boundary tightening
     pub left_bound_rs1: i32,
@@ -448,7 +448,7 @@ pub struct Mapping {
     pub strand_retained: bool,
     /// Parent index in the compacted array (for filter_strand_retained)
     pub compact_parent: usize,
-    /// True if this split part was created when zdrop detected an inversion (align.c:899)
+    /// True if this split part was created when zdrop detected an inversion.
     pub split_inv: bool,
     /// True if this chain came from mm_split_chains_into_segments splitting (multi-segment)
     pub seg_split: bool,
@@ -493,7 +493,7 @@ pub fn compute_bounds_from_squeezed(
     let qs0_pre = first.query_pos() + 1 - first_q_span;
 
 
-    // Left nearby-seed inspection (align.c:711-722)
+    // Left nearby-seed inspection.
     let mut left_rs1 = 0i32;
     let mut left_qs1 = 0i32;
     {
@@ -519,7 +519,7 @@ pub fn compute_bounds_from_squeezed(
         }
     }
 
-    // Right nearby-seed inspection (align.c:738-748)
+    // Right nearby-seed inspection.
     let re0_pre = last.ref_pos() + 1;
     let qe0_pre = last.query_pos() + 1;
     let mut right_re1 = tlen;
@@ -649,7 +649,7 @@ fn filter_strand_retained(regs: &mut Vec<Mapping>) {
         if !strand_retained[i] { continue; }
         let p = parents[i];
         let parent_div = if p < divs.len() { divs[p] } else { 0.0 };
-        // Keep if div < parent_div * 5.0 or div < 0.01 (hit.c:295)
+        // Keep if div < parent_div * 5.0 or div < 0.01.
         if divs[i] < parent_div * 5.0 || divs[i] < 0.01 {
             continue; // keep
         }
@@ -824,7 +824,7 @@ fn split_chains_into_segments(
             if sid >= n_segs { continue; }
 
             let mut a1 = a;
-            // Coordinate transformation (hit.c:372)
+            // Coordinate transformation.
             let is_rev = (a1.x >> 63) != 0;
             let adj = if is_rev {
                 // reverse strand
@@ -1164,7 +1164,7 @@ pub fn map_query_multi(
         return MultiMapResult { per_seg, rep_len, frag_gap: max_chain_gap_ref, stats };
     }
 
-    // chain_post with n_segs > 1: mm_set_parent + mm_filter_suboptimal_multi_segment (map.c:206-213)
+    // Multi-segment chain_post: parent assignment + suboptimal filtering.
     if !opt.flags.contains(AlignFlags::ALL_CHAINS) {
         let filter_params = FilterParams::new(opt, mi);
         let mut parent_state = ParentState::new(
@@ -1214,7 +1214,7 @@ pub fn map_query_multi(
     // split_chains_into_segments: split combined chains to per-segment (map.c:345)
     let mut per_seg = split_chains_into_segments(read_hash, n_segs, qlens, &regs0, &chains, mi, is_qstrand);
 
-    // Per-segment mm_set_parent (map.c:348)
+    // Per-segment parent assignment.
     for (regs_s, _) in &mut per_seg {
         if !regs_s.is_empty() {
             regs_s.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.hash.cmp(&a.hash)));
@@ -1512,18 +1512,19 @@ pub fn map_query(
     if opt.flags.contains(AlignFlags::ALL_CHAINS) {
         // Nearby-seed computation on post-filter chains
         // Build squeezed anchor array from surviving chains, sorted by position
+        let mut pos_order: Vec<usize> = (0..regs.len()).collect();
+        pos_order.sort_by_key(|&i| regs[i].original_as);
+
+        let mut squeezed: Vec<Minimizer> = Vec::new();
+        let mut sq_offsets: Vec<(usize, usize)> = vec![(0, 0); regs.len()];
+        for &pi in &pos_order {
+            let start = squeezed.len();
+            squeezed.extend_from_slice(&regs[pi].anchors);
+            sq_offsets[pi] = (start, regs[pi].anchors.len());
+            regs[pi].sq_start = start;
+        }
+
         {
-            let mut pos_order: Vec<usize> = (0..regs.len()).collect();
-            pos_order.sort_by_key(|&i| regs[i].original_as);
-
-            let mut squeezed: Vec<Minimizer> = Vec::new();
-            let mut sq_offsets: Vec<(usize, usize)> = vec![(0, 0); regs.len()];
-            for &pi in &pos_order {
-                let start = squeezed.len();
-                squeezed.extend_from_slice(&regs[pi].anchors);
-                sq_offsets[pi] = (start, regs[pi].anchors.len());
-            }
-
             for ri in 0..regs.len() {
                 let (sq_start, sq_cnt) = sq_offsets[ri];
                 if sq_cnt == 0 { continue; }
@@ -1603,7 +1604,7 @@ pub fn map_query(
         }
 
         stats.t_post = t3.elapsed();
-        return (regs, rep_len, stats, Vec::new());
+        return (regs, rep_len, stats, squeezed);
     }
 
     // Parent-based filtering
@@ -1613,15 +1614,14 @@ pub fn map_query(
     parent_state.init_from_items(&regs);
     parent_state.assign_parents(&regs);
 
-    // Compute subsc and n_sub for each parent BEFORE filtering
-    // These persist through filtering and into the post-alignment mm_set_parent call.
-    // Pre-alignment: r->p is NULL, so only ri->cnt >= rp->cnt triggers cnt_sub (line 170)
+    // Compute subsc and n_sub per parent before filtering; these persist into
+    // the post-alignment parent assignment call.
     let mut subsc_pre = vec![0i32; regs.len()];
     let mut n_sub_pre = vec![0i32; regs.len()];
     for i in 0..regs.len() {
         let pi = parent_state.parent[i];
         if pi != i {
-            // hit.c:168: ALT penalty for subsc (pre-alignment, chain score only)
+            // ALT penalty for subsc (pre-alignment, chain score only).
             let sci = if !regs[pi].is_alt && regs[i].is_alt {
                 scale_alt_score(regs[i].score, opt.filtering.alt_drop)
             } else {
@@ -1630,8 +1630,7 @@ pub fn map_query(
             if sci > subsc_pre[pi] {
                 subsc_pre[pi] = sci;
             }
-            // Pre-alignment cnt_sub: only ri->cnt >= rp->cnt (hit.c:170)
-            // r->p is NULL before alignment, so dp_max comparison doesn't apply
+            // Pre-alignment cnt_sub uses anchor counts only (no dp_max yet).
             if regs[i].anchor_count >= regs[pi].anchor_count {
                 n_sub_pre[pi] += 1;
             }

@@ -1607,12 +1607,17 @@ pub fn align_anchors(
         qs0 = qs0_tmp;
     }
 
-    // SEED_SELF: limit left extension bounds for self-mapping
+    // SEED_SELF: clamp leftward extension distance to |q-r| of the chain's
+    // FIRST original anchor (pre-trim). Post-trim qs/rs would give a small
+    // non-zero offset that suppresses extension on diagonal self-chains.
     let (mut rs0, mut qs0) = (rs0, qs0);
     if !anchors.is_empty() && (anchors[0].y & crate::align::map::SEED_SELF) != 0 {
-        let max_ext = (qs - rs).unsigned_abs() as i32;
-        if rs - rs0 > max_ext { rs0 = rs - max_ext; }
-        if qs - qs0 > max_ext { qs0 = qs - max_ext; }
+        let pre_q_span = anchors[0].query_span();
+        let pre_qs = anchors[0].query_pos() + 1 - pre_q_span;
+        let pre_rs = anchors[0].ref_pos() + 1 - pre_q_span;
+        let max_ext = (pre_qs - pre_rs).unsigned_abs() as i32;
+        if pre_rs - rs0 > max_ext { rs0 = pre_rs - max_ext; }
+        if pre_qs - qs0 > max_ext { qs0 = pre_qs - max_ext; }
     }
 
     if debug { eprintln!("[DBG] left ext boundary: qs0={} rs0={} is_sr={} seed_bounds=({},{},{},{})", qs0, rs0, is_sr, seed_bounds.0, seed_bounds.1, seed_bounds.2, seed_bounds.3); }
@@ -1922,11 +1927,15 @@ pub fn align_anchors(
             qe0 = qe0_tmp;
         }
 
-        // SEED_SELF: limit right extension bounds for self-mapping
+        // SEED_SELF: clamp rightward extension distance to |q-r| of the chain's
+        // LAST original anchor (pre-trim).
         if !anchors.is_empty() && (anchors[0].y & crate::align::map::SEED_SELF) != 0 {
-            let max_ext = (qe - re).unsigned_abs() as i32;
-            if re0 - re > max_ext { re0 = re + max_ext; }
-            if qe0 - qe > max_ext { qe0 = qe + max_ext; }
+            let last_idx = anchors.len() - 1;
+            let pre_qe = anchors[last_idx].query_pos() + 1;
+            let pre_re = anchors[last_idx].ref_pos() + 1;
+            let max_ext = (pre_qe - pre_re).unsigned_abs() as i32;
+            if re0 - pre_re > max_ext { re0 = pre_re + max_ext; }
+            if qe0 - pre_qe > max_ext { qe0 = pre_qe + max_ext; }
         }
 
         if qe0 > qe && re0 > re {

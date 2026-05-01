@@ -396,6 +396,7 @@ pub struct AlnResult {
     pub divergence: f64,
     pub is_secondary: bool,
     pub split: u8,           // z-drop split flag: 1=left part, 2=right part
+    pub split_depth: u8,     // 0=original chain, 1=direct split-child, 2+=nested split-of-split
     pub dp_score: i32,       // for sorting (may be recalculated)
     pub dp_score_original: i32, // for ms:i: tag (original)
     pub effective_cnt: i32,  // for post-alignment filtering
@@ -683,6 +684,7 @@ fn align_single_mapping(
         edit_distance: nm, num_ambiguous: nn, divergence: de,
         is_secondary: mapping.is_secondary,
         split: 0,
+        split_depth: 0,
         dp_score: dp_max,
         dp_score_original: dp_max,
         effective_cnt,
@@ -719,8 +721,13 @@ fn try_align_inversion(
 ) -> Option<AlnResult> {
     // Preconditions
     if (r1.split & 1) == 0 || (r2.split & 2) == 0 { return None; }
-    // Parent check: only root chains (parent==id or flagged as temporary primary)
-    if !r1.is_root_chain || !r2.is_root_chain { return None; }
+    // Parent gate. In ALL_CHAINS mode parent assignment is skipped, so
+    // "primary" reduces to "this chain is itself a split-child".
+    if opt.flags.contains(AlignFlags::ALL_CHAINS) {
+        if (r1.split & 2) == 0 || (r2.split & 2) == 0 { return None; }
+    } else {
+        if !r1.is_root_chain || !r2.is_root_chain { return None; }
+    }
     if r1.ref_id != r2.ref_id || r1.is_reverse != r2.is_reverse { return None; }
 
     let ql = if r1.is_reverse {
@@ -900,6 +907,7 @@ fn try_align_inversion(
         divergence: de,
         is_secondary: false,
         split: 0,
+        split_depth: 0,
         dp_score: dp_max,
         dp_score_original: dp_max,
         effective_cnt: 0,
@@ -1084,20 +1092,23 @@ fn compute_mapping_qualities(
         }
     }).collect();
 
-    // Set inversion MAPQ from flanking alignments
+    // Set inversion MAPQ from flanking alignments. ALL_CHAINS mode includes
+    // every chain in the aux pool; other modes exclude secondaries.
     if mapqs.len() >= 3 {
-        let mut aux: Vec<(u64, usize)> = Vec::new();
+        let all_chains_mode = opt.flags.contains(AlignFlags::ALL_CHAINS);
+        let mut aux: Vec<(u64, u64)> = Vec::new();
         for (i, r) in results.iter().enumerate() {
-            if !r.is_secondary {
-                aux.push((((r.ref_id as u64) << 32) | r.ref_start as u64, i));
+            let include = if all_chains_mode { true } else { !r.is_secondary };
+            if include {
+                aux.push((((r.ref_id as u64) << 32) | r.ref_start as u64, i as u64));
             }
         }
-        aux.sort();
+        crate::align::sort::radix_sort_128x_pair(&mut aux);
         for k in 1..aux.len().saturating_sub(1) {
-            let idx = aux[k].1;
+            let idx = aux[k].1 as usize;
             if results[idx].inv {
-                let left_mapq = mapqs[aux[k - 1].1];
-                let right_mapq = mapqs[aux[k + 1].1];
+                let left_mapq = mapqs[aux[k - 1].1 as usize];
+                let right_mapq = mapqs[aux[k + 1].1 as usize];
                 mapqs[idx] = left_mapq.min(right_mapq);
             }
         }
@@ -1195,13 +1206,16 @@ fn assign_parents_and_select(
 ) -> (Vec<AlnResult>, Vec<usize>) {
     let mut parent_indices: Vec<usize> = (0..results.len()).collect();
 
-    // ALL_CHAINS mode (ava-ont, ava-pb): mark all results as secondary with mapq=0.
-    // This must run regardless of do_cigar since ava presets skip CIGAR.
+    // ALL_CHAINS mode (ava-ont, ava-pb): only direct (depth==1) split-children
+    // and inversion alignments count as primaries; originals and deeper splits
+    // are secondary.
     if !results.is_empty() && opt.flags.contains(AlignFlags::ALL_CHAINS) {
         for r in results.iter_mut() {
-            r.is_secondary = true;
+            r.is_secondary = !(r.split_depth == 1 || r.inv);
         }
-        parent_indices = vec![usize::MAX; results.len()];
+        parent_indices = results.iter().enumerate()
+            .map(|(i, r)| if r.is_secondary { usize::MAX } else { i })
+            .collect();
     }
 
     // Non-CIGAR mode: preserve pre-alignment parent structure from chain_post.
@@ -1251,7 +1265,22 @@ fn assign_parents_and_select(
         }
 
         if opt.flags.contains(AlignFlags::ALL_CHAINS) {
-            // ALL_CHAINS: parent assignment already done above; skip sort + parent + select_sub
+            // Parent assignment was done above. Still re-sort by (dp_max, hash)
+            // descending so the inv-mapq aux ordering uses the same regs order
+            // as if parent_select had run.
+            let alt_drop = opt.filtering.alt_drop;
+            let mut aux: Vec<(u64, u64)> = results.iter().enumerate().map(|(i, r)| {
+                let score = if r.is_alt { scale_alt_score(r.dp_score, alt_drop) } else { r.dp_score };
+                let key = ((score as u64) << 32) | (r.hash as u64);
+                (key, i as u64)
+            }).collect();
+            radix_sort_128x_pair(&mut aux);
+            let mut opt_results: Vec<Option<AlnResult>> = results.into_iter().map(Some).collect();
+            results = aux.iter().rev().map(|&(_, i)| opt_results[i as usize].take().unwrap()).collect();
+            // Recompute parent_indices to track new positions of primaries.
+            parent_indices = results.iter().enumerate()
+                .map(|(i, r)| if r.is_secondary { usize::MAX } else { i })
+                .collect();
         } else {
 
         // Sort by (dp_max, hash) descending with unstable but deterministic paired radix sort
@@ -1482,17 +1511,21 @@ fn process_query_core(
     let is_splice = opt.flags.contains(AlignFlags::SPLICE);
     let is_dual_splice = is_splice && opt.flags.contains(AlignFlags::SPLICE_FOR) && opt.flags.contains(AlignFlags::SPLICE_REV);
 
-    // Build work queue: original regs first, splits get inserted at front
-    let mut work_queue: std::collections::VecDeque<(Mapping, bool)> = std::collections::VecDeque::new();
+    // Build work queue: original regs first, splits get inserted at front.
+    // The u8 is split-depth: 0 = original chain, 1 = direct child of an original,
+    // 2+ = deeper-nested split-of-a-split. Used downstream to distinguish
+    // primary split-children from secondary deep splits.
+    let mut work_queue: std::collections::VecDeque<(Mapping, u8)> = std::collections::VecDeque::new();
     for r in regs.into_iter() {
-        work_queue.push_back((r, false));
+        work_queue.push_back((r, 0));
     }
 
     // Lazily initialized nt4 sequences for inversion detection
     let mut qseq_fwd_nt4: Option<Vec<u8>> = None;
     let mut qseq_rc_nt4: Option<Vec<u8>> = None;
 
-    while let Some((mut r, is_split_part)) = work_queue.pop_front() {
+    while let Some((mut r, parent_depth)) = work_queue.pop_front() {
+        let is_split_part = parent_depth > 0;
         let (mut result, recalc_info, new_split) = if is_dual_splice {
             let base_flags = opt.flags & !(AlignFlags::SPLICE_FOR | AlignFlags::SPLICE_REV);
             let mut r_for = r.clone();
@@ -1560,20 +1593,22 @@ fn process_query_core(
             (res, rec, spl)
         };
 
-        // Mark split parts
+        // Mark split parts; split_depth carries the chain's nesting level.
         if is_split_part {
             result.split |= 2;
             result.split_inv = r.split_inv;
         }
+        result.split_depth = parent_depth;
 
-        // If this result has a new split, mark it as left part and queue the split next
+        // If this result has a new split, mark it as left part and queue the split.
+        // The new split's depth is parent_depth + 1 (one level deeper).
         if let Some(split) = new_split {
             if debug {
                 eprintln!("[DBG] SPLIT_RIGHT cnt={} anchors={}", split.anchor_count, split.anchors.len());
             }
             result.split |= 1;
-            // Insert split at FRONT of queue so it's processed next (maintaining adjacency)
-            work_queue.push_front((split, true));
+            let child_depth = parent_depth.saturating_add(1);
+            work_queue.push_front((split, child_depth));
         }
 
         results.push(result);
