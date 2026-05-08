@@ -3,6 +3,16 @@ use std::path::Path;
 use std::fs::File;
 use flate2::read::MultiGzDecoder;
 
+/// Convert RNA bases U->T and u->t in place
+/// ASCII 'U' = 0x55, 'T' = 0x54, 'u' = 0x75, 't' = 0x74
+/// so just decrement
+#[inline]
+fn rna_to_dna_inplace(seq: &mut [u8]) {
+    for b in seq.iter_mut() {
+        if *b == b'U' || *b == b'u' { *b -= 1; }
+    }
+}
+
 use thiserror::Error;
 use crate::fasta::record::{Record, RefRecord};
 
@@ -277,8 +287,9 @@ impl<R: BufRead> Reader<R> {
             if self.reader.read_until(b'\n', &mut self.buf)? == 0 { return Ok(None); }
             self.line_number += 1;
             let s_end = trim_newline(&self.buf);
-            let seq = self.buf[..s_end].to_vec();
-            
+            let mut seq = self.buf[..s_end].to_vec();
+            rna_to_dna_inplace(&mut seq);
+
             // +
             self.buf.clear();
              if self.reader.read_until(b'\n', &mut self.buf)? == 0 { return Ok(None); }
@@ -345,7 +356,8 @@ impl<R: BufRead> Reader<R> {
              let l_end = trim_newline(&self.buf);
              seq.extend_from_slice(&self.buf[..l_end]);
         }
-        
+        rna_to_dna_inplace(&mut seq);
+
         Ok(Some(Record::new(name, desc, seq, None)))
     }
 
