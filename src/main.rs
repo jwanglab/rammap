@@ -776,10 +776,10 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         None
     };
     let stdout = std::io::stdout();
-    let mut handle: Box<dyn Write> = if let Some(f) = output_file {
+    let mut handle: Box<dyn Write + Send> = if let Some(f) = output_file {
         Box::new(std::io::BufWriter::new(f))
     } else {
-        Box::new(stdout.lock())
+        Box::new(std::io::BufWriter::new(stdout))
     };
 
     let mut total_stats = AlignmentStats::default();
@@ -1162,7 +1162,7 @@ fn map_one_part(
     query_path: &str,
     part_number: usize,  // 1-based
     sam_header_written: &mut bool,
-    handle: &mut Box<dyn Write>,
+    handle: &mut Box<dyn Write + Send>,
 ) -> anyhow::Result<AlignmentStats> {
     let mid_occ_frac = run.mid_occ_frac;
     let cli = run.cli;
@@ -1261,12 +1261,16 @@ fn map_one_part(
     if pe_mode {
         type PairData = (String, Vec<u8>, Option<String>, Option<String>, String, Vec<u8>, Option<String>, Option<String>);
 
-        // Overlapped I/O: reader thread reads ahead while main thread processes + writes
+        // Three-stage pipeline: reader thread → worker pool → writer thread.
+        // sync_channel(1) gives reader 1 chunk lookahead. The writer thread
+        // runs on its own and consumes results so the worker pool isn't idle
+        // while output is serialized.
         #[cfg(feature = "parallel")]
         {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<PairData>>(1);
+            let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Vec<(String, AlignmentStats)>>(2);
 
-            std::thread::scope(|s| -> anyhow::Result<()> {
+            total_stats = std::thread::scope(|s| -> anyhow::Result<AlignmentStats> {
                 s.spawn(move || {
                     loop {
                         let mut chunk_data: Vec<PairData> = Vec::new();
@@ -1310,6 +1314,19 @@ fn map_one_part(
                     }
                 });
 
+                let writer_handle = s.spawn(move || -> anyhow::Result<AlignmentStats> {
+                    let mut acc = AlignmentStats::default();
+                    while let Ok(results) = rx_out.recv() {
+                        for (res, stats) in results {
+                            if !res.is_empty() {
+                                write!(handle, "{}", res)?;
+                            }
+                            acc = acc + stats;
+                        }
+                    }
+                    Ok(acc)
+                });
+
                 while let Ok(chunk_data) = rx.recv() {
                     if chunk_data.is_empty() { break; }
 
@@ -1333,14 +1350,10 @@ fn map_one_part(
                         }
                     ).collect();
 
-                    for (res, stats) in results {
-                        if !res.is_empty() {
-                            write!(handle, "{}", res)?;
-                        }
-                        total_stats = total_stats + stats;
-                    }
+                    if tx_out.send(results).is_err() { break; }
                 }
-                Ok(())
+                drop(tx_out);
+                writer_handle.join().expect("writer thread panicked")
             })?;
         }
 
@@ -1409,13 +1422,16 @@ fn map_one_part(
             }
         }
     } else {
-        // Overlapped I/O: reader thread reads ahead while main thread processes + writes
+        // Three-stage pipeline: reader thread → worker pool → writer thread.
+        // Output is decoupled from the worker pool so cores stay saturated
+        // through chunk transitions.
         #[cfg(feature = "parallel")]
         {
             type SeData = (String, Vec<u8>, Option<String>, Option<String>);
             let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<SeData>>(1);
+            let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Vec<(String, AlignmentStats)>>(2);
 
-            std::thread::scope(|s| -> anyhow::Result<()> {
+            total_stats = std::thread::scope(|s| -> anyhow::Result<AlignmentStats> {
                 s.spawn(move || {
                     loop {
                         let mut chunk_data: Vec<SeData> = Vec::new();
@@ -1442,6 +1458,19 @@ fn map_one_part(
                     }
                 });
 
+                let writer_handle = s.spawn(move || -> anyhow::Result<AlignmentStats> {
+                    let mut acc = AlignmentStats::default();
+                    while let Ok(results) = rx_out.recv() {
+                        for (res, stats) in results {
+                            if !res.is_empty() {
+                                write!(handle, "{}", res)?;
+                            }
+                            acc = acc + stats;
+                        }
+                    }
+                    Ok(acc)
+                });
+
                 while let Ok(chunk_data) = rx.recv() {
                     if chunk_data.is_empty() { break; }
 
@@ -1464,14 +1493,10 @@ fn map_one_part(
                         }
                     ).collect();
 
-                    for (res, stats) in results {
-                        if !res.is_empty() {
-                            write!(handle, "{}", res)?;
-                        }
-                        total_stats = total_stats + stats;
-                    }
+                    if tx_out.send(results).is_err() { break; }
                 }
-                Ok(())
+                drop(tx_out);
+                writer_handle.join().expect("writer thread panicked")
             })?;
         }
 
