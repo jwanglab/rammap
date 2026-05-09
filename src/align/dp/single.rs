@@ -1564,7 +1564,7 @@ pub fn extend_single_affine(
     result: &mut DpResult,
 ) {
     // Force scalar mode for testing/comparison
-    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() {
+    if *crate::align::env_flags::FORCE_SCALAR {
         extend_single_affine_scalar(qseq, tseq, alphabet_size, score_matrix, gap_open as i32, gap_extend as i32, bandwidth, z_drop, end_bonus, flags, result);
         return;
     }

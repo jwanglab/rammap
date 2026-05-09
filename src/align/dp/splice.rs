@@ -54,7 +54,7 @@ pub fn extend_splice(
     result: &mut DpResult,
 ) {
     // Force scalar mode for testing/comparison
-    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() {
+    if *crate::align::env_flags::FORCE_SCALAR {
         extend_splice_scalar(qseq, tseq, alphabet_size, score_matrix,
             gap_open as i32, gap_extend as i32, gap_open2 as i32,
             noncanon_penalty as i32, z_drop, end_bonus,

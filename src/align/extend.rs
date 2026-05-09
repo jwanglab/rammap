@@ -1515,7 +1515,7 @@ pub fn align_anchors(
     let empty = AlignResult { cigar_ops: Vec::new(), query_start: 0, query_end: 0, ref_start: 0, ref_end: 0, dp_score: 0, split_right_anchors: None, split_offset_in_orig: None, split_inv: false };
     if anchors.is_empty() { return empty; }
 
-    let debug = std::env::var("RAMMAP_DEBUG_ALIGN").is_ok();
+    let debug = *crate::align::env_flags::DEBUG_ALIGN;
 
     let mat = build_scoring_matrix_full(a, b, transition, sc_ambi);
 

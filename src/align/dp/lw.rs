@@ -494,7 +494,7 @@ pub fn global_align(
     // Use SIMD extension on SIMD-capable targets (faster at all lengths).
     // Gotoh scalar NW is the fallback for non-SIMD architectures.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32"))]
-    let has_simd = std::env::var("RAMMAP_FORCE_SCALAR").is_err();
+    let has_simd = !*crate::align::env_flags::FORCE_SCALAR;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32")))]
     let has_simd = false;
 

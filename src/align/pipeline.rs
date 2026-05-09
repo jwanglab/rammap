@@ -352,7 +352,7 @@ pub fn update_dp_max(
     let mut b2 = 0.5 / div;
     if b2 * (a as f64) < b as f64 { b2 = a as f64 / b as f64; }
 
-    if std::env::var("RAMMAP_DEBUG").is_ok() {
+    if *crate::align::env_flags::DEBUG {
         let info = &recalc_infos[max_i];
         eprintln!("[DBG_DPMAX] max_i={} max={} max2={} div={:.10} b2={:.10} event_id={:.10} mlen={} blen={} n_ambi={} n_gap={} n_gapo={} n_entries={}",
             max_i, max, max2, div, b2, recalc_infos[max_i].event_identity(),
@@ -774,7 +774,7 @@ fn try_align_inversion(
     qseq.reverse();
     tseq.reverse();
 
-    if std::env::var("RAMMAP_DEBUG").is_ok() {
+    if *crate::align::env_flags::DEBUG {
         eprintln!("[DBG] try_align_inversion: ql={} tl={} ll_score={} raw_q_off={} raw_t_off={} min_dp_max={}", ql, tl, score, q_off, t_off, opt.alignment.min_dp_max);
     }
     if score < opt.alignment.min_dp_max { return None; }
@@ -785,7 +785,7 @@ fn try_align_inversion(
     q_off = ql - (q_off + 1);
     t_off = tl - (t_off + 1);
 
-    if std::env::var("RAMMAP_DEBUG").is_ok() {
+    if *crate::align::env_flags::DEBUG {
         eprintln!("[DBG] try_align_inversion: adjusted q_off={} t_off={} ql={} tl={}", q_off, t_off, ql, tl);
     }
 
@@ -805,7 +805,7 @@ fn try_align_inversion(
     } else {
         crate::align::dp::extend_dual_affine(q_sub, t_sub, 5, &mat, opt.scoring.gap_open as i8, opt.scoring.gap_extend as i8, opt.scoring.gap_open2 as i8, opt.scoring.gap_extend2 as i8, bw, opt.alignment.zdrop, -1, dp_flag, &mut ez);
     }
-    if std::env::var("RAMMAP_DEBUG").is_ok() {
+    if *crate::align::env_flags::DEBUG {
         eprintln!("[DBG] try_align_inversion: q_off={} t_off={} q_sub_len={} t_sub_len={} bw={} zdrop={} flag=0x{:x} ez_score={} ez_max={} cigar_len={}",
             q_off, t_off, q_sub.len(), t_sub.len(), bw, opt.alignment.zdrop, dp_flag, ez.score, ez.max, ez.cigar.len());
     }
@@ -1512,7 +1512,7 @@ fn process_query_core(
     // naturally processes the split next. After each right-split, inversion detection
     // checks the adjacent pair (left part at i-1, right part at i).
     let t_aln_start = Instant::now();
-    let debug = std::env::var("RAMMAP_DEBUG").is_ok();
+    let debug = *crate::align::env_flags::DEBUG;
     let is_splice = opt.flags.contains(AlignFlags::SPLICE);
     let is_dual_splice = is_splice && opt.flags.contains(AlignFlags::SPLICE_FOR) && opt.flags.contains(AlignFlags::SPLICE_REV);
 

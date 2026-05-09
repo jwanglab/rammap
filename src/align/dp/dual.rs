@@ -72,9 +72,9 @@ pub fn extend_dual_affine(
     }
 
     // Force scalar mode for testing/comparison
-    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() {
+    if *crate::align::env_flags::FORCE_SCALAR {
         // Compare mode: run both SIMD and scalar, report differences
-        if std::env::var("RAMMAP_COMPARE_SCALAR").is_ok() {
+        if *crate::align::env_flags::COMPARE_SCALAR {
             let mut ez_simd = DpResult::default();
             #[cfg(target_arch = "x86_64")]
             unsafe {

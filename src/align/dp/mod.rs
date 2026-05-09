@@ -66,12 +66,12 @@ fn simd_cap() -> SimdCap {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn use_avx512() -> bool {
-    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() { return false; }
-    if std::env::var("RAMMAP_FORCE_SSE").is_ok() { return false; }
-    if std::env::var("RAMMAP_FORCE_AVX2").is_ok() { return false; }
-    let force_avx512 = std::env::var("RAMMAP_FORCE_AVX512").is_ok();
+    use crate::align::env_flags::*;
+    if *FORCE_SCALAR { return false; }
+    if *FORCE_SSE { return false; }
+    if *FORCE_AVX2 { return false; }
     // Preset cap applies unless user explicitly opts back into AVX-512.
-    if !force_avx512 && !matches!(simd_cap(), SimdCap::Auto) {
+    if !*FORCE_AVX512 && !matches!(simd_cap(), SimdCap::Auto) {
         return false;
     }
     is_x86_feature_detected!("avx512bw")
@@ -81,8 +81,9 @@ pub fn use_avx512() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn use_avx2() -> bool {
-    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() { return false; }
-    if std::env::var("RAMMAP_FORCE_SSE").is_ok() { return false; }
+    use crate::align::env_flags::*;
+    if *FORCE_SCALAR { return false; }
+    if *FORCE_SSE { return false; }
     if matches!(simd_cap(), SimdCap::Sse | SimdCap::Scalar) { return false; }
     is_x86_feature_detected!("avx2")
 }

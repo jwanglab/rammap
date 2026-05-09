@@ -230,15 +230,13 @@ pub fn chain_anchors(
 
     #[cfg(target_arch = "x86_64")]
     {
-        let force_scalar = std::env::var("RAMMAP_FORCE_SCALAR_CHAIN").is_ok();
-        let force_sse = std::env::var("RAMMAP_FORCE_SSE").is_ok();
-        let force_avx2 = std::env::var("RAMMAP_FORCE_AVX2").is_ok();
-        if !force_scalar && !force_sse && !force_avx2 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let force_scalar = *crate::align::env_flags::FORCE_SCALAR_CHAIN;
+        if !force_scalar && crate::align::dp::use_avx512() && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
             return unsafe {
                 super::chain_simd::chain_anchors_avx512(opt, max_dist_x, max_dist_y, a, ctx)
             };
         }
-        if !force_scalar && !force_sse && is_x86_feature_detected!("avx2") {
+        if !force_scalar && crate::align::dp::use_avx2() {
             return unsafe {
                 super::chain_simd::chain_anchors_avx2(opt, max_dist_x, max_dist_y, a, ctx)
             };
@@ -252,7 +250,7 @@ pub fn chain_anchors(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let force_scalar = std::env::var("RAMMAP_FORCE_SCALAR_CHAIN").is_ok();
+        let force_scalar = *crate::align::env_flags::FORCE_SCALAR_CHAIN;
         if !force_scalar {
             return unsafe {
                 super::chain_simd::chain_anchors_neon(opt, max_dist_x, max_dist_y, a, ctx)
