@@ -149,11 +149,13 @@ pub(crate) fn chain_backtrack(
     predecessors: &[i64],
     v: &mut [i32], // modified in place to store anchor indices; C: v[n_v++] = i
     visited: &mut [i32],
+    candidates: &mut Vec<Minimizer>, // pooled scratch
     min_cnt: i32,
     min_sc: i32,
     max_drop: i32,
 ) -> (Vec<u64>, usize, usize) { // returns (u, n_u, n_v)
-    let mut candidates: Vec<Minimizer> = Vec::with_capacity(n);
+    candidates.clear();
+    candidates.reserve(n);
     let mut n_z = 0;
 
     for (i, &score) in scores[..n].iter().enumerate() {
@@ -168,7 +170,7 @@ pub(crate) fn chain_backtrack(
     }
 
     // Sort candidates by score (x) using MSD radix sort
-    radix_sort_128x(&mut candidates);
+    radix_sort_128x(candidates);
 
     for x in visited.iter_mut() { *x = 0; }
 
@@ -183,7 +185,7 @@ pub(crate) fn chain_backtrack(
 
         if visited[z_k_y_idx] == 0 {
             let n_v0 = n_v;
-            let end_i = chain_backtrack_end(max_drop, &candidates, scores, predecessors, visited, k as i64);
+            let end_i = chain_backtrack_end(max_drop, candidates, scores, predecessors, visited, k as i64);
 
             let mut i = z_k_y_idx as i64;
             while i != end_i {
@@ -454,10 +456,11 @@ pub(crate) fn chain_anchors_scalar(
         if global_max_score < best_score { global_max_score = best_score; }
     }
 
-    let (u, n_u, n_v) = chain_backtrack(n, &scores, &predecessors, &mut peak_scores, &mut visited, opt.min_cnt, opt.min_chain_score, real_max_drop);
+    let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
+    let (u, n_u, n_v) = chain_backtrack(n, &scores, &predecessors, &mut peak_scores, &mut visited, &mut bt_candidates, opt.min_cnt, opt.min_chain_score, real_max_drop);
 
     if n_u == 0 {
-        ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited;
+        ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited; ctx.bt_candidates = bt_candidates;
         return (Vec::new(), Vec::new());
     }
 
@@ -501,7 +504,7 @@ pub(crate) fn chain_anchors_scalar(
         }
     }
 
-    ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited;
+    ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited; ctx.bt_candidates = bt_candidates;
     (u2, b2)
 }
 

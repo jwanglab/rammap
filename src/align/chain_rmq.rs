@@ -607,6 +607,7 @@ pub fn chain_anchors_rmq(
     let max_drop = bw;
 
     let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -715,10 +716,10 @@ pub fn chain_anchors_rmq(
     }
 
     // Backtrack to extract chains
-    let (u, n_u, n_v) = chain_backtrack(n, &scores, &predecessors, &mut peak_scores, &mut visited, opt.min_cnt, opt.min_chain_score, max_drop);
+    let (u, n_u, n_v) = chain_backtrack(n, &scores, &predecessors, &mut peak_scores, &mut visited, &mut bt_candidates, opt.min_cnt, opt.min_chain_score, max_drop);
 
     if n_u == 0 {
-        ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited;
+        ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited; ctx.bt_candidates = bt_candidates;
         return (Vec::new(), Vec::new());
     }
 
@@ -762,7 +763,7 @@ pub fn chain_anchors_rmq(
         }
     }
 
-    ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited;
+    ctx.predecessors = predecessors; ctx.scores = scores; ctx.peak_scores = peak_scores; ctx.visited = visited; ctx.bt_candidates = bt_candidates;
     (u2, b2)
 }
 

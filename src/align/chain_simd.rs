@@ -284,7 +284,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
     }
 
     // --- DP buffers ---
-    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut predecessors = std::mem::take(&mut ctx.predecessors); let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -418,13 +418,14 @@ pub(crate) unsafe fn chain_anchors_avx2(
         &predecessors,
         &mut peak_scores,
         &mut visited,
+        &mut bt_candidates,
         opt.min_cnt,
         opt.min_chain_score,
         real_max_drop,
     );
 
     if n_u == 0 {
-        ctx.predecessors = predecessors;
+        ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates);
         ctx.scores = scores;
         ctx.peak_scores = peak_scores;
         ctx.visited = visited;
@@ -476,7 +477,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
     }
 
     // Return buffers to context for reuse
-    ctx.predecessors = predecessors;
+    ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates);
     ctx.scores = scores;
     ctx.peak_scores = peak_scores;
     ctx.visited = visited;
@@ -684,7 +685,7 @@ pub(crate) unsafe fn chain_anchors_sse(
         soa_rid_strand[j] = (a[j].x >> 32) as u32;
     }
 
-    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut predecessors = std::mem::take(&mut ctx.predecessors); let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -805,10 +806,10 @@ pub(crate) unsafe fn chain_anchors_sse(
     }
 
     let (u, n_u, n_v) = chain_backtrack(n, &scores, &predecessors, &mut peak_scores,
-        &mut visited, opt.min_cnt, opt.min_chain_score, real_max_drop);
+        &mut visited, &mut bt_candidates, opt.min_cnt, opt.min_chain_score, real_max_drop);
 
     if n_u == 0 {
-        ctx.predecessors = predecessors; ctx.scores = scores;
+        ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
         ctx.peak_scores = peak_scores; ctx.visited = visited;
         ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
         ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
@@ -841,7 +842,7 @@ pub(crate) unsafe fn chain_anchors_sse(
         for idx in 0..ni { b2.push(b[offset + idx]); }
     }
 
-    ctx.predecessors = predecessors; ctx.scores = scores;
+    ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
     ctx.peak_scores = peak_scores; ctx.visited = visited;
     ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
     ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
@@ -1032,7 +1033,7 @@ pub(crate) unsafe fn chain_anchors_avx512(
         soa_rid_strand[j] = (a[j].x >> 32) as u32;
     }
 
-    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut predecessors = std::mem::take(&mut ctx.predecessors); let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -1144,11 +1145,12 @@ pub(crate) unsafe fn chain_anchors_avx512(
 
     let (u, n_u, n_v) = chain_backtrack(
         n, &scores, &predecessors, &mut peak_scores, &mut visited,
+        &mut bt_candidates,
         opt.min_cnt, opt.min_chain_score, real_max_drop,
     );
 
     if n_u == 0 {
-        ctx.predecessors = predecessors; ctx.scores = scores;
+        ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
         ctx.peak_scores = peak_scores; ctx.visited = visited;
         ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
         ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
@@ -1187,7 +1189,7 @@ pub(crate) unsafe fn chain_anchors_avx512(
         for idx in 0..ni { b2.push(b[offset + idx]); }
     }
 
-    ctx.predecessors = predecessors; ctx.scores = scores;
+    ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
     ctx.peak_scores = peak_scores; ctx.visited = visited;
     ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
     ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
@@ -1456,7 +1458,7 @@ pub(crate) unsafe fn chain_anchors_neon(
     }
 
     // --- DP buffers ---
-    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut predecessors = std::mem::take(&mut ctx.predecessors); let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -1587,13 +1589,14 @@ pub(crate) unsafe fn chain_anchors_neon(
         &predecessors,
         &mut peak_scores,
         &mut visited,
+        &mut bt_candidates,
         opt.min_cnt,
         opt.min_chain_score,
         real_max_drop,
     );
 
     if n_u == 0 {
-        ctx.predecessors = predecessors;
+        ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates);
         ctx.scores = scores;
         ctx.peak_scores = peak_scores;
         ctx.visited = visited;
@@ -1641,7 +1644,7 @@ pub(crate) unsafe fn chain_anchors_neon(
         }
     }
 
-    ctx.predecessors = predecessors;
+    ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates);
     ctx.scores = scores;
     ctx.peak_scores = peak_scores;
     ctx.visited = visited;
@@ -1861,7 +1864,7 @@ pub(crate) unsafe fn chain_anchors_wasm(
         soa_rid_strand[j] = (a[j].x >> 32) as u32;
     }
 
-    let mut predecessors = std::mem::take(&mut ctx.predecessors);
+    let mut predecessors = std::mem::take(&mut ctx.predecessors); let mut bt_candidates = std::mem::take(&mut ctx.bt_candidates);
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
@@ -1973,11 +1976,12 @@ pub(crate) unsafe fn chain_anchors_wasm(
 
     let (u, n_u, n_v) = chain_backtrack(
         n, &scores, &predecessors, &mut peak_scores, &mut visited,
+        &mut bt_candidates,
         opt.min_cnt, opt.min_chain_score, real_max_drop,
     );
 
     if n_u == 0 {
-        ctx.predecessors = predecessors; ctx.scores = scores;
+        ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
         ctx.peak_scores = peak_scores; ctx.visited = visited;
         ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
         ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;
@@ -2016,7 +2020,7 @@ pub(crate) unsafe fn chain_anchors_wasm(
         for idx in 0..ni { b2.push(b[offset + idx]); }
     }
 
-    ctx.predecessors = predecessors; ctx.scores = scores;
+    ctx.predecessors = predecessors; ctx.bt_candidates = std::mem::take(&mut bt_candidates); ctx.scores = scores;
     ctx.peak_scores = peak_scores; ctx.visited = visited;
     ctx.soa_ref_pos = soa_ref_pos; ctx.soa_query_pos = soa_query_pos;
     ctx.soa_query_span = soa_query_span; ctx.soa_ref_id_strand = soa_rid_strand;

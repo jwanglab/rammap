@@ -266,6 +266,8 @@ pub struct ChainingBuffers {
     pub scores: Vec<i32>,
     pub peak_scores: Vec<i32>,
     pub visited: Vec<i32>,
+    // Backtrack candidate buffer (one (score, idx) per candidate chain)
+    pub bt_candidates: Vec<Minimizer>,
     // SoA buffers for SIMD chaining (extracted from Minimizer AoS)
     pub soa_ref_pos: Vec<i32>,
     pub soa_query_pos: Vec<i32>,
@@ -287,6 +289,7 @@ impl ChainingBuffers {
             scores: Vec::with_capacity(4096),
             peak_scores: Vec::with_capacity(4096),
             visited: Vec::with_capacity(4096),
+            bt_candidates: Vec::with_capacity(1024),
             soa_ref_pos: Vec::new(),
             soa_query_pos: Vec::new(),
             soa_query_span: Vec::new(),
