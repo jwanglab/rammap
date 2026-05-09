@@ -475,8 +475,13 @@ fn align_single_mapping(
 
         let tlen = mi.seqs[rid].len;
 
-        // Compute region extraction bounds with generous padding
-        let pad = std::cmp::max(opt.chaining.max_gap as usize * 2, qlen * 2).max(10000);
+        // Compute region extraction bounds. The padding accommodates the chain's
+        // boundary extension; max_gap bounds how far an alignment can extend past
+        // an anchor, and qlen bounds the read's own footprint. For SR (qlen~150,
+        // max_gap=100) this is ~300 bytes; for long reads max_gap dominates
+        // (lr:hq max_gap=10000 → pad=20000). Previous version had a hard
+        // .max(10000) floor that wasted ~133× memory on SR alignments.
+        let pad = std::cmp::max(opt.chaining.max_gap as usize * 2, qlen * 2);
         let rgn_start = mapping.ref_start.saturating_sub(pad);
         let rgn_end = std::cmp::min(tlen, mapping.ref_end + pad);
 
