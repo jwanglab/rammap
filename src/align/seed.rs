@@ -168,10 +168,38 @@ struct MatchedSeed {
     entry_range: (u32, u32), // absolute range into Index.entries, avoids re-lookup
 }
 
+/// Reusable scratch buffers for the seed-collection path.
+///
+/// Held on `MapContext` and threaded through `collect_seed_hits*` so we don't
+/// allocate `is_tandem`/`seeds`/`matched_seeds`/`heap` per read.
+pub struct SeedScratch {
+    is_tandem: Vec<bool>,
+    seeds: Vec<SeedInfo>,
+    matched_seeds: Vec<MatchedSeed>,
+    heap: Vec<(u64, u64)>,
+}
+
+impl Default for SeedScratch {
+    fn default() -> Self { Self::new() }
+}
+
+impl SeedScratch {
+    pub fn new() -> Self {
+        SeedScratch {
+            is_tandem: Vec::new(),
+            seeds: Vec::new(),
+            matched_seeds: Vec::new(),
+            heap: Vec::new(),
+        }
+    }
+}
+
 /// Common seed collection + filtering logic shared by both heap and non-heap paths.
 /// Collect anchor matches from index hits.
 ///
-/// Returns (matched_seeds, n_a, rep_len) where n_a is total anchor count.
+/// Fills `scratch.matched_seeds` with the kept seeds and returns (n_a, rep_len)
+/// where n_a is total anchor count. `scratch.is_tandem` and `scratch.seeds` are
+/// reused as working buffers.
 fn collect_anchor_matches(
     opt: &MapOptions,
     mi: &Index,
@@ -179,12 +207,15 @@ fn collect_anchor_matches(
     q_minimizers: &[Minimizer],
     mini_pos: &mut Vec<u64>,
     max_occ: usize,
-) -> (Vec<MatchedSeed>, usize, usize) {
+    scratch: &mut SeedScratch,
+) -> (usize, usize) {
     mini_pos.clear();
 
-    // Pre-compute tandem flags
+    // Pre-compute tandem flags (reuse buffer)
     let n_qm = q_minimizers.len();
-    let mut is_tandem = vec![false; n_qm];
+    let is_tandem = &mut scratch.is_tandem;
+    is_tandem.clear();
+    is_tandem.resize(n_qm, false);
     for i in 0..n_qm {
         if i > 0 && (q_minimizers[i].x >> 8) == (q_minimizers[i - 1].x >> 8) {
             is_tandem[i] = true;
@@ -199,7 +230,9 @@ fn collect_anchor_matches(
     // Software prefetch: issue prefetch for upcoming hash table bucket while
     // processing the current one, hiding memory latency.
     const PREFETCH_AHEAD: usize = 8;
-    let mut seeds: Vec<SeedInfo> = Vec::with_capacity(n_qm);
+    let seeds = &mut scratch.seeds;
+    seeds.clear();
+    seeds.reserve(n_qm);
 
     // Issue initial prefetches
     for mn in q_minimizers.iter().take(PREFETCH_AHEAD.min(n_qm)) {
@@ -233,7 +266,7 @@ fn collect_anchor_matches(
 
     // Phase 2: Apply mm_select_seeds or simple filtering
     if opt.seeding.occ_dist > 0 && opt.seeding.max_max_occ > max_occ {
-        select_seeds(&mut seeds, qlen, max_occ, opt.seeding.max_max_occ, opt.seeding.occ_dist);
+        select_seeds(seeds, qlen, max_occ, opt.seeding.max_max_occ, opt.seeding.occ_dist);
     } else {
         for s in seeds.iter_mut() {
             if s.hit_count > max_occ { s.is_filtered = true; }
@@ -241,13 +274,15 @@ fn collect_anchor_matches(
     }
 
     // Phase 3: Partition filtered vs non-filtered, compute rep_len and n_a
-    let mut matched_seeds: Vec<MatchedSeed> = Vec::with_capacity(seeds.len());
+    let matched_seeds = &mut scratch.matched_seeds;
+    matched_seeds.clear();
+    matched_seeds.reserve(seeds.len());
     let mut n_a: usize = 0;
     let mut rep_len: usize = 0;
     let mut rep_st: usize = 0;
     let mut rep_en: usize = 0;
 
-    for seed in &seeds {
+    for seed in seeds.iter() {
         if seed.is_filtered {
             let en = (seed.query_pos >> 1) as usize + 1;
             let st = en.saturating_sub(seed.q_span as usize);
@@ -274,7 +309,7 @@ fn collect_anchor_matches(
 
     rep_len += rep_en - rep_st;
 
-    (matched_seeds, n_a, rep_len)
+    (n_a, rep_len)
 }
 
 /// Non-heap seed collection with explicit max_occ parameter (for re-chaining path).
@@ -287,10 +322,12 @@ pub(crate) fn collect_seed_hits_with_occ(
     mini_pos: &mut Vec<u64>,
     max_occ: usize,
     qname: Option<&str>,
+    scratch: &mut SeedScratch,
 ) -> usize {
     anchors.clear();
-    let (matched_seeds, n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ);
+    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch);
     anchors.reserve(n_a);
+    let matched_seeds = &scratch.matched_seeds;
 
     let seed_tandem: u64 = crate::align::sketch::SEED_TANDEM;
     let skip_flags = opt.flags & (AlignFlags::NO_DIAG | AlignFlags::NO_DUAL);
@@ -374,8 +411,9 @@ pub fn collect_seed_hits(
     anchors: &mut Vec<Minimizer>,
     mini_pos: &mut Vec<u64>,
     qname: Option<&str>,
+    scratch: &mut SeedScratch,
 ) -> usize {
-    collect_seed_hits_with_occ(opt, mi, qlen, q_minimizers, anchors, mini_pos, opt.seeding.mid_occ, qname)
+    collect_seed_hits_with_occ(opt, mi, qlen, q_minimizers, anchors, mini_pos, opt.seeding.mid_occ, qname, scratch)
 }
 
 // --- Heap-based seed collection ---
@@ -384,19 +422,23 @@ pub fn collect_seed_hits(
 /// Smaller x values float to root.
 #[inline]
 fn anchor_heap_down(heap: &mut [(u64, u64)], start: usize, n: usize) {
-    let mut i = start;
-    let tmp = heap[i];
-    loop {
-        let mut k = (i << 1) + 1; // left child
-        if k >= n { break; }
-        // Pick the child with smaller .0
-        if k + 1 < n && heap[k].0 > heap[k + 1].0 { k += 1; }
-        // If child has strictly larger .0, stop
-        if heap[k].0 > tmp.0 { break; }
-        heap[i] = heap[k];
-        i = k;
+    debug_assert!(start < n && n <= heap.len());
+    // SAFETY: i < n on entry; k < n is checked before each child access; n <= heap.len().
+    unsafe {
+        let p = heap.as_mut_ptr();
+        let mut i = start;
+        let tmp = *p.add(i);
+        loop {
+            let mut k = (i << 1) + 1;
+            if k >= n { break; }
+            // Pick the smaller child.
+            if k + 1 < n && (*p.add(k)).0 > (*p.add(k + 1)).0 { k += 1; }
+            if (*p.add(k)).0 > tmp.0 { break; }
+            *p.add(i) = *p.add(k);
+            i = k;
+        }
+        *p.add(i) = tmp;
     }
-    heap[i] = tmp;
 }
 
 /// Build min-heap from unsorted array. Matches ksort.h ks_heapmake.
@@ -420,26 +462,26 @@ pub fn collect_seed_hits_heap(
     mini_pos: &mut Vec<u64>,
     max_occ: usize,
     qname: Option<&str>,
+    scratch: &mut SeedScratch,
 ) -> usize {
     anchors.clear();
-    let (matched_seeds, n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ);
+    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch);
     if n_a == 0 { return rep_len; }
 
     anchors.resize(n_a, Minimizer { x: 0, y: 0 });
 
-    // Retrieve hit slices directly from cached entry ranges (no binary search).
-    let hit_slices: Vec<&[u64]> = matched_seeds.iter().map(|seed| {
-        mi.get_by_range(seed.entry_range)
-    }).collect();
-
-    // Initialize heap: (r_packed, seed_idx << 32 | hit_counter)
-    let mut heap: Vec<(u64, u64)> = Vec::with_capacity(matched_seeds.len());
-    for (i, h) in hit_slices.iter().enumerate() {
+    // Disjoint field borrows: shared on matched_seeds, exclusive on heap.
+    let matched_seeds: &[MatchedSeed] = &scratch.matched_seeds;
+    let heap = &mut scratch.heap;
+    heap.clear();
+    heap.reserve(matched_seeds.len());
+    for (i, seed) in matched_seeds.iter().enumerate() {
+        let h = mi.get_by_range(seed.entry_range);
         if !h.is_empty() {
             heap.push((h[0], (i as u64) << 32)); // h[0] = r_packed
         }
     }
-    anchor_heap_make(&mut heap);
+    anchor_heap_make(heap);
 
     let mut n_for: usize = 0;
     let mut n_rev: usize = 0;
@@ -507,7 +549,7 @@ pub fn collect_seed_hits_heap(
         }
 
         // Update heap: advance to next hit or remove seed
-        let hits = hit_slices[seed_idx];
+        let hits = mi.get_by_range(seed.entry_range);
         let hs = heap.len();
         if hit_idx < hits.len() - 1 {
             let next_r = hits[hit_idx + 1];
@@ -518,7 +560,7 @@ pub fn collect_seed_hits_heap(
         }
         let hn = heap.len();
         if hn > 0 {
-            anchor_heap_down(&mut heap, 0, hn);
+            anchor_heap_down(heap, 0, hn);
         }
     }
 
