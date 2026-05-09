@@ -532,6 +532,11 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
 /// is not recognized so the caller can abort rather than silently using
 /// the default configuration.
 pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) -> Result<(), String> {
+    // Reset SIMD cap each time so switching presets has predictable behavior.
+    // Specific presets below opt back into a cap if their workload is hurt by
+    // AVX-512's per-core license throttling (chain/seed-heavy presets where DP
+    // is a small fraction of CPU time).
+    crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Auto);
     match preset {
         "lr" | "map-ont" => {
             *k = 15; *w = 10;
@@ -598,6 +603,11 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             }
         },
         "short" | "sr" => {
+            // Cap SIMD at AVX2: SR mapping spends ~7-10% of CPU in DP and the rest
+            // in chaining/seeding/output, so AVX-512's all-core license throttle
+            // (200-600 MHz drop on Skylake-X / Cascade / Cooper Lake) costs more
+            // than the DP speedup wins. RAMMAP_FORCE_AVX512=1 overrides this.
+            crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
             *k = 21; *w = 11;
             opt.flags.insert(AlignFlags::SHORT_READ | AlignFlags::FRAG_MODE | AlignFlags::NO_PRINT_2ND | AlignFlags::HEAP_SORT);
             opt.pairing.pe_ori = 1;
@@ -643,6 +653,9 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             }
         },
         "ava-ont" => {
+            // Cap SIMD at AVX2 — AVA workload is dominated by chaining (ALL_CHAINS)
+            // with no base-level alignment, so AVX-512 throttling pure-loses here.
+            crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
             *k = 15; *w = 5;
             opt.flags.insert(AlignFlags::ALL_CHAINS | AlignFlags::NO_DIAG | AlignFlags::NO_DUAL | AlignFlags::NO_LJOIN);
             opt.chaining.min_chain_score = 100; opt.filtering.pri_ratio = 0.0;
@@ -651,6 +664,8 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             opt.seeding.occ_dist = 0;
         },
         "ava-pb" => {
+            // Cap SIMD at AVX2 — same reasoning as ava-ont.
+            crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
             *is_hpc = true; *k = 19; *w = 5;
             opt.flags.insert(AlignFlags::ALL_CHAINS | AlignFlags::NO_DIAG | AlignFlags::NO_DUAL | AlignFlags::NO_LJOIN);
             opt.chaining.min_chain_score = 100; opt.filtering.pri_ratio = 0.0;

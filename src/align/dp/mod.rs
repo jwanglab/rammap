@@ -4,7 +4,9 @@
 //! with SIMD specializations for SSE2, AVX2, AVX512BW, NEON, WASM SIMD128, and a
 //! scalar fallback. The public entry points are `extend_single_affine`,
 //! `extend_dual_affine`, and `extend_splice`; each dispatches to the best available
-//! SIMD variant at runtime (overridable via `RAMMAP_FORCE_SSE` / `RAMMAP_FORCE_AVX2`).
+//! SIMD variant at runtime, optionally capped per-preset (e.g., `sr`/`ava-*` cap
+//! at AVX2 to avoid AVX-512 license throttling). Override-able via env vars:
+//! `RAMMAP_FORCE_SCALAR`, `RAMMAP_FORCE_SSE`, `RAMMAP_FORCE_AVX2`, `RAMMAP_FORCE_AVX512`.
 //!
 //! All kernels return a `DpResult` containing the alignment score, the query/target
 //! end positions, the number of columns computed, and an optional CIGAR. Callers in
@@ -15,6 +17,75 @@ mod single;
 mod dual;
 mod splice;
 mod lw;
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Per-process cap on SIMD width.
+///
+/// `sr`/`ava-*` presets set this to `Avx2` because their workload is dominated by
+/// chaining/seeding/output rather than DP — a workload class where AVX-512's
+/// per-core license throttling (200–600 MHz drop on Skylake-X / Cascade Lake / Cooper Lake
+/// for ~2 ms after any AVX-512 instruction) costs more than the DP speedup wins.
+/// Other presets leave this `Auto` and use AVX-512 when available.
+///
+/// Override with env vars (highest priority first):
+/// - `RAMMAP_FORCE_SCALAR=1`
+/// - `RAMMAP_FORCE_SSE=1`
+/// - `RAMMAP_FORCE_AVX2=1`
+/// - `RAMMAP_FORCE_AVX512=1` (overrides preset cap; opt back into AVX-512)
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SimdCap {
+    Auto = 0,
+    Avx2 = 1,
+    Sse = 2,
+    Scalar = 3,
+}
+
+static SIMD_CAP: AtomicU8 = AtomicU8::new(SimdCap::Auto as u8);
+
+/// Set the per-process SIMD cap. Typically called from `apply_preset_str` once
+/// during startup. Library users with multiple Aligners should be aware this is
+/// process-global; reset to `Auto` if switching back to a DP-heavy preset.
+pub fn set_simd_cap(cap: SimdCap) {
+    SIMD_CAP.store(cap as u8, Ordering::Relaxed);
+}
+
+#[inline]
+fn simd_cap() -> SimdCap {
+    match SIMD_CAP.load(Ordering::Relaxed) {
+        1 => SimdCap::Avx2,
+        2 => SimdCap::Sse,
+        3 => SimdCap::Scalar,
+        _ => SimdCap::Auto,
+    }
+}
+
+/// Should we dispatch to the AVX-512 DP path here?
+/// Combines env-var overrides, preset cap, and runtime CPU detection.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn use_avx512() -> bool {
+    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() { return false; }
+    if std::env::var("RAMMAP_FORCE_SSE").is_ok() { return false; }
+    if std::env::var("RAMMAP_FORCE_AVX2").is_ok() { return false; }
+    let force_avx512 = std::env::var("RAMMAP_FORCE_AVX512").is_ok();
+    // Preset cap applies unless user explicitly opts back into AVX-512.
+    if !force_avx512 && !matches!(simd_cap(), SimdCap::Auto) {
+        return false;
+    }
+    is_x86_feature_detected!("avx512bw")
+}
+
+/// Should we dispatch to the AVX2 DP path here?
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn use_avx2() -> bool {
+    if std::env::var("RAMMAP_FORCE_SCALAR").is_ok() { return false; }
+    if std::env::var("RAMMAP_FORCE_SSE").is_ok() { return false; }
+    if matches!(simd_cap(), SimdCap::Sse | SimdCap::Scalar) { return false; }
+    is_x86_feature_detected!("avx2")
+}
 
 // Re-export public API from common
 pub use common::{

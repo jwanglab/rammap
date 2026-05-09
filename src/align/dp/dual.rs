@@ -110,11 +110,9 @@ pub fn extend_dual_affine(
 
     #[cfg(target_arch = "x86_64")]
     {
-        let force_sse = std::env::var("RAMMAP_FORCE_SSE").is_ok();
-        let force_avx2 = std::env::var("RAMMAP_FORCE_AVX2").is_ok();
-        if !force_sse && !force_avx2 && is_x86_feature_detected!("avx512bw") {
+        if super::use_avx512() {
             unsafe { extend_dual_affine_avx512_fn(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, gap_open2, gap_extend2, bandwidth, z_drop, end_bonus, flags, result); }
-        } else if !force_sse && is_x86_feature_detected!("avx2") {
+        } else if super::use_avx2() {
             unsafe { extend_dual_affine_avx2_fn(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, gap_open2, gap_extend2, bandwidth, z_drop, end_bonus, flags, result); }
         } else if is_x86_feature_detected!("sse4.1") {
             unsafe { extend_dual_affine41_impl(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, gap_open2, gap_extend2, bandwidth, z_drop, end_bonus, flags, result); }
