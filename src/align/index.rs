@@ -125,40 +125,45 @@ impl Index {
 
     /// Fast bulk unpack from packed 4-bit to nt4 bytes (0=A,1=C,2=G,3=T,4=N).
     /// Processes 8 bases per u32 word for aligned portions.
+    ///
+    /// Each nibble of `packed` is guaranteed by `Index::build` to hold 0-4 only
+    /// (the encoding table maps to {0,1,2,3,4} and OR-writes target unique nibble
+    /// positions), so `& 0xf` alone is sufficient and the runtime `.min(4)` clamp
+    /// is dropped.
     fn unpack_nt4_into(packed: &[u32], gpos_start: usize, out: &mut [u8]) {
         let len = out.len();
         if len == 0 { return; }
         let mut i = 0;
         let mut gpos = gpos_start;
 
-        // Handle unaligned prefix
         while i < len && (gpos & 7) != 0 {
-            out[i] = (((packed[gpos >> 3] >> (((gpos & 7) << 2) as u32)) & 0xf) as u8).min(4);
+            out[i] = ((packed[gpos >> 3] >> (((gpos & 7) << 2) as u32)) & 0xf) as u8;
             i += 1;
             gpos += 1;
         }
 
-        // Fast path: extract 8 bases per u32 word
         let word_start = gpos >> 3;
         let full_words = (len - i) >> 3;
-        for w in 0..full_words {
-            let word = packed[word_start + w];
-            let base = i + (w << 3);
-            out[base]     = ((word & 0xf) as u8).min(4);
-            out[base + 1] = (((word >>  4) & 0xf) as u8).min(4);
-            out[base + 2] = (((word >>  8) & 0xf) as u8).min(4);
-            out[base + 3] = (((word >> 12) & 0xf) as u8).min(4);
-            out[base + 4] = (((word >> 16) & 0xf) as u8).min(4);
-            out[base + 5] = (((word >> 20) & 0xf) as u8).min(4);
-            out[base + 6] = (((word >> 24) & 0xf) as u8).min(4);
-            out[base + 7] = (((word >> 28) & 0xf) as u8).min(4);
+        if full_words > 0 {
+            let words = &packed[word_start..word_start + full_words];
+            let main_end = i + (full_words << 3);
+            let (chunks, _rem) = out[i..main_end].as_chunks_mut::<8>();
+            for (chunk, &word) in chunks.iter_mut().zip(words.iter()) {
+                chunk[0] = ( word        & 0xf) as u8;
+                chunk[1] = ((word >>  4) & 0xf) as u8;
+                chunk[2] = ((word >>  8) & 0xf) as u8;
+                chunk[3] = ((word >> 12) & 0xf) as u8;
+                chunk[4] = ((word >> 16) & 0xf) as u8;
+                chunk[5] = ((word >> 20) & 0xf) as u8;
+                chunk[6] = ((word >> 24) & 0xf) as u8;
+                chunk[7] = ((word >> 28) & 0xf) as u8;
+            }
+            i = main_end;
+            gpos = gpos_start + i;
         }
-        i += full_words << 3;
-        gpos = gpos_start + i;
 
-        // Handle unaligned suffix
         while i < len {
-            out[i] = (((packed[gpos >> 3] >> (((gpos & 7) << 2) as u32)) & 0xf) as u8).min(4);
+            out[i] = ((packed[gpos >> 3] >> (((gpos & 7) << 2) as u32)) & 0xf) as u8;
             i += 1;
             gpos += 1;
         }
