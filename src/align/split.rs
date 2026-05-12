@@ -294,7 +294,7 @@ pub fn merge_split_results(
             pq1.rep_len = 0;
             pq2.rep_len = 0;
 
-            // mm_pair (map.c:650-651)
+            // Run pair-rescue / TLEN inference across the two mates.
             if out_cfg.do_cigar && opt.pairing.pe_ori >= 0 {
                 let qlens = [qseq1_work.len() as i32, qseq2_work.len() as i32];
                 let sub_diff = opt.scoring.match_score * 2 + opt.scoring.mismatch_penalty;

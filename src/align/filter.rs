@@ -210,7 +210,8 @@ pub struct FilterResult {
     pub passes_strand: bool,
 }
 
-/// Check if a secondary item passes the mm_select_sub filtering criteria.
+/// Check if a secondary item passes the secondary-overlap / score-ratio
+/// filtering criteria (run after parent assignment).
 /// `check_strand`: strand retention is enabled for pre-alignment filtering
 /// but disabled for post-alignment filtering.
 pub fn check_secondary_filter(

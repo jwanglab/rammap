@@ -375,7 +375,7 @@ pub(crate) fn collect_seed_hits_with_occ(
                     x = (r_packed & 0xFFFFFFFF00000000) | (r_pos as u64);
                     y = (q_span as u64) << 32 | (q_pos_u32 as u64);
                 } else if opt.flags.contains(AlignFlags::QSTRAND) {
-                    // qstrand mode: keep query pos, reverse reference pos (map.c:189-195)
+                    // qstrand mode: keep query pos, reverse reference pos.
                     let rid = (r_packed >> 32) as usize;
                     let tlen = mi.seqs[rid].len as u64;
                     let rpos_rev = tlen.wrapping_sub(r_pos as u64 + 1).wrapping_sub(1).wrapping_add(q_span as u64);
@@ -582,7 +582,10 @@ pub fn collect_seed_hits_heap(
     rep_len
 }
 
-/// Apply mm_filter_minimizers_by_occ on minimizer vector (shared by single and multi-segment paths).
+/// Drop query minimizers that appear too many times within the query itself
+/// (shared by single- and multi-segment paths). `mid_occ` is the absolute
+/// cutoff and `q_occ_frac` the fraction of total minimizers above which the
+/// cutoff applies.
 pub(crate) fn filter_minimizers_by_occ(minimizers: &mut Vec<Minimizer>, mid_occ: usize, q_occ_frac: f32) {
     let n = minimizers.len();
     let q_occ_max = mid_occ;

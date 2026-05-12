@@ -578,10 +578,9 @@ fn compute_chain_score_simple(
     (sc, exact, gap_width)
 }
 
-/// RMQ-based chaining (port of mg_lchain_rmq)
-///
-/// This is more efficient than DP chaining for large bandwidths because it uses
-/// O(log n) range maximum queries instead of O(n) iteration.
+/// RMQ-based chaining: uses a range-max query tree over score-by-position to
+/// pick the best predecessor in O(log n) per anchor instead of the DP path's
+/// O(n) inner scan. Wins on large bandwidths / long-read chains.
 ///
 /// Arguments:
 /// - opt: chaining parameters (max_gap, rmq_inner_dist, bandwidth, max_chain_skip, etc.)
@@ -723,7 +722,7 @@ pub fn chain_anchors_rmq(
         return (Vec::new(), Vec::new());
     }
 
-    // compact_a logic: reorder anchors according to chains (matching lchain.c:78-111)
+    // compact_a logic: reorder anchors into per-chain contiguous runs.
     // Step 1: Write chain anchors to b[] in forward order
     let mut b: Vec<Minimizer> = Vec::with_capacity(n_v);
     let mut k = 0;
@@ -737,7 +736,7 @@ pub fn chain_anchors_rmq(
         }
     }
 
-    // Step 2: Sort chains by target position of first anchor (lchain.c:93-107)
+    // Step 2: Sort chains by target position of their first anchor.
     let mut w: Vec<Minimizer> = Vec::with_capacity(n_u);
     let mut k_pos = 0usize;
     for (i, &u_val) in u[..n_u].iter().enumerate() {

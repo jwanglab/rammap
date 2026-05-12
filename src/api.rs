@@ -32,7 +32,7 @@ use crate::align::map::{MapOptions, MapContext, AlignFlags};
 use crate::align::extend::AlignmentContext;
 use crate::align::pipeline::{self, OutputConfig, ReadInfo};
 
-/// Alignment preset matching minimap2's `-x` presets.
+/// Alignment preset (selected via the `-x` flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     MapOnt,
@@ -223,7 +223,7 @@ impl Aligner {
 
     // --- Constructors ---
 
-    /// Load an aligner from a pre-built minimap2 `.mmi` index file.
+    /// Load an aligner from a pre-built `.mmi` index file.
     pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
         let index = Index::load(path)?;
         let (mut options, out_cfg) = build_options(preset, index.kmer_size, index.window_size);
@@ -728,9 +728,9 @@ pub struct DpAlignment {
 
 /// Align two nt4-encoded sequences using the SIMD-optimized DP engine.
 ///
-/// Performs semi-global extension alignment (like minimap2's gap-fill): aligns
-/// `query` against `target` with affine gap penalties, returning the best-scoring
-/// alignment with CIGAR traceback.
+/// Performs semi-global extension alignment used to fill the gap between two
+/// adjacent chained anchors: aligns `query` against `target` with affine gap
+/// penalties, returning the best-scoring alignment with CIGAR traceback.
 ///
 /// Sequences must be nt4-encoded (0=A, 1=C, 2=G, 3=T, 4=N). Use
 /// [`encode_nt4`] to convert from ASCII.

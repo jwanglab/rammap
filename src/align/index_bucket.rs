@@ -3,8 +3,7 @@
 //! Each of 2^B buckets has its own open-addressing hash table that maps
 //! hash suffixes to (offset, count) ranges in a shared flat `positions` array.
 //! During build, each bucket's temporary (hash, position) pairs are processed
-//! and freed independently, matching minimap2's `worker_post` — the key to
-//! controlling peak build memory.
+//! and freed independently — the key to controlling peak build memory.
 //!
 //! All positions (including singletons) live in `positions[]` so that the
 //! existing `get_range`/`get_by_range` API works without changes.
@@ -113,7 +112,7 @@ impl BucketHashLookup {
         Self { bucket_bits: 0, buckets: Vec::new(), positions: Vec::new() }
     }
 
-    /// Load from minimap2's per-bucket hash table format.
+    /// Load from the `.mmi` per-bucket hash table format.
     ///
     /// Each bucket contributes: `p[]` (multi-occurrence positions) + hash entries
     /// (key/value pairs where key bit 0 = singleton flag). We convert to our
@@ -135,8 +134,8 @@ impl BucketHashLookup {
             let mut ht = bucket_with_capacity(hash_entries.len());
 
             for &(key, value) in hash_entries {
-                // minimap2 key: (hash_suffix << 1) | singleton_flag
-                // Our key: hash_suffix (key >> 1), stored as u32
+                // Source-format key: (hash_suffix << 1) | singleton_flag.
+                // Our key: hash_suffix (key >> 1), stored as u32.
                 let our_key = key >> 1;
 
                 if key & 1 != 0 {
@@ -164,10 +163,9 @@ impl BucketHashLookup {
 
     /// Build from pre-distributed, pre-sorted bucket data.
     ///
-    /// Each bucket is processed independently in parallel (like minimap2's
-    /// `worker_post` via `kt_for`): build per-bucket hash table + local
-    /// positions, consume and free the source bucket. Then concatenate
-    /// all per-bucket positions and fix up offsets.
+    /// Each bucket is processed independently in parallel: build per-bucket
+    /// hash table + local positions, consume and free the source bucket. Then
+    /// concatenate all per-bucket positions and fix up offsets.
     pub fn build(bucket_bits: u32, sorted_buckets: &mut [Vec<(u64, u64)>], max_occ: usize) -> Self {
         let n_buckets = sorted_buckets.len();
 

@@ -44,8 +44,9 @@ pub trait SeedLookup {
     fn is_empty(&self) -> bool;
 }
 
-/// Seed lookup backend. Currently uses BucketHash (minimap2-style per-bucket
-/// hash tables). The enum + trait are kept for future extensibility.
+/// Seed lookup backend. Currently uses BucketHash (per-bucket open-addressing
+/// hash tables over a shared flat positions array). The enum + trait are kept
+/// for future extensibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LookupBackend {
     BucketHash(super::index_bucket::BucketHashLookup),
@@ -81,7 +82,8 @@ pub struct Index {
     pub seqs: Vec<TargetSequence>,
     /// Seed lookup backend.
     backend: LookupBackend,
-    /// Packed 4-bit reference sequences (8 bases per u32, minimap2 encoding).
+    /// Packed 4-bit reference sequences (8 bases per u32; nibbles hold the nt4
+    /// codes 0=A, 1=C, 2=G, 3=T, 4=N, low nibble first).
     /// Kept at runtime for on-demand per-region nt4 extraction (~375 MB for GRCh38).
     #[serde(default)]
     pub packed_seqs: Vec<u32>,
@@ -196,7 +198,8 @@ impl Index {
     const MINIMAP2_INDEX_MAGIC: &'static [u8; 4] = b"MMI\x02";
 
     /// Load the next index part from a reader. Returns None on EOF.
-    /// Detects RMMI (rammap), MMI\2 (minimap2), or old bincode format.
+    /// Detects RMMI (bincode-serialized), MMI\2 (.mmi binary layout), or
+    /// legacy no-magic bincode formats.
     pub fn load_part<R: Read + Seek>(reader: &mut R) -> io::Result<Option<Self>> {
         let mut magic = [0u8; 4];
         match reader.read_exact(&mut magic) {
@@ -268,7 +271,7 @@ impl Index {
         }
 
         // Read per-bucket hash tables directly into BucketHashLookup.
-        // minimap2's format stores per-bucket: n positions (p[]), then hash entries.
+        // .mmi format stores per-bucket: n positions (p[]), then hash entries.
         let n_buckets = 1usize << b;
         let mut bucket_data: Vec<(Vec<u64>, Vec<(u64, u64)>)> = Vec::with_capacity(n_buckets);
 
@@ -483,8 +486,8 @@ impl Index {
         idx.packed_seqs = packed;
 
         // Parallel bucket post-processing: sort each bucket independently.
-        // This is where minimap2 gets its parallelism — 1024 independent
-        // sort+compact jobs across all threads via kt_for/rayon.
+        // 1024 (or however many buckets) sort+compact jobs run across all
+        // rayon threads — the bulk of build parallelism lives here.
         #[cfg(feature = "parallel")]
         buckets.par_iter_mut().for_each(|b| {
             if !b.is_empty() { b.sort_unstable(); }
@@ -494,8 +497,8 @@ impl Index {
             if !b.is_empty() { b.sort_unstable(); }
         }
 
-        // Build per-bucket hash tables (minimap2-style). Each bucket is processed
-        // and freed independently, keeping peak memory low.
+        // Build per-bucket hash tables. Each bucket is processed and freed
+        // independently, keeping peak memory low.
         idx.backend = LookupBackend::BucketHash(
             super::index_bucket::BucketHashLookup::build(bucket_bits, &mut buckets, max_occ)
         );

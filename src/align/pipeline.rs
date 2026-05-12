@@ -1742,8 +1742,8 @@ pub fn refilter_merged_results(
             }
             parent_indices = vec![usize::MAX; results.len()];
         } else {
-            // Sort by (dp_score, hash) descending — same mm_hit_sort port as the
-            // earlier site. See comment there for the unstable-tie behavior.
+            // Sort by (dp_score, hash) descending — same hit-sort routine as
+            // the earlier site. See comment there for the unstable-tie behavior.
             {
                 let alt_drop = opt.filtering.alt_drop;
                 let mut aux: Vec<(u64, u64)> = results.iter().enumerate().map(|(i, r)| {

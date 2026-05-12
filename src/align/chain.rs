@@ -90,7 +90,9 @@ pub(crate) fn compute_chain_score(
 }
 
 
-// Port of mg_chain_bk_end
+/// Walk back through predecessors from candidate `k` to find the chain's
+/// start anchor, applying a per-step z-drop (`max_drop`) cutoff. Marks
+/// visited anchors with sentinel `2` and resets them before returning.
 pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], scores: &[i32], predecessors: &[i64], visited: &mut [i32], k: i64) -> i64 {
     let mut i = candidates[k as usize].y as i64;
 
@@ -141,7 +143,10 @@ pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], score
     max_i
 }
 
-// Port of mg_chain_backtrack
+/// Reconstruct chains from the DP scores+predecessors arrays. Returns
+/// `(u, n_u, n_v)` where `u[i]` packs `(score, anchor_count)` for chain `i`,
+/// `n_u` is the chain count, and `n_v` is the total anchor count across chains.
+/// Anchors are emitted into `v` in backtrack (reverse) order.
 pub(crate) fn chain_backtrack(
     // km: void* - allocator, redundant in Rust
     n: usize,
@@ -292,7 +297,7 @@ pub fn chain_anchors_partitioned(
     }
 
     // Find partition boundaries by ref_id (NOT ref_id_strand).
-    // Both strands of the same ref must stay together because minimap2's chaining
+    // Both strands of the same ref must stay together because chaining
     // allows cross-strand connections (inversions). Anchors are sorted by
     // x = (ref_id << 33 | strand << 32 | ref_pos), so both strands of the same
     // ref_id are contiguous.
@@ -346,7 +351,9 @@ pub fn chain_anchors_partitioned(
     (merged_u, merged_chains)
 }
 
-// Port of mg_lchain_dp (scalar implementation)
+// Scalar DP chaining over a reference-sorted anchor array. For each anchor i,
+// scan back within a distance window for the best-scoring predecessor; record
+// score + predecessor; then backtrack into compacted chains.
 pub(crate) fn chain_anchors_scalar(
     opt: &ChainingParams,
     is_cdna: bool,
@@ -478,7 +485,7 @@ pub(crate) fn chain_anchors_scalar(
         }
     }
 
-    // Step 2: Sort chains by target position of first anchor (lchain.c:93-107)
+    // Step 2: Sort chains by target position of their first anchor.
     let mut w: Vec<Minimizer> = Vec::with_capacity(n_u);
     let mut k_pos = 0usize;
     for (i, &u_val) in u[..n_u].iter().enumerate() {

@@ -122,10 +122,9 @@ pub fn radix_sort_128x(arr: &mut [Minimizer]) {
     }
 }
 
-/// MSD in-place radix sort for `(u64, u64)` aux entries by `.0`.
-/// Bit-identical to minimap2's `radix_sort_128x` on `mm128_t` (sort_key = .x):
-/// same cycle-leader bucket-shuffle algorithm, same bucket order, same
-/// implementation-defined ordering of ties. Used for `mm_hit_sort` parity.
+/// MSD in-place radix sort for `(u64, u64)` aux entries by `.0`. Cycle-leader
+/// bucket-shuffle radix variant with a deterministic ordering of ties; used
+/// for the per-read hit sort where output stability matters.
 pub fn radix_sort_128x_pair(arr: &mut [(u64, u64)]) {
     if arr.len() <= RS_MIN_SIZE {
         rs_insertsort(arr);

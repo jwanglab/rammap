@@ -450,13 +450,14 @@ pub struct Mapping {
     pub sq_start: usize,
     /// Estimated divergence from estimate_divergence
     pub div: f32,
-    /// Whether this chain was retained only due to strand-based retention in mm_select_sub
+    /// Whether this chain was retained only due to opposite-strand retention
+    /// in secondary filtering (would otherwise have been dropped).
     pub strand_retained: bool,
     /// Parent index in the compacted array (for filter_strand_retained)
     pub compact_parent: usize,
     /// True if this split part was created when zdrop detected an inversion.
     pub split_inv: bool,
-    /// True if this chain came from mm_split_chains_into_segments splitting (multi-segment)
+    /// True if this chain came from per-segment splitting (multi-segment input)
     pub seg_split: bool,
     /// Segment index (0 or 1) for multi-segment mapping
     pub seg_id: usize,
@@ -951,7 +952,7 @@ pub fn map_query_multi(
     let t0 = Instant::now();
     collect_minimizers_multi(mi, seqs, qlens, &mut ctx.minimizers);
 
-    // mm_filter_minimizers_by_occ (map.c:251)
+    // Drop query minimizers that appear too many times in the query itself.
     if opt.seeding.q_occ_frac > 0.0 && opt.seeding.mid_occ > 0 && ctx.minimizers.len() > opt.seeding.mid_occ {
         filter_minimizers_by_occ(&mut ctx.minimizers, opt.seeding.mid_occ, opt.seeding.q_occ_frac);
     }
@@ -972,7 +973,7 @@ pub fn map_query_multi(
 
     let t2 = Instant::now();
 
-    // Compute max chaining gaps (map.c:262-271)
+    // Compute max chaining gaps.
     let is_sr = opt.flags.contains(AlignFlags::SHORT_READ);
     let max_chain_gap_qry = if is_sr {
         if qlen_sum as i32 > opt.chaining.max_gap { qlen_sum as i32 } else { opt.chaining.max_gap }
@@ -988,7 +989,7 @@ pub fn map_query_multi(
         opt.chaining.max_gap
     };
 
-    // Chain with n_segs (map.c:278-281)
+    // Run chaining across all segments.
     let mut anchors = std::mem::take(&mut ctx.anchors);
     let (mut u, mut chains) = if opt.flags.contains(AlignFlags::RMQ_CHAIN) {
         chain_anchors_rmq(&opt.chaining, &mut anchors, &mut ctx.chain_bufs)
@@ -1000,7 +1001,7 @@ pub fn map_query_multi(
     stats.t_chain = t2.elapsed();
     stats.n_chains = chains.len();
 
-    // RMQ rescue re-chaining (map.c:283-291) — checked FIRST, before high-occ re-chain
+    // RMQ rescue re-chaining — checked FIRST, before high-occ re-chain.
     let skip_rescue = opt.flags.intersects(AlignFlags::SPLICE | AlignFlags::SHORT_READ | AlignFlags::NO_LJOIN);
     if n_segs == 1 && opt.chaining.bandwidth_long > opt.chaining.bandwidth && u.len() > 1 && !skip_rescue {
         let first_chain_cnt = (u[0] & 0xFFFFFFFF) as usize;
@@ -1149,7 +1150,7 @@ pub fn map_query_multi(
     if opt.flags.contains(AlignFlags::FOR_ONLY) { regs0.retain(|r| !r.is_reverse); }
     if opt.flags.contains(AlignFlags::REV_ONLY) { regs0.retain(|r| r.is_reverse); }
 
-    // mm_mark_alt + mm_hit_sort on chains (map.c:372-374)
+    // Mark ALT-contig chains; then sort chains by descending score.
     let n_alt = mi.seqs.iter().filter(|s| s.is_alt).count();
     if n_alt > 0 {
         for r in regs0.iter_mut() {
@@ -1209,15 +1210,14 @@ pub fn map_query_multi(
         );
     }
 
-    // estimate_divergence: skip for SR mode (map.c:333)
-    // (handled in pipeline.rs)
+    // estimate_divergence runs in pipeline.rs; skipped for SR mode.
 
     if regs0.is_empty() {
         let per_seg = (0..n_segs).map(|_| (Vec::new(), Vec::new())).collect();
         return MultiMapResult { per_seg, rep_len, frag_gap: max_chain_gap_ref, stats };
     }
 
-    // split_chains_into_segments: split combined chains to per-segment (map.c:345)
+    // Split combined chains into one batch per query segment.
     let mut per_seg = split_chains_into_segments(read_hash, n_segs, qlens, &regs0, &chains, mi, is_qstrand);
 
     // Per-segment parent assignment.
@@ -1275,8 +1275,7 @@ pub fn map_query(
     ctx.minimizers.clear();
     sketch_sequence(qseq, qlen, mi.window_size, mi.kmer_size, 0, mi.homopolymer_compressed, &mut ctx.minimizers);
 
-    // mm_filter_minimizers_by_occ: remove query minimizers that appear too many times in the query
-    //
+    // Drop query minimizers that appear too many times in the query itself.
     if opt.seeding.q_occ_frac > 0.0 && opt.seeding.mid_occ > 0 && ctx.minimizers.len() > opt.seeding.mid_occ {
         filter_minimizers_by_occ(&mut ctx.minimizers, opt.seeding.mid_occ, opt.seeding.q_occ_frac);
     }
@@ -1492,7 +1491,7 @@ pub fn map_query(
         regs.retain(|r| r.is_reverse);
     }
 
-    // mm_mark_alt + mm_hit_sort on chains (map.c:372-374)
+    // Mark ALT-contig chains; then sort chains by descending score.
     let n_alt = mi.seqs.iter().filter(|s| s.is_alt).count();
     if n_alt > 0 {
         for r in regs.iter_mut() {
@@ -1604,7 +1603,7 @@ pub fn map_query(
             }
         }
 
-        // estimate_divergence runs unconditionally after chain_post (map.c:385), even for ALL_CHAINS
+        // estimate_divergence runs unconditionally after chain_post, even for ALL_CHAINS.
         if !opt.flags.contains(AlignFlags::SHORT_READ) {
             estimate_divergence(&mut regs, &ctx.anchors, qlen, &ctx.mini_pos, mi);
         }
@@ -1672,7 +1671,7 @@ pub fn map_query(
             p_score,
             p_rev,
             &filter_params,
-            true, // check_strand=true for pre-alignment (map.c:210)
+            true, // check_strand=true for pre-alignment filtering.
         );
 
         if filter_result.passes && n_second < opt.filtering.best_n {

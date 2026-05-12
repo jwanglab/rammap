@@ -13,7 +13,8 @@ use std::fs::File;
 
 use super::dp::SPSC_OFFSET;
 
-/// Per-interval data for BED mode (matches mm_idx_intv1_t)
+/// Per-interval data for BED mode: a single annotated interval on a target
+/// sequence with strand and optional thick/itemRgb extras from the BED row.
 #[derive(Debug, Clone)]
 pub struct BedInterval {
     pub start: i32,

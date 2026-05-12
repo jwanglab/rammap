@@ -22,7 +22,8 @@ fn wasm_log(s: &str) {
     log(s);
 }
 
-/// Apply a minimap2-style preset to MapOptions + k/w.
+/// Apply a named preset (e.g. `map-ont`, `lr:hq`, `sr`, `splice`) to
+/// MapOptions + k/w.
 fn apply_preset_wasm(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) {
     match preset {
         "map-ont" => {

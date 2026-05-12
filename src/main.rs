@@ -743,7 +743,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                 // -d with no query files → index-only mode (build/dump and exit)
                 (vec![], None, false)
             } else {
-                // No query files, no -d → read from stdin (like minimap2)
+                // No query files, no -d → read from stdin.
                 (vec!["-".to_string()], None, false)
             }
         } else if cli.queries.len() == 2 && frag_mode {
@@ -1724,7 +1724,7 @@ fn map_one_part_split(
             let mut pq = process_query(opt, mi, &qname, &qseq, &mut ctx, &mut map_ctx,
                 junc_db.as_ref(), out_cfg);
 
-            // Jump splice extension for single-end split (map.c:478-480)
+            // Jump splice extension for single-end split.
             if let Some(ref jdb) = jump_db {
                 let is_splice = opt.flags.contains(AlignFlags::SPLICE);
                 if is_splice {
