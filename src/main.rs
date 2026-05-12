@@ -3,6 +3,18 @@ use clap::Parser;
 use rayon::prelude::*;
 use std::io::Write;
 use std::time::Instant;
+
+// Global allocator: Rust system allocator by default. Opt in to jemalloc or
+// mimalloc via `--features jemalloc` / `--features mimalloc` (both need a C
+// toolchain at build time). mimalloc wins precedence if both are set.
+#[cfg(all(not(target_arch = "wasm32"), feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "jemalloc", not(feature = "mimalloc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use rammap::align::index::Index;
 use rammap::align::map::{MapOptions, AlignFlags};
 use rammap::align::pipeline::{OutputConfig, ReadInfo};

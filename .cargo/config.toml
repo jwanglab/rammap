@@ -1,0 +1,25 @@
+# Allocator selection (set in Cargo.toml [features]):
+#   cargo build --release                       → Rust system allocator (default; no C dep)
+#   cargo build --release --features jemalloc   → jemalloc (~2.5s wall faster on BGI 5M SR PE; needs C toolchain)
+#   cargo build --release --features mimalloc   → mimalloc (~1s faster than system; ~1.2s slower than jemalloc; needs C toolchain)
+# Both jemalloc and mimalloc beat the system allocator on this workload; jemalloc currently wins.
+#
+# NOTE: Do NOT set target-cpu=native here — it bakes AVX2/AVX512 into ALL
+# code via auto-vectorization, making the binary crash on SSE-only hardware.
+# The SIMD DP/chaining kernels use #[target_feature] + is_x86_feature_detected!
+# for safe runtime dispatch regardless of this setting.
+#
+# For a single-machine performance build (~2s extra on BGI 5M SR PE):
+#   RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=no -C llvm-args=-inline-threshold=1000" cargo build --release
+# The combination matters; any flag alone is a wash. With AVX-512 hardware,
+# the win comes from LLVM using the 32 xmm regs (xmm0-31) instead of 16,
+# eliminating per-iter `chn_pen_gap`/`chn_pen_skip` stack spills in
+# chain_anchors_scalar's hot loop.
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
+
+[target.wasm32-wasip1]
+rustflags = ["-C", "target-feature=+simd128"]
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
