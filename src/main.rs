@@ -1254,6 +1254,12 @@ fn map_one_part(
         None
     };
 
+    // Parallel branches below assign `total_stats` unconditionally from the
+    // thread::scope result; only the non-parallel accumulation path needs the
+    // default initial value.
+    #[cfg(feature = "parallel")]
+    let total_stats: AlignmentStats;
+    #[cfg(not(feature = "parallel"))]
     let mut total_stats = AlignmentStats::default();
     let mut record_iter = reader.records();
     let mut record_iter2 = reader2.map(|r| r.records());
