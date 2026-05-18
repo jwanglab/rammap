@@ -610,7 +610,7 @@ pub fn chain_anchors_rmq(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     // visited uses sentinel comparison (visited[j] == i) so must be zeroed
@@ -708,7 +708,7 @@ pub fn chain_anchors_rmq(
 
         // Set max
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0 && peak_scores[best_predecessor as usize] > best_score { peak_scores[best_predecessor as usize] } else { best_score };
         if _mmax_f < best_score { _mmax_f = best_score; }
 

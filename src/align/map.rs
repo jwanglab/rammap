@@ -262,7 +262,7 @@ impl Default for MapOptions {
 /// narrow the interface: chaining functions receive only what they need.
 pub struct ChainingBuffers {
     // DP arrays (reused across reads to avoid per-read allocation)
-    pub predecessors: Vec<i64>,
+    pub predecessors: Vec<i32>,
     pub scores: Vec<i32>,
     pub peak_scores: Vec<i32>,
     pub visited: Vec<i32>,

@@ -93,7 +93,7 @@ pub(crate) fn compute_chain_score(
 /// Walk back through predecessors from candidate `k` to find the chain's
 /// start anchor, applying a per-step z-drop (`max_drop`) cutoff. Marks
 /// visited anchors with sentinel `2` and resets them before returning.
-pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], scores: &[i32], predecessors: &[i64], visited: &mut [i32], k: i64) -> i64 {
+pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], scores: &[i32], predecessors: &[i32], visited: &mut [i32], k: i64) -> i64 {
     let mut i = candidates[k as usize].y as i64;
 
     let mut end_i;
@@ -110,7 +110,7 @@ pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], score
     loop {
         visited[i as usize] = 2;
         // end_i = i = p[i]; both are set to p[i]
-        i = predecessors[i as usize];
+        i = predecessors[i as usize] as i64;
         end_i = i;
 
         let f_curr = candidates[k as usize].x as i32;
@@ -137,7 +137,7 @@ pub(crate) fn chain_backtrack_end(max_drop: i32, candidates: &[Minimizer], score
     let mut curr = candidates[k as usize].y as i64;
     while curr >= 0 && curr != end_i {
         visited[curr as usize] = 0;
-        curr = predecessors[curr as usize];
+        curr = predecessors[curr as usize] as i64;
     }
 
     max_i
@@ -151,7 +151,7 @@ pub(crate) fn chain_backtrack(
     // km: void* - allocator, redundant in Rust
     n: usize,
     scores: &[i32],
-    predecessors: &[i64],
+    predecessors: &[i32],
     v: &mut [i32], // modified in place to store anchor indices; C: v[n_v++] = i
     visited: &mut [i32],
     candidates: &mut Vec<Minimizer>, // pooled scratch
@@ -199,7 +199,7 @@ pub(crate) fn chain_backtrack(
                 }
                 n_v += 1;
                 visited[i as usize] = 1;
-                i = predecessors[i as usize];
+                i = predecessors[i as usize] as i64;
             }
 
             let sc = if i < 0 {
@@ -380,7 +380,7 @@ pub(crate) fn chain_anchors_scalar(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     // visited uses sentinel comparison (visited[j] == i) so must be zeroed
@@ -452,7 +452,7 @@ pub(crate) fn chain_anchors_scalar(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0 && peak_scores[best_predecessor as usize] > best_score { peak_scores[best_predecessor as usize] } else { best_score };
 
         // Update best_anchor_idx if current anchor has better score

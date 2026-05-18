@@ -288,7 +288,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     visited.clear();
@@ -389,7 +389,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0
             && peak_scores[best_predecessor as usize] > best_score
         {
@@ -689,7 +689,7 @@ pub(crate) unsafe fn chain_anchors_sse(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64); scores.resize(n, 0i32);
+    predecessors.resize(n, 0i32); scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32); visited.clear(); visited.resize(n, 0i32);
 
     let mut global_max_score = 0;
@@ -792,7 +792,7 @@ pub(crate) unsafe fn chain_anchors_sse(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0
             && peak_scores[best_predecessor as usize] > best_score
         { peak_scores[best_predecessor as usize] } else { best_score };
@@ -1037,7 +1037,7 @@ pub(crate) unsafe fn chain_anchors_avx512(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     visited.clear();
@@ -1130,7 +1130,7 @@ pub(crate) unsafe fn chain_anchors_avx512(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0
             && peak_scores[best_predecessor as usize] > best_score
         { peak_scores[best_predecessor as usize] } else { best_score };
@@ -1462,7 +1462,7 @@ pub(crate) unsafe fn chain_anchors_neon(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     visited.clear();
@@ -1561,7 +1561,7 @@ pub(crate) unsafe fn chain_anchors_neon(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0
             && peak_scores[best_predecessor as usize] > best_score
         {
@@ -1868,7 +1868,7 @@ pub(crate) unsafe fn chain_anchors_wasm(
     let mut scores = std::mem::take(&mut ctx.scores);
     let mut peak_scores = std::mem::take(&mut ctx.peak_scores);
     let mut visited = std::mem::take(&mut ctx.visited);
-    predecessors.resize(n, 0i64);
+    predecessors.resize(n, 0i32);
     scores.resize(n, 0i32);
     peak_scores.resize(n, 0i32);
     visited.clear();
@@ -1961,7 +1961,7 @@ pub(crate) unsafe fn chain_anchors_wasm(
         }
 
         scores[i] = best_score;
-        predecessors[i] = best_predecessor;
+        predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0
             && peak_scores[best_predecessor as usize] > best_score
         { peak_scores[best_predecessor as usize] } else { best_score };
