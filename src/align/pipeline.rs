@@ -352,16 +352,6 @@ pub fn update_dp_max(
     let mut b2 = 0.5 / div;
     if b2 * (a as f64) < b as f64 { b2 = a as f64 / b as f64; }
 
-    if *crate::align::env_flags::DEBUG {
-        let info = &recalc_infos[max_i];
-        eprintln!("[DBG_DPMAX] max_i={} max={} max2={} div={:.10} b2={:.10} event_id={:.10} mlen={} blen={} n_ambi={} n_gap={} n_gapo={} n_entries={}",
-            max_i, max, max2, div, b2, recalc_infos[max_i].event_identity(),
-            info.match_len, info.block_len, info.num_ambiguous, info.gap_bases, info.gap_opens, dp_max_vals.len());
-        for i in 0..dp_max_vals.len() {
-            let ri = &recalc_infos[i];
-            eprintln!("[DBG_DPMAX_ENTRY] [{}] dp_max={} mlen={} blen={} n_gap={} n_gapo={}", i, dp_max_vals[i], ri.match_len, ri.block_len, ri.gap_bases, ri.gap_opens);
-        }
-    }
 
     for i in 0..dp_max_vals.len() {
         dp_max_vals[i] = recalc_infos[i].recalc_dp_max(b2, a);
@@ -438,7 +428,9 @@ fn align_single_mapping(
     mapping: &mut Mapping,
     opt: &MapOptions,
     mi: &Index,
-    qseq: &[u8],
+    _qseq: &[u8],
+    qseq_fwd_nt4: &[u8],
+    qseq_rc_nt4: &[u8],
     qlen: usize,
     ctx: &mut AlignmentContext,
     _map_ctx: &mut MapContext,
@@ -475,40 +467,236 @@ fn align_single_mapping(
 
         let tlen = mi.seqs[rid].len;
 
-        // Compute region extraction bounds. The padding accommodates the chain's
-        // boundary extension; max_gap bounds how far an alignment can extend past
-        // an anchor, and qlen bounds the read's own footprint. For SR (qlen~150,
-        // max_gap=100) this is ~300 bytes; for long reads max_gap dominates
-        // (lr:hq max_gap=10000 → pad=20000). Previous version had a hard
-        // .max(10000) floor that wasted ~133× memory on SR alignments.
-        let pad = std::cmp::max(opt.chaining.max_gap as usize * 2, qlen * 2);
-        let rgn_start = mapping.ref_start.saturating_sub(pad);
-        let rgn_end = std::cmp::min(tlen, mapping.ref_end + pad);
+        // Compute the [rs0, re0] target-sequence extraction window so the
+        // downstream extension-alignment sees the same bytes as a reference
+        // bandwidth-bounded extension would. Three coordinate adjustments
+        // apply:
+        //
+        // 1. Bad-diagonal anchors at chain ends are trimmed first; the window
+        //    derives from POST-trim chain extents. NO_END_FLT and splice mode
+        //    skip the trim and use pre-trim coords.
+        //
+        // 2. Chain qs/qe are in alignment-space (strand-flipped on the "-"
+        //    strand). `mapping.query_start/end` is alignment-space on "+" and
+        //    forward-space on "-"; convert before use.
+        //
+        // 3. Shift chain start/end coords from "start/end+1 of kmer" to
+        //    "center of kmer" (non-HPC: subtract `k/2`). HPC uses a
+        //    sequence-dependent shift handled inside `align_anchors`.
+        let max_gap = opt.chaining.max_gap;
+        let a = opt.scoring.match_score;
+        let q = opt.scoring.gap_open;
+        let e = opt.scoring.gap_extend;
+        let end_bonus = opt.alignment.end_bonus;
+        let is_sr_mode = opt.flags.contains(AlignFlags::SHORT_READ);
+        let is_splice = opt.filtering.is_splice;
+        let no_end_flt = opt.flags.contains(AlignFlags::NO_END_FLT);
+        let is_hpc = mi.homopolymer_compressed;
+        let qlen_i32 = qlen as i32;
+        let tlen_i32 = tlen as i32;
+        let k_half = (mi.kmer_size as i32) >> 1;
 
-        // Extract target region from packed index (typically 10-200 KB)
-        let target_region_owned: Vec<u8>;
-        let target_region: &[u8];
+        // The region formula uses two coord conventions:
+        //
+        //   - rs0_init / re0_init: PRE-trim chain extents in "start-of-kmer"
+        //     / "end+1-of-kmer" convention. Used as the initial extraction
+        //     bound, then shrunk against the max_gap-bounded window.
+        //
+        //   - chain_rs / chain_re / chain_qs / chain_qe: POST-trim chain
+        //     extents in "center-of-kmer" convention. Used in the
+        //     max_gap-bounded computation below.
+        //
+        // `mapping.{ref,query}_{start,end}` already store PRE-trim
+        // start-of-kmer / end+1-of-kmer. On "-" strand, `mapping.query_*`
+        // is forward-space; convert to alignment-space before use.
+        let rs0_init = mapping.ref_start as i32;
+        let re0_init = mapping.ref_end as i32;
+
+        // Compute POST-trim chain extents. The trim depends on mode:
+        //   - SR non-HPC: max-stretch trim, result in start-of-kmer /
+        //     end+1-of-kmer convention (no center shift).
+        //   - Splice: DP-scoring-based trim — fall back to pre-trim extents
+        //     here; the wider region is safe.
+        //   - Otherwise: bad-end trim, then shift to center-of-kmer.
+        //
+        // `align_anchors` re-runs the same trim on the same input (position
+        // differences are invariant to the constant rgn_off rebase applied
+        // below), so the trim is identical.
+        let (chain_rs, chain_qs, chain_re, chain_qe) = if mapping.anchors.is_empty() {
+            // No anchors (e.g. inversion placeholder). Apply the
+            // center-of-kmer shift to PRE-trim chain extents.
+            let start_shift = (mi.kmer_size as i32 - 1) - k_half;
+            let end_shift = 1 + k_half;
+            let (qs0_pre, qe0_pre) = if mapping.is_reverse && !is_qstrand {
+                (qlen_i32 - mapping.query_end as i32,
+                 qlen_i32 - mapping.query_start as i32)
+            } else {
+                (mapping.query_start as i32, mapping.query_end as i32)
+            };
+            (
+                rs0_init + start_shift,
+                qs0_pre + start_shift,
+                re0_init - end_shift,
+                qe0_pre - end_shift,
+            )
+        } else if is_sr_mode {
+            // SR: max-stretch trim, start-of-kmer convention (no center shift).
+            let (off, cnt) = crate::align::extend::max_stretch(&mapping.anchors);
+            let (trim_first_idx, trim_last_idx) = if cnt == 0 {
+                (0usize, mapping.anchors.len() - 1)
+            } else {
+                (off, off + cnt - 1)
+            };
+            let trim_first = &mapping.anchors[trim_first_idx];
+            let trim_last = &mapping.anchors[trim_last_idx];
+            let first_q_span = trim_first.query_span();
+            (
+                trim_first.ref_pos() + 1 - first_q_span,
+                trim_first.query_pos() + 1 - first_q_span,
+                trim_last.ref_pos() + 1,
+                trim_last.query_pos() + 1,
+            )
+        } else {
+            let (trim_first_idx, trim_last_idx) = if !is_splice && !no_end_flt {
+                let (off, cnt) = crate::align::extend::fix_bad_ends(
+                    &mapping.anchors,
+                    opt.chaining.bandwidth,
+                    opt.chaining.min_chain_score * 2,
+                );
+                if cnt == 0 {
+                    (0usize, mapping.anchors.len() - 1)
+                } else {
+                    (off, off + cnt - 1)
+                }
+            } else {
+                (0usize, mapping.anchors.len() - 1)
+            };
+            let trim_first = &mapping.anchors[trim_first_idx];
+            let trim_last = &mapping.anchors[trim_last_idx];
+            // Center-of-kmer shift (non-HPC): r = a.x - k/2, q = a.y - k/2.
+            (
+                trim_first.ref_pos() - k_half,
+                trim_first.query_pos() - k_half,
+                trim_last.ref_pos() - k_half,
+                trim_last.query_pos() - k_half,
+            )
+        };
+
+        let (rs0, re0) = if is_hpc {
+            // HPC mode: the center-of-kmer shift is sequence-dependent
+            // (depends on homopolymer runs in qseq/tseq) and can't be
+            // computed here without those sequences. The shift is bounded
+            // by the kmer span, and the underlying region formula caps the
+            // bandwidth contribution at `max_gap` per side; `pad = max_gap *
+            // 2` (twice that algorithmic bound) safely contains the exact
+            // region. `align_anchors` does its own HPC-aware boundary calc
+            // and converges to the precise window.
+            let pad = max_gap as usize * 2;
+            (
+                std::cmp::max(0, mapping.ref_start as i32 - pad as i32),
+                std::cmp::min(tlen_i32, mapping.ref_end as i32 + pad as i32),
+            )
+        } else if is_sr_mode {
+            // SR-mode region: post-trim chain (max-stretch).
+            let mut l = chain_qs;
+            l += if l * a + end_bonus > q { (l * a + end_bonus - q) / e } else { 0 };
+            let rs0 = std::cmp::max(0, chain_rs - l);
+            let mut l = qlen_i32 - chain_qe;
+            l += if l * a + end_bonus > q { (l * a + end_bonus - q) / e } else { 0 };
+            let re0 = std::cmp::min(tlen_i32, chain_re + l);
+            (rs0, re0)
+        } else {
+            // Non-SR region. Initial rs0/re0 use PRE-trim chain extents;
+            // the max_gap-bounded branch uses POST-trim chain coords.
+            let mut rs0 = rs0_init;
+            if chain_qs > 0 && chain_rs > 0 {
+                let mut l = std::cmp::min(chain_qs, max_gap);
+                l += if l * a > q { (l * a - q) / e } else { 0 };
+                l = std::cmp::min(l, max_gap);
+                l = std::cmp::min(l, chain_rs);
+                let rs1 = std::cmp::max(mapping.left_bound_rs1, chain_rs - l);
+                rs0 = std::cmp::min(rs0, rs1);
+                rs0 = std::cmp::min(rs0, chain_rs);
+            }
+            let mut re0 = re0_init;
+            if chain_qe < qlen_i32 && chain_re < tlen_i32 {
+                let mut l = std::cmp::min(qlen_i32 - chain_qe, max_gap);
+                l += if l * a > q { (l * a - q) / e } else { 0 };
+                l = std::cmp::min(l, max_gap);
+                l = std::cmp::min(l, tlen_i32 - chain_re);
+                let re1 = std::cmp::min(mapping.right_bound_re1, chain_re + l);
+                re0 = std::cmp::max(re0, re1);
+            }
+            (rs0, re0)
+        };
+
+        // SEED_SELF clamp. For diagonal self-mapping chains, restrict the
+        // extracted region to within `|chain_qs - chain_rs|` of the chain
+        // extents. Uses PRE-trim `mapping.{ref,query}_*`. SEED_SELF chains
+        // are always on the "+" strand.
+        let (rs0, re0) = if !mapping.anchors.is_empty()
+            && (mapping.anchors[0].y & crate::align::map::SEED_SELF) != 0 {
+            let r_qs = mapping.query_start as i32;
+            let r_rs = mapping.ref_start as i32;
+            let r_qe = mapping.query_end as i32;
+            let r_re = mapping.ref_end as i32;
+            let max_ext_left = (r_qs - r_rs).abs();
+            let max_ext_right = (r_qe - r_re).abs();
+            let mut rs0 = rs0;
+            let mut re0 = re0;
+            if r_rs - rs0 > max_ext_left { rs0 = r_rs - max_ext_left; }
+            if re0 - r_re > max_ext_right { re0 = r_re + max_ext_right; }
+            (rs0, re0)
+        } else {
+            (rs0, re0)
+        };
+
+        let rgn_start = std::cmp::max(0, rs0) as usize;
+        let rgn_end = std::cmp::min(tlen_i32, re0) as usize;
+
+        // Extract target region from packed index.
+        //
+        // Common case (forward strand or non-qstrand): use a thread-local
+        // reusable buffer (`ctx.target_buf`), growing with `resize` only
+        // when too small. The buffer is left UNINITIALIZED here;
+        // `align_anchors` lazy-extracts each DP segment from the index on
+        // demand, keeping the active working set in cache rather than
+        // streaming a megabyte-scale region through memory upfront. This
+        // avoids both the per-mapping malloc/free and the redundant memset
+        // that `vec![0u8; N]` would do — the two biggest costs on
+        // chromosome-scale chains where region sizes hit megabytes.
+        //
+        // The rare qstrand+reverse path needs a full-chromosome rev-comp,
+        // which doesn't fit the reusable-buffer pattern; eager-fill there
+        // and signal `align_anchors` to skip its lazy fills.
+        let mut qstrand_owned: Vec<u8> = Vec::new();
         let rgn_start_final: usize;
-
-        if is_qstrand && mapping.is_reverse {
-            // Qstrand+reverse: need full chromosome reverse complement (rare path)
+        let use_qstrand_rev = is_qstrand && mapping.is_reverse;
+        if use_qstrand_rev {
             let mut full = vec![0u8; tlen];
             mi.extract_nt4_into(rid, 0, tlen, &mut full);
-            target_region_owned = rev_comp_nt4(&full);
-            target_region = &target_region_owned;
-            rgn_start_final = 0; // full chromosome, no offset
+            qstrand_owned = rev_comp_nt4(&full);
+            rgn_start_final = 0; // full chromosome
         } else {
-            let mut region = vec![0u8; rgn_end - rgn_start];
-            mi.extract_nt4_into(rid, rgn_start, rgn_end, &mut region);
-            target_region_owned = region;
-            target_region = &target_region_owned;
+            let size = rgn_end - rgn_start;
+            if ctx.target_buf.len() < size {
+                ctx.target_buf.resize(size, 0);
+            }
+            // Note: NO `extract_nt4_into` here. `align_anchors` fills tseq
+            // lazily per DP segment + once for the alignment range before
+            // CIGAR finalization.
             rgn_start_final = rgn_start;
         };
 
-        let query_seq_for_aln = if mapping.is_reverse && !is_qstrand {
-            encode_nt4_rc(qseq)
+        // Use the caller-provided nt4-encoded query (forward or reverse-
+        // complement). Previously this re-encoded `qseq` on every chain;
+        // for chromosome-scale qlens with many chains that was the
+        // dominant cost. The caller (`align_and_format`) encodes once per
+        // outer call and passes references in.
+        let query_seq_for_aln: &[u8] = if mapping.is_reverse && !is_qstrand {
+            qseq_rc_nt4
         } else {
-            qseq.iter().map(|&b| encode_nt4(b)).collect()
+            qseq_fwd_nt4
         };
 
         // Adjust anchor ref positions to region-relative coordinates
@@ -517,11 +705,19 @@ fn align_single_mapping(
             anchor.set_ref_pos(anchor.ref_pos() - rgn_off);
         }
 
-        // Adjust seed_bounds to region-relative
+        // Adjust seed_bounds to region-relative. The target slice we'll pass
+        // to align_anchors is either the rev-comp'd qstrand buffer or a
+        // slice of `ctx.target_buf[..rgn_size]`. Either way the length is
+        // `rgn_end - rgn_start` for non-qstrand and `tlen` for qstrand+rev.
+        let target_len_for_bounds: i32 = if use_qstrand_rev {
+            qstrand_owned.len() as i32
+        } else {
+            (rgn_end - rgn_start) as i32
+        };
         let adj_seed_bounds = (
             (mapping.left_bound_rs1 - rgn_off).max(0),
             mapping.left_bound_qs1,
-            (mapping.right_bound_re1 - rgn_off).min(target_region.len() as i32),
+            (mapping.right_bound_re1 - rgn_off).min(target_len_for_bounds),
             mapping.right_bound_qe1,
         );
 
@@ -536,14 +732,40 @@ fn align_single_mapping(
             junc_db,
             ref_offset: rgn_start_final,
         };
-        let aln_result = align_anchors(
-            &mut mapping.anchors,
-            &query_seq_for_aln,
-            target_region,
-            opt,
-            ctx,
-            &call_ctx,
-        );
+        // Pick the target buffer and the lazy-extract context. For
+        // qstrand+reverse the buffer is pre-filled with rev-comp'd full
+        // chromosome bytes, so `lazy_extract = None` (skip per-segment
+        // fills). For the common path, the buffer is uninitialized and
+        // `align_anchors` fills segments on demand.
+        let region_size = if use_qstrand_rev { qstrand_owned.len() } else { rgn_end - rgn_start };
+        let aln_result = if use_qstrand_rev {
+            align_anchors(
+                &mut mapping.anchors,
+                &query_seq_for_aln,
+                &mut qstrand_owned,
+                None,
+                opt,
+                &call_ctx,
+            )
+        } else {
+            align_anchors(
+                &mut mapping.anchors,
+                &query_seq_for_aln,
+                &mut ctx.target_buf[..region_size],
+                Some((mi, rid, rgn_start)),
+                opt,
+                &call_ctx,
+            )
+        };
+
+        // After align_anchors, the alignment range [rs1..final_re) of the
+        // active buffer has been filled (the lazy-fill pass before
+        // finalize_cigar) — safe for downstream tag generation.
+        let target_region: &[u8] = if use_qstrand_rev {
+            &qstrand_owned
+        } else {
+            &ctx.target_buf[..region_size]
+        };
 
         // Restore anchor ref positions to absolute (for split mapping reuse)
         for anchor in mapping.anchors.iter_mut() {
@@ -774,9 +996,6 @@ fn try_align_inversion(
     qseq.reverse();
     tseq.reverse();
 
-    if *crate::align::env_flags::DEBUG {
-        eprintln!("[DBG] try_align_inversion: ql={} tl={} ll_score={} raw_q_off={} raw_t_off={} min_dp_max={}", ql, tl, score, q_off, t_off, opt.alignment.min_dp_max);
-    }
     if score < opt.alignment.min_dp_max { return None; }
     if q_off < 0 || t_off < 0 { return None; }
 
@@ -785,9 +1004,6 @@ fn try_align_inversion(
     q_off = ql - (q_off + 1);
     t_off = tl - (t_off + 1);
 
-    if *crate::align::env_flags::DEBUG {
-        eprintln!("[DBG] try_align_inversion: adjusted q_off={} t_off={} ql={} tl={}", q_off, t_off, ql, tl);
-    }
 
     // Full alignment
     let bw = (opt.chaining.bandwidth as f64 * 1.5) as i32;
@@ -804,10 +1020,6 @@ fn try_align_inversion(
         crate::align::dp::extend_single_affine(q_sub, t_sub, 5, &mat, opt.scoring.gap_open as i8, opt.scoring.gap_extend as i8, bw, opt.alignment.zdrop, -1, dp_flag, &mut ez);
     } else {
         crate::align::dp::extend_dual_affine(q_sub, t_sub, 5, &mat, opt.scoring.gap_open as i8, opt.scoring.gap_extend as i8, opt.scoring.gap_open2 as i8, opt.scoring.gap_extend2 as i8, bw, opt.alignment.zdrop, -1, dp_flag, &mut ez);
-    }
-    if *crate::align::env_flags::DEBUG {
-        eprintln!("[DBG] try_align_inversion: q_off={} t_off={} q_sub_len={} t_sub_len={} bw={} zdrop={} flag=0x{:x} ez_score={} ez_max={} cigar_len={}",
-            q_off, t_off, q_sub.len(), t_sub.len(), bw, opt.alignment.zdrop, dp_flag, ez.score, ez.max, ez.cigar.len());
     }
     if ez.cigar.is_empty() { return None; }
 
@@ -1133,37 +1345,24 @@ fn filter_alignment_results(
     min_dp_max: i32,
     max_clip_ratio: f32,
     qlen: usize,
-    debug: bool,
 ) {
-    let pre_len = results.len();
     let clip_thresh = qlen as f32 * max_clip_ratio;
     if let Some(recalc) = recalc_infos {
         // Filter both results and recalc_infos together
-        if debug {
-            eprintln!("[DBG] PRE_FILTER n_results={}", results.len());
-            for (i, r) in results.iter().enumerate() {
-                eprintln!("[DBG] ALN[{}] dp_max={} AS={} qs={} qe={} rs={} re={} rev={} eff_cnt={}",
-                    i, r.dp_score_original, r.align_score, r.query_start, r.query_end, r.ref_start, r.ref_end, r.is_reverse, r.effective_cnt);
-            }
-        }
         let mut keep = vec![true; results.len()];
         for (i, r) in results.iter().enumerate() {
             if !r.inv && !r.seg_split && r.effective_cnt < min_cnt {
-                if debug { eprintln!("[DBG] FILTER_OUT[{}] eff_cnt={} < min_cnt={}", i, r.effective_cnt, min_cnt); }
                 keep[i] = false;
             }
             if (r.matches as i32) < min_chain_score {
-                if debug { eprintln!("[DBG] FILTER_OUT[{}] mlen={} < min_chain_score={}", i, r.matches, min_chain_score); }
                 keep[i] = false;
             }
             if r.dp_score < min_dp_max {
-                if debug { eprintln!("[DBG] FILTER_OUT[{}] dp_max={} < min_dp_max={}", i, r.dp_score, min_dp_max); }
                 keep[i] = false;
             }
             if (r.query_start as f32) > clip_thresh
                 && ((qlen.saturating_sub(r.query_end)) as f32) > clip_thresh
             {
-                if debug { eprintln!("[DBG] FILTER_OUT[{}] both ends clipped > qlen*{}", i, max_clip_ratio); }
                 keep[i] = false;
             }
         }
@@ -1189,9 +1388,6 @@ fn filter_alignment_results(
                     && ((qlen.saturating_sub(r.query_end)) as f32) > clip_thresh);
             !flt
         });
-        if debug && results.len() < pre_len {
-            eprintln!("[DBG] filter_alignment_results removed {} results", pre_len - results.len());
-        }
     }
 }
 
@@ -1207,7 +1403,6 @@ fn assign_parents_and_select(
     out: &OutputConfig,
     split_mode: bool,
     qlen: usize,
-    debug: bool,
 ) -> (Vec<AlnResult>, Vec<usize>) {
     let mut parent_indices: Vec<usize> = (0..results.len()).collect();
 
@@ -1259,7 +1454,7 @@ fn assign_parents_and_select(
         }
 
         if out.do_cigar {
-            filter_alignment_results(&mut results, None, opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen, debug);
+            filter_alignment_results(&mut results, None, opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen);
         }
 
         // Propagate is_alt from index sequences to results
@@ -1512,7 +1707,6 @@ fn process_query_core(
     // naturally processes the split next. After each right-split, inversion detection
     // checks the adjacent pair (left part at i-1, right part at i).
     let t_aln_start = Instant::now();
-    let debug = *crate::align::env_flags::DEBUG;
     let is_splice = opt.flags.contains(AlignFlags::SPLICE);
     let is_dual_splice = is_splice && opt.flags.contains(AlignFlags::SPLICE_FOR) && opt.flags.contains(AlignFlags::SPLICE_REV);
 
@@ -1525,9 +1719,13 @@ fn process_query_core(
         work_queue.push_back((r, 0));
     }
 
-    // Lazily initialized nt4 sequences for inversion detection
-    let mut qseq_fwd_nt4: Option<Vec<u8>> = None;
-    let mut qseq_rc_nt4: Option<Vec<u8>> = None;
+    // Encode the query once per outer call (forward + reverse-complement)
+    // and pass references into `align_single_mapping`. Previously each
+    // chain re-encoded the query inside `align_single_mapping` — catastrophic
+    // at chromosome-scale qlens (a 248 Mb chr1 query × 679k chains ≈ 170 TB
+    // of encoding work).
+    let qseq_fwd_nt4: Vec<u8> = qseq.iter().map(|&b| encode_nt4(b)).collect();
+    let qseq_rc_nt4: Vec<u8> = encode_nt4_rc(qseq);
 
     while let Some((mut r, parent_depth)) = work_queue.pop_front() {
         let is_split_part = parent_depth > 0;
@@ -1535,7 +1733,7 @@ fn process_query_core(
             let base_flags = opt.flags & !(AlignFlags::SPLICE_FOR | AlignFlags::SPLICE_REV);
             let mut r_for = r.clone();
             let (result_for, recalc_for, split_for) = align_single_mapping(
-                &mut r_for, opt, mi, qseq, qlen, ctx, map_ctx, out, &squeezed, base_flags | AlignFlags::SPLICE_FOR, junc_db,
+                &mut r_for, opt, mi, qseq, &qseq_fwd_nt4, &qseq_rc_nt4, qlen, ctx, map_ctx, out, &squeezed, base_flags | AlignFlags::SPLICE_FOR, junc_db,
             );
 
             let is_sr_rna = opt.flags.contains(AlignFlags::SR_RNA);
@@ -1551,7 +1749,7 @@ fn process_query_core(
             } else {
                 let mut r_rev = r.clone();
                 let (result_rev, recalc_rev, split_rev) = align_single_mapping(
-                    &mut r_rev, opt, mi, qseq, qlen, ctx, map_ctx, out, &squeezed, base_flags | AlignFlags::SPLICE_REV, junc_db,
+                    &mut r_rev, opt, mi, qseq, &qseq_fwd_nt4, &qseq_rc_nt4, qlen, ctx, map_ctx, out, &squeezed, base_flags | AlignFlags::SPLICE_REV, junc_db,
                 );
 
                 let (mut chosen_result, chosen_recalc, chosen_split, trans_strand) =
@@ -1590,7 +1788,7 @@ fn process_query_core(
         } else {
             let splice_f = opt.flags;
             let (mut res, rec, spl) = align_single_mapping(
-                &mut r, opt, mi, qseq, qlen, ctx, map_ctx, out, &squeezed, splice_f, junc_db,
+                &mut r, opt, mi, qseq, &qseq_fwd_nt4, &qseq_rc_nt4, qlen, ctx, map_ctx, out, &squeezed, splice_f, junc_db,
             );
             if is_splice {
                 res.trans_strand = if opt.flags.contains(AlignFlags::SPLICE_FOR) { 1 } else { 2 };
@@ -1608,9 +1806,6 @@ fn process_query_core(
         // If this result has a new split, mark it as left part and queue the split.
         // The new split's depth is parent_depth + 1 (one level deeper).
         if let Some(split) = new_split {
-            if debug {
-                eprintln!("[DBG] SPLIT_RIGHT cnt={} anchors={}", split.anchor_count, split.anchors.len());
-            }
             result.split |= 1;
             let child_depth = parent_depth.saturating_add(1);
             work_queue.push_front((split, child_depth));
@@ -1625,30 +1820,12 @@ fn process_query_core(
         // not at the call site.
         if results.len() >= 2 && out.do_cigar && !opt.flags.contains(AlignFlags::NO_INV) {
             let idx = results.len() - 1;
-            if debug {
-                eprintln!("[DBG] INV_CHECK idx={} split_inv={} is_root_chain={} prev_is_root={} r2_split={} r1_split={} r1_rev={} r2_rev={} r1_qs={} r1_qe={} r2_qs={} r2_qe={} r1_rs={} r1_re={} r2_rs={} r2_re={} r1_rid={} r2_rid={}",
-                    idx, results[idx].split_inv, results[idx].is_root_chain, results[idx-1].is_root_chain,
-                    results[idx].split, results[idx-1].split,
-                    results[idx-1].is_reverse, results[idx].is_reverse,
-                    results[idx-1].query_start, results[idx-1].query_end, results[idx].query_start, results[idx].query_end,
-                    results[idx-1].ref_start, results[idx-1].ref_end, results[idx].ref_start, results[idx].ref_end,
-                    results[idx-1].ref_id, results[idx].ref_id);
-            }
             if results[idx].split_inv {
-                // Lazily initialize nt4 sequences
-                if qseq_fwd_nt4.is_none() {
-                    qseq_fwd_nt4 = Some(qseq.iter().map(|&b| encode_nt4(b)).collect());
-                    qseq_rc_nt4 = Some(encode_nt4_rc(qseq));
-                }
                 if let Some(inv_result) = try_align_inversion(
-                    opt, mi, qlen, qseq_fwd_nt4.as_ref().unwrap(), qseq_rc_nt4.as_ref().unwrap(),
+                    opt, mi, qlen, &qseq_fwd_nt4, &qseq_rc_nt4,
                     &results[idx - 1], &results[idx],
                     out,
                 ) {
-                    if debug {
-                        eprintln!("[DBG] INV_FOUND qs={} qe={} rs={} re={} score={}",
-                            inv_result.query_start, inv_result.query_end, inv_result.ref_start, inv_result.ref_end, inv_result.align_score);
-                    }
                     // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi come from per-base comparison in CigarStats; gap stats come from CIGAR ops)
                     let mut inv_recalc = DpRecalcInfo::from_cigar_str(&inv_result.cigar_str);
                     inv_recalc.match_len = inv_result.matches as i32;
@@ -1656,8 +1833,6 @@ fn process_query_core(
                     inv_recalc.num_ambiguous = inv_result.num_ambiguous as i32;
                     results.push(inv_result);
                     recalc_infos.push(inv_recalc);
-                } else if debug {
-                    eprintln!("[DBG] INV_NOT_FOUND for idx={}", idx);
                 }
             }
         }
@@ -1667,11 +1842,11 @@ fn process_query_core(
 
     // Post-alignment filtering
     if out.do_cigar {
-        filter_alignment_results(&mut results, Some(&mut recalc_infos), opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen, debug);
+        filter_alignment_results(&mut results, Some(&mut recalc_infos), opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen);
     }
 
     // Parent assignment, secondary selection, dp_max ranking
-    let (results, parent_indices) = assign_parents_and_select(results, &recalc_infos, opt, mi, out, split_mode, qlen, debug);
+    let (results, parent_indices) = assign_parents_and_select(results, &recalc_infos, opt, mi, out, split_mode, qlen);
 
     // Set SAM primary flag (first non-secondary result)
     let mut sam_pri = vec![false; results.len()];

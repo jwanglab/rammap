@@ -163,7 +163,7 @@ pub fn encode_nt4_byte(b: u8) -> u8 {
 /// Find the longest stretch of consecutively matching anchors.
 /// For SR mode, replaces fix_bad_ends + filter_bad_seeds + adjust_minier.
 /// Returns (as1_offset, cnt1) into the anchors slice.
-fn max_stretch(anchors: &[Minimizer]) -> (usize, usize) {
+pub fn max_stretch(anchors: &[Minimizer]) -> (usize, usize) {
     let n = anchors.len();
     if n < 2 {
         return (0, n);
@@ -291,7 +291,15 @@ impl std::fmt::Display for CigarOp {
     }
 }
 
-pub struct AlignmentContext;
+pub struct AlignmentContext {
+    /// Reusable buffer for the extracted target region.
+    /// Allocated once per thread, grown as needed, never shrunk —
+    /// avoids per-mapping `malloc`/`free` churn for the multi-megabyte
+    /// regions produced by chromosome-scale chains (asm presets).
+    /// Filled via `set_len + extract_nt4_into` to skip the zero-fill
+    /// that `vec![0u8; N]` would otherwise perform.
+    pub target_buf: Vec<u8>,
+}
 
 impl Default for AlignmentContext {
     fn default() -> Self {
@@ -301,7 +309,7 @@ impl Default for AlignmentContext {
 
 impl AlignmentContext {
     pub fn new() -> Self {
-        AlignmentContext
+        AlignmentContext { target_buf: Vec::new() }
     }
 }
 
@@ -474,7 +482,7 @@ fn filter_bad_seeds_alt(anchors: &mut [Minimizer], min_gap: i32, max_ext: i32) {
 }
 
 /// Fix bad chain endpoints by trimming weak boundary alignments.
-fn fix_bad_ends(anchors: &[Minimizer], bw: i32, min_match: i32) -> (usize, usize) {
+pub fn fix_bad_ends(anchors: &[Minimizer], bw: i32, min_match: i32) -> (usize, usize) {
     let cnt = anchors.len();
     let mut as_idx = 0usize;
     let mut cnt_out = cnt;
@@ -1385,8 +1393,7 @@ fn compute_right_boundary(
     seed_r_bound: i32, seed_q_bound: i32,
     opt: &MapOptions,
     qlen: i32, tlen: i32,
-    debug: bool,
-    seed_bounds: (i32, i32, i32, i32),
+    _seed_bounds: (i32, i32, i32, i32),
 ) -> (i32, i32) {
     let max_gap = opt.chaining.max_gap;
     let a = opt.scoring.match_score;
@@ -1409,7 +1416,6 @@ fn compute_right_boundary(
     re1_bound = cmp::min(re1_bound, re + l);
     re0 = cmp::max(re0, re1_bound);
 
-    if debug { eprintln!("[DBG] right ext boundary: re0={} qe0={} re={} qe={} raw_re0={} raw_qe0={} re1_bound={} qe1_bound={} seed_bounds=({},{},{},{}) max_gap={}", re0, qe0, re, qe, orig_anchor_rend, orig_anchor_qend, re1_bound, qe1_bound, seed_bounds.0, seed_bounds.1, seed_bounds.2, seed_bounds.3, max_gap); }
     (cmp::min(re0, tlen), cmp::min(qe0, qlen))
 }
 
@@ -1470,12 +1476,17 @@ fn finalize_cigar(
 /// [`AlignResult`] with region-relative coordinates. The caller adds `ref_offset` to
 /// convert `ref_start`/`ref_end` back to absolute chromosome positions. Split anchors
 /// (if any) also have region-relative ref_pos.
+/// `lazy_extract` parameter (`Option<(mi, rid, rgn_start)>`): when `Some`,
+/// segments of `tseq` are filled on demand from `mi` (each DP call fills its
+/// own segment; post-DP processing fills the final alignment range). When
+/// `None`, `tseq` is assumed pre-filled (qstrand+reverse path, where the
+/// buffer holds a rev-comp'd full chromosome).
 pub fn align_anchors(
     anchors: &mut [Minimizer],
     qseq: &[u8],
-    tseq: &[u8],
+    tseq: &mut [u8],
+    lazy_extract: Option<(&crate::align::index::Index, usize, usize)>,
     opt: &MapOptions,
-    _ctx: &mut AlignmentContext,
     call: &AlignAnchorContext,
 ) -> AlignResult {
     // Local bindings from opt/call to avoid modifying the function body
@@ -1491,7 +1502,6 @@ pub fn align_anchors(
     let zdrop_inv = opt.alignment.zdrop_inv;
     let end_bonus = opt.alignment.end_bonus;
     let is_splice = opt.filtering.is_splice;
-    let min_chain_score = opt.chaining.min_chain_score;
     let _k = call.k;
     let seed_bounds = call.seed_bounds;
     let min_cnt = opt.chaining.min_cnt;
@@ -1515,7 +1525,6 @@ pub fn align_anchors(
     let empty = AlignResult { cigar_ops: Vec::new(), query_start: 0, query_end: 0, ref_start: 0, ref_end: 0, dp_score: 0, split_right_anchors: None, split_offset_in_orig: None, split_inv: false };
     if anchors.is_empty() { return empty; }
 
-    let debug = *crate::align::env_flags::DEBUG_ALIGN;
 
     let mat = build_scoring_matrix_full(a, b, transition, sc_ambi);
 
@@ -1557,6 +1566,20 @@ pub fn align_anchors(
     // --- Steps 1-3: Anchor trimming + coordinate computation ---
     let is_sr = flags.contains(AlignFlags::SHORT_READ);
 
+    // Lazy fill: for non-HPC non-splice modes (e.g. asm/map-ont), `tseq`
+    // arrives uninitialized and we fill segments on demand before each DP
+    // call + once for the final alignment range before CIGAR finalization.
+    // HPC/splice/SR need `tseq` filled up front because the trim path reads
+    // it. When `lazy_extract` is `None` (qstrand+reverse path), the caller
+    // has already filled `tseq`.
+    let use_lazy = lazy_extract.is_some() && !is_hpc && !is_splice && !is_sr;
+    if let Some((mi, rid, rgn_start)) = lazy_extract {
+        if !use_lazy {
+            let len = tseq.len();
+            mi.extract_nt4_into(rid, rgn_start, rgn_start + len, tseq);
+        }
+    }
+
     let trim = match trim_and_prepare_anchors(
         anchors, qseq, tseq, &mat, opt,
         is_hpc, splice_flag, k_half,
@@ -1566,18 +1589,7 @@ pub fn align_anchors(
     };
     let TrimResult { as1_offset, cnt1, work_anchors, rs, qs, re, qe } = trim;
 
-    if debug {
-        eprintln!("[DBG] anchors={} as1_offset={} cnt1={} w={} min_chain_score={}", anchors.len(), as1_offset, cnt1, w, min_chain_score);
-        let work = &work_anchors;
-        for (idx, a) in work.iter().enumerate() {
-            let r_pos = a.ref_pos();
-            let q_pos = a.query_pos();
-            let q_span = a.query_span();
-            eprintln!("[DBG]   anchor[{}] r_end={} q_end={} q_span={}", idx, r_pos, q_pos, q_span);
-        }
-    }
 
-    if debug { eprintln!("[DBG] qs={} qe={} rs={} re={} qlen={} tlen={}", qs, qe, rs, re, qlen, tlen); }
 
     // Raw CIGAR accumulator (u32 format: len<<4 | op)
     let mut raw_cigar: Vec<u32> = Vec::new();
@@ -1620,12 +1632,20 @@ pub fn align_anchors(
         if pre_qs - qs0 > max_ext { qs0 = pre_qs - max_ext; }
     }
 
-    if debug { eprintln!("[DBG] left ext boundary: qs0={} rs0={} is_sr={} seed_bounds=({},{},{},{})", qs0, rs0, is_sr, seed_bounds.0, seed_bounds.1, seed_bounds.2, seed_bounds.3); }
 
     // --- Step 5: Left extension ---
     let (mut rs1, mut qs1) = (rs, qs);
     if qs > 0 && rs > 0 && qs > qs0 && rs > rs0 {
         let q_ext_len = (qs - qs0) as usize;
+
+        // Lazy fill the left-extension segment [rs0, rs) in tseq.
+        if use_lazy {
+            if let Some((mi, rid, rgn_start)) = lazy_extract {
+                let a = rs0 as usize;
+                let b = rs as usize;
+                mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
+            }
+        }
 
         // Reverse sequences for left extension
         let mut q_rev: Vec<u8> = qseq[qs0 as usize..qs as usize].to_vec();
@@ -1650,20 +1670,9 @@ pub fn align_anchors(
         let left_zdrop = if split_inv { zdrop_inv } else { zdrop };
 
         let mut ez = DpResult::default();
-        if debug {
-            let qfirst5: Vec<u8> = q_rev.iter().take(5).copied().collect();
-            let qlast5: Vec<u8> = q_rev.iter().rev().take(5).rev().copied().collect();
-            let tfirst5: Vec<u8> = t_rev.iter().take(5).copied().collect();
-            let tlast5: Vec<u8> = t_rev.iter().rev().take(5).rev().copied().collect();
-            // Compute simple checksums for full sequence comparison
-            let q_sum: u64 = q_rev.iter().enumerate().map(|(i, &b)| (b as u64).wrapping_mul((i as u64).wrapping_add(1))).sum();
-            let t_sum: u64 = t_rev.iter().enumerate().map(|(i, &b)| (b as u64).wrapping_mul((i as u64).wrapping_add(1))).sum();
-            eprintln!("[DBG] left ext input: qlen={} tlen={} a={} b={} q={} e={} q2={} e2={} bw={} zdrop={} end_bonus={} flag=0x{:x} split_inv={} q_first={:?} q_last={:?} t_first={:?} t_last={:?} q_sum={} t_sum={}", q_rev.len(), t_rev.len(), a, b, q, e, q2, e2, bw, left_zdrop, end_bonus, flag, split_inv, qfirst5, qlast5, tfirst5, tlast5, q_sum, t_sum);
-        }
         // max_sw_mat check: skip alignment if matrix too large
         let sw_mat_size = q_rev.len() as i64 * t_rev.len() as i64;
         if max_sw_mat > 0 && sw_mat_size > max_sw_mat {
-            if debug { eprintln!("[DBG]   SKIPPING left ext: sw_mat={}>{}", sw_mat_size, max_sw_mat); }
             ez.max_score_query_pos = -1;
             ez.max_score_target_pos = -1;
             ez.max_query_end_target_pos = -1;
@@ -1676,9 +1685,6 @@ pub fn align_anchors(
             dp::extend_dual_affine(&q_rev, &t_rev, 5, &mat, q as i8, e as i8, q2 as i8, e2 as i8, bw, left_zdrop, end_bonus, flag, &mut ez);
         }
 
-        if debug {
-            eprintln!("[DBG] left ext: cigar_len={} score={} max={} reach_end={} max_t={} max_q={} mqe_t={}", ez.cigar.len(), ez.score, ez.max, ez.reach_end, ez.max_score_target_pos, ez.max_score_query_pos, ez.max_query_end_target_pos);
-        }
         if !ez.cigar.is_empty() {
             append_cigar(&mut raw_cigar, &ez.cigar);
             dp_score += ez.max;
@@ -1686,12 +1692,10 @@ pub fn align_anchors(
         // Compute consumed bases
         rs1 = rs - if ez.reach_end != 0 { ez.max_query_end_target_pos + 1 } else { ez.max_score_target_pos + 1 };
         qs1 = qs - if ez.reach_end != 0 { q_ext_len as i32 } else { ez.max_score_query_pos + 1 };
-        if debug { eprintln!("[DBG] after left ext: rs1={} qs1={}", rs1, qs1); }
     }
     let (mut re1, mut qe1) = (rs, qs);
 
     // Gap filling: iterate seeds, accumulate, align when appropriate
-    if debug { eprintln!("[DBG] gap-fill loop: cnt1={}", cnt1); }
     let mut gap_rs = rs; // current gap-fill start (reference)
     let mut gap_qs = qs; // current gap-fill start (query)
     let mut dropped = false;
@@ -1728,7 +1732,6 @@ pub fn align_anchors(
         // gap-fill always uses end_bonus = -1
         let gap_end_bonus: i32 = -1;
 
-        if debug && (i <= 5 || is_last || should_align) { eprintln!("[DBG]   seed {}: anchor_re={} anchor_qe={} gap_rs={} gap_qs={} should={} last={} qgap={} rgap={}", i, anchor_re, anchor_qe, gap_rs, gap_qs, should_align, is_last, anchor_qe - gap_qs, anchor_re - gap_rs); }
         if should_align {
             let mut bw1 = bw_long;
             if is_long_join {
@@ -1740,7 +1743,14 @@ pub fn align_anchors(
             let t_start = cmp::max(0, gap_rs) as usize;
             let t_end = cmp::min(tlen, anchor_re) as usize;
 
-            if debug { eprintln!("[DBG]   aligning q[{}..{}] t[{}..{}]", q_start, q_end, t_start, t_end); }
+            // Lazy fill the gap segment [t_start, t_end) in tseq.
+            if use_lazy && t_end > t_start {
+                if let Some((mi, rid, rgn_start)) = lazy_extract {
+                    mi.extract_nt4_into(rid, rgn_start + t_start, rgn_start + t_end,
+                                        &mut tseq[t_start..t_end]);
+                }
+            }
+
             if q_end > q_start && t_end > t_start {
                 let q_sub = &qseq[q_start..q_end];
                 let t_sub = &tseq[t_start..t_end];
@@ -1760,7 +1770,6 @@ pub fn align_anchors(
                 // Reset: max_q=max_t=mqe_t=mte_q=-1, max=0, zdropped=1
                 let sw_mat_size = q_sub.len() as i64 * t_sub.len() as i64;
                 if max_sw_mat > 0 && sw_mat_size > max_sw_mat {
-                    if debug { eprintln!("[DBG]   SKIPPING alignment: sw_mat={}>{}", sw_mat_size, max_sw_mat); }
                     ez.max_score_query_pos = -1;
                     ez.max_score_target_pos = -1;
                     ez.max_query_end_target_pos = -1;
@@ -1815,7 +1824,6 @@ pub fn align_anchors(
                     let mut skip_full = false;
                     if is_sr_rna {
                         skip_full = align_short_read_rna(q_sub, t_sub, &mat, opt, gap_end_bonus, splice_dp_flag | APPROX_MAX | generic_sc_flag, junc_gap.as_deref(), junc_bonus as i8, junc_pen as i8, &mut ez);
-                        if debug { eprintln!("[DBG_SRRNA] align_short_read_rna qlen={} tlen={} skip_full={}", q_sub.len(), t_sub.len(), skip_full); }
                     }
                     // First pass: APPROX_MAX
                     if !skip_full {
@@ -1829,12 +1837,10 @@ pub fn align_anchors(
                     }
 
                     // Z-drop test
-                    if debug { eprintln!("[DBG]   first pass: cigar_len={} score={} zdropped={} max={} max_t={} max_q={}", ez.cigar.len(), ez.score, ez.zdropped, ez.max, ez.max_score_target_pos, ez.max_score_query_pos); }
                     zdrop_code = if !ez.cigar.is_empty() {
                         test_zdrop(q_sub, t_sub, &ez.cigar, &mat, opt)
                     } else { 0 };
                     if zdrop_code != 0 {
-                        if debug { eprintln!("[DBG]   test_zdrop returned {}", zdrop_code); }
                         ez = DpResult::default();
                         let zdrop2 = if zdrop_code == 2 { zdrop_inv } else { zdrop };
                         if is_splice {
@@ -1847,9 +1853,6 @@ pub fn align_anchors(
                     }
                 }
 
-                if debug {
-                    eprintln!("[DBG]   gap result: cigar_len={} score={} zdropped={} max={} max_t={} max_q={}", ez.cigar.len(), ez.score, ez.zdropped, ez.max, ez.max_score_target_pos, ez.max_score_query_pos);
-                }
                 if !ez.cigar.is_empty() {
                     append_cigar(&mut raw_cigar, &ez.cigar);
                 }
@@ -1881,7 +1884,6 @@ pub fn align_anchors(
                             if zdrop_code == 2 {
                                 split_inv_flag = true;
                             }
-                            if debug { eprintln!("[DBG] z-drop split at i={} j_split={} remaining={} split_anchors={} split_offset={} zdrop_code={}", i, j_split, remaining, anchors.len() - split_off, split_off, zdrop_code); }
                         }
                     }
                     dropped = true;
@@ -1901,8 +1903,6 @@ pub fn align_anchors(
     let mut final_re = re1;
     let mut final_qe = qe1;
 
-    if debug { eprintln!("[DBG] after gap-fill: raw_cigar.len={} dropped={} re1={} qe1={}", raw_cigar.len(), dropped, re1, qe1); }
-    if debug { eprintln!("[DBG] right ext check: dropped={} qe={} qlen={} re={} tlen={}", dropped, qe, qlen, re, tlen); }
     if !dropped && qe < qlen && re < tlen {
         // Compute right extension boundary
         let (mut qe0, mut re0);
@@ -1921,7 +1921,7 @@ pub fn align_anchors(
                 seed_bounds.2, seed_bounds.3,
                 opt,
                 qlen, tlen,
-                debug, seed_bounds,
+                seed_bounds,
             );
             re0 = re0_tmp;
             qe0 = qe0_tmp;
@@ -1939,6 +1939,14 @@ pub fn align_anchors(
         }
 
         if qe0 > qe && re0 > re {
+            // Lazy fill the right-extension segment [re, re0) in tseq.
+            if use_lazy {
+                if let Some((mi, rid, rgn_start)) = lazy_extract {
+                    let a = re as usize;
+                    let b = re0 as usize;
+                    mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
+                }
+            }
             let q_sub = &qseq[qe as usize..qe0 as usize];
             let t_sub = &tseq[re as usize..re0 as usize];
 
@@ -1957,7 +1965,6 @@ pub fn align_anchors(
             // max_sw_mat check: skip alignment if matrix too large
             let sw_mat_size = q_sub.len() as i64 * t_sub.len() as i64;
             if max_sw_mat > 0 && sw_mat_size > max_sw_mat {
-                if debug { eprintln!("[DBG]   SKIPPING right ext: sw_mat={}>{}", sw_mat_size, max_sw_mat); }
                 ez.max_score_query_pos = -1;
                 ez.max_score_target_pos = -1;
                 ez.max_query_end_target_pos = -1;
@@ -1970,7 +1977,6 @@ pub fn align_anchors(
                 dp::extend_dual_affine(q_sub, t_sub, 5, &mat, q as i8, e as i8, q2 as i8, e2 as i8, bw, zdrop, end_bonus, flag, &mut ez);
             }
 
-            if debug { eprintln!("[DBG] right ext: cigar_len={} score={} max={} reach_end={} max_t={} max_q={} mqe_t={} qe0={} re0={}", ez.cigar.len(), ez.score, ez.max, ez.reach_end, ez.max_score_target_pos, ez.max_score_query_pos, ez.max_query_end_target_pos, qe0, re0); }
             if !ez.cigar.is_empty() {
                 append_cigar(&mut raw_cigar, &ez.cigar);
                 dp_score += ez.max;
@@ -1979,17 +1985,28 @@ pub fn align_anchors(
             // Consumed bases
             final_re = re + if ez.reach_end != 0 { ez.max_query_end_target_pos + 1 } else { ez.max_score_target_pos + 1 };
             final_qe = qe + if ez.reach_end != 0 { qe0 - qe } else { ez.max_score_query_pos + 1 };
-            if debug { eprintln!("[DBG] right ext result: final_re={} final_qe={}", final_re, final_qe); }
         }
     }
 
     if final_re <= 0 { final_re = re1; }
     if final_qe <= 0 { final_qe = qe1; }
 
+    // Lazy mode: fill the final alignment range [rs1, final_re) so that
+    // `finalize_cigar` (indel right-alignment, op merging, =/X conversion)
+    // and any downstream MD/cs tag generators can read tseq there.
+    if use_lazy {
+        if let Some((mi, rid, rgn_start)) = lazy_extract {
+            let a = cmp::max(0, rs1) as usize;
+            let b = cmp::max(a as i32, final_re) as usize;
+            if b > a {
+                mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
+            }
+        }
+    }
+
     // --- Steps 8-9: fix_cigar + convert M→=/X + condense ---
     let (condensed, final_qs, final_rs) = finalize_cigar(raw_cigar, qseq, tseq, qs1, rs1);
 
-    if debug { eprintln!("[DBG] final: qs1={} qe={} rs1={} re={} condensed={}", final_qs, final_qe, final_rs, final_re, condensed.len()); }
 
     AlignResult {
         cigar_ops: condensed,

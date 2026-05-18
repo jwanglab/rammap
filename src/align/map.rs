@@ -385,10 +385,18 @@ impl Aligner for RMAligner {
         qseq: &[u8],
         tseq: &[u8],
         opt: &MapOptions,
-        ctx: &mut crate::align::extend::AlignmentContext,
+        _ctx: &mut crate::align::extend::AlignmentContext,
         call: &crate::align::extend::AlignAnchorContext,
     ) -> crate::align::extend::AlignResult {
-        crate::align::extend::align_anchors(anchors, qseq, tseq, opt, ctx, call)
+        // The trait gives `tseq: &[u8]` (immutable, pre-filled by the
+        // caller). `align_anchors` now needs `&mut [u8]` for its lazy-fill
+        // path, but with `lazy_extract = None` it treats tseq as pre-filled
+        // and never writes. Copy to a local `Vec` here to satisfy the
+        // signature; this is the API trait path, not the hot mapping path
+        // (the hot path in `pipeline.rs` calls `align_anchors` directly with
+        // a thread-local buffer and `lazy_extract = Some(...)`).
+        let mut tseq_buf = tseq.to_vec();
+        crate::align::extend::align_anchors(anchors, qseq, &mut tseq_buf, None, opt, call)
     }
 }
 
