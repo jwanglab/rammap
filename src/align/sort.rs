@@ -146,10 +146,12 @@ fn rs_partition_top<T: RadixKey>(arr: &mut [T], s: u32) -> ([usize; 256], [usize
         be[byte] += 1;
     }
 
+    // prefix sum on `be` in place
     for i in 1..256 {
-        be[i] += be[i - 1];
-        bb[i] = be[i - 1];
+      be[i] += be[i - 1];
     }
+    // bucket starts = bucket ends shifted right by one
+    bb[1..].copy_from_slice(&be[..255]);
 
     // In-place cyclic permutation (American Flag sort)
     let mut k = 0usize;

@@ -104,7 +104,7 @@ impl RmqTree {
         if r != NIL {
             let r_min = self.nodes[r as usize].sub_min_idx;
             let best_pri = self.nodes[best as usize].pri;
-            if !(best_pri < self.nodes[r_min as usize].pri) {
+            if best_pri >= self.nodes[r_min as usize].pri {
                 best = r_min;
             }
         }
@@ -187,13 +187,13 @@ impl RmqTree {
         let mut best = idx;
         if q != NIL {
             let q_min = self.nodes[q as usize].sub_min_idx;
-            if !(cur_pri < self.nodes[q_min as usize].pri) {
+            if cur_pri >= self.nodes[q_min as usize].pri {
                 best = q_min;
             }
         }
         if r != NIL {
             let r_min = self.nodes[r as usize].sub_min_idx;
-            if !(self.nodes[best as usize].pri < self.nodes[r_min as usize].pri) {
+            if self.nodes[best as usize].pri >= self.nodes[r_min as usize].pri {
                 best = r_min;
             }
         }
@@ -202,8 +202,8 @@ impl RmqTree {
 
     /// Insert and rebalance. BST descent records the ancestor path and the
     /// deepest non-zero-balance ancestor `bp`. Then two independent walks:
-    /// sub_min leaf→root with early break when the new node is no longer the
-    /// subtree min, and balance bp→leaf. One rotation at bp if `|balance|≥2`.
+    /// sub_min leaf->root with early break when the new node is no longer the
+    /// subtree min, and balance bp->leaf. One rotation at bp if `|balance|>=2`.
     ///
     /// Sub_min and balance walks must not be interleaved: an interleaved walk
     /// that exits at the rotation point and then re-walks ancestors with
@@ -267,7 +267,7 @@ impl RmqTree {
             }
         }
 
-        // Step 3: rotate at bp if balance hits ±2.
+        // Step 3: rotate at bp if balance hits +-2.
         let bp = path[bp_idx];
         let bp_balance = self.nodes[bp as usize].balance;
         if bp_balance >= 2 || bp_balance <= -2 {
@@ -355,12 +355,12 @@ impl RmqTree {
         while p != NIL {
             self.update_sub_min(p);
             let old_balance = self.nodes[p as usize].balance;
-            // Adjust balance: left shrunk → balance increases; right shrunk → decreases
+            // Adjust balance: left shrunk -> balance increases; right shrunk -> decreases
             let new_balance = if shrunk_left { old_balance + 1 } else { old_balance - 1 };
             self.nodes[p as usize].balance = new_balance;
 
             if new_balance == 1 || new_balance == -1 {
-                // Height didn't change (was 0, now ±1), stop propagating
+                // Height didn't change (was 0, now +-1), stop propagating
                 break;
             } else if new_balance == 0 {
                 // Height decreased, continue propagating up

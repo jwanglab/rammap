@@ -741,7 +741,7 @@ fn align_single_mapping(
         let aln_result = if use_qstrand_rev {
             align_anchors(
                 &mut mapping.anchors,
-                &query_seq_for_aln,
+                query_seq_for_aln,
                 &mut qstrand_owned,
                 None,
                 opt,
@@ -750,7 +750,7 @@ fn align_single_mapping(
         } else {
             align_anchors(
                 &mut mapping.anchors,
-                &query_seq_for_aln,
+                query_seq_for_aln,
                 &mut ctx.target_buf[..region_size],
                 Some((mi, rid, rgn_start)),
                 opt,
@@ -880,13 +880,13 @@ fn align_single_mapping(
 
         cigar_str = fmt_cigar(&ops, out.eqx);
         if out.do_cs {
-            cs_str = fmt_cs(&ops, &query_seq_for_aln, target_region, new_qs, rgn_rs, out.cs_long);
+            cs_str = fmt_cs(&ops, query_seq_for_aln, target_region, new_qs, rgn_rs, out.cs_long);
         }
         if out.do_md {
             md_str = fmt_md(&ops, target_region, rgn_rs);
         }
         if out.do_ds {
-            ds_str = fmt_ds(&ops, &query_seq_for_aln, target_region, new_qs, rgn_rs);
+            ds_str = fmt_ds(&ops, query_seq_for_aln, target_region, new_qs, rgn_rs);
         }
     }
 
@@ -1820,20 +1820,14 @@ fn process_query_core(
         // not at the call site.
         if results.len() >= 2 && out.do_cigar && !opt.flags.contains(AlignFlags::NO_INV) {
             let idx = results.len() - 1;
-            if results[idx].split_inv {
-                if let Some(inv_result) = try_align_inversion(
-                    opt, mi, qlen, &qseq_fwd_nt4, &qseq_rc_nt4,
-                    &results[idx - 1], &results[idx],
-                    out,
-                ) {
-                    // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi come from per-base comparison in CigarStats; gap stats come from CIGAR ops)
-                    let mut inv_recalc = DpRecalcInfo::from_cigar_str(&inv_result.cigar_str);
-                    inv_recalc.match_len = inv_result.matches as i32;
-                    inv_recalc.block_len = inv_result.block_len as i32;
-                    inv_recalc.num_ambiguous = inv_result.num_ambiguous as i32;
-                    results.push(inv_result);
-                    recalc_infos.push(inv_recalc);
-                }
+            if results[idx].split_inv && let Some(inv_result) = try_align_inversion(opt, mi, qlen, &qseq_fwd_nt4, &qseq_rc_nt4, &results[idx - 1], &results[idx], out) {
+                // Build recalc_info from the inversion alignment stats (mlen/blen/n_ambi come from per-base comparison in CigarStats; gap stats come from CIGAR ops)
+                let mut inv_recalc = DpRecalcInfo::from_cigar_str(&inv_result.cigar_str);
+                inv_recalc.match_len = inv_result.matches as i32;
+                inv_recalc.block_len = inv_result.block_len as i32;
+                inv_recalc.num_ambiguous = inv_result.num_ambiguous as i32;
+                results.push(inv_result);
+                recalc_infos.push(inv_recalc);
             }
         }
     }

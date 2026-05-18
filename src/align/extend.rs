@@ -1573,11 +1573,9 @@ pub fn align_anchors(
     // it. When `lazy_extract` is `None` (qstrand+reverse path), the caller
     // has already filled `tseq`.
     let use_lazy = lazy_extract.is_some() && !is_hpc && !is_splice && !is_sr;
-    if let Some((mi, rid, rgn_start)) = lazy_extract {
-        if !use_lazy {
-            let len = tseq.len();
-            mi.extract_nt4_into(rid, rgn_start, rgn_start + len, tseq);
-        }
+    if let Some((mi, rid, rgn_start)) = lazy_extract && !use_lazy {
+        let len = tseq.len();
+        mi.extract_nt4_into(rid, rgn_start, rgn_start + len, tseq);
     }
 
     let trim = match trim_and_prepare_anchors(
@@ -1642,12 +1640,10 @@ pub fn align_anchors(
         let q_ext_len = (qs - qs0) as usize;
 
         // Lazy fill the left-extension segment [rs0, rs) in tseq.
-        if use_lazy {
-            if let Some((mi, rid, rgn_start)) = lazy_extract {
-                let a = rs0 as usize;
-                let b = rs as usize;
-                mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
-            }
+        if use_lazy && let Some((mi, rid, rgn_start)) = lazy_extract {
+            let a = rs0 as usize;
+            let b = rs as usize;
+            mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
         }
 
         // Reverse sequences for left extension
@@ -1747,11 +1743,8 @@ pub fn align_anchors(
             let t_end = cmp::min(tlen, anchor_re) as usize;
 
             // Lazy fill the gap segment [t_start, t_end) in tseq.
-            if use_lazy && t_end > t_start {
-                if let Some((mi, rid, rgn_start)) = lazy_extract {
-                    mi.extract_nt4_into(rid, rgn_start + t_start, rgn_start + t_end,
-                                        &mut tseq[t_start..t_end]);
-                }
+            if use_lazy && t_end > t_start && let Some((mi, rid, rgn_start)) = lazy_extract {
+                mi.extract_nt4_into(rid, rgn_start + t_start, rgn_start + t_end, &mut tseq[t_start..t_end]);
             }
 
             if q_end > q_start && t_end > t_start {
@@ -1946,12 +1939,10 @@ pub fn align_anchors(
 
         if qe0 > qe && re0 > re {
             // Lazy fill the right-extension segment [re, re0) in tseq.
-            if use_lazy {
-                if let Some((mi, rid, rgn_start)) = lazy_extract {
-                    let a = re as usize;
-                    let b = re0 as usize;
-                    mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
-                }
+            if use_lazy && let Some((mi, rid, rgn_start)) = lazy_extract {
+                let a = re as usize;
+                let b = re0 as usize;
+                mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
             }
             let q_sub = &qseq[qe as usize..qe0 as usize];
             let t_sub = &tseq[re as usize..re0 as usize];
@@ -2000,13 +1991,11 @@ pub fn align_anchors(
     // Lazy mode: fill the final alignment range [rs1, final_re) so that
     // `finalize_cigar` (indel right-alignment, op merging, =/X conversion)
     // and any downstream MD/cs tag generators can read tseq there.
-    if use_lazy {
-        if let Some((mi, rid, rgn_start)) = lazy_extract {
-            let a = cmp::max(0, rs1) as usize;
-            let b = cmp::max(a as i32, final_re) as usize;
-            if b > a {
-                mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
-            }
+    if use_lazy && let Some((mi, rid, rgn_start)) = lazy_extract {
+        let a = cmp::max(0, rs1) as usize;
+        let b = cmp::max(a as i32, final_re) as usize;
+        if b > a {
+            mi.extract_nt4_into(rid, rgn_start + a, rgn_start + b, &mut tseq[a..b]);
         }
     }
 
