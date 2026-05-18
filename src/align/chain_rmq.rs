@@ -512,25 +512,36 @@ impl RmqTree {
     }
 
     /// Reverse in-order iterator over elements with key_y <= start_y.
+    ///
+    /// The walk stack is bounded by the AVL tree height, which is itself bounded
+    /// by ~1.44·log2(`rmq_size_cap`) — well under 64 for any practical cap. We
+    /// keep the stack inline on the iterator to avoid a heap allocation per
+    /// `iter_rev_le()` call (hot path: fires once per non-exact outer-tree hit,
+    /// tens of millions of times per chromosome at asm presets).
     fn iter_rev_le(&self, start_y: i32) -> RmqRevIter<'_> {
-        let mut stack = Vec::with_capacity(32);
+        let mut iter = RmqRevIter { tree: self, stack: [0u32; RMQ_ITER_STACK_CAP], stack_len: 0 };
         let mut t = self.root;
         while t != NIL {
             let node = &self.nodes[t as usize];
             if node.key_y <= start_y {
-                stack.push(t);
+                debug_assert!(iter.stack_len < RMQ_ITER_STACK_CAP, "RMQ iter stack overflow");
+                iter.stack[iter.stack_len] = t;
+                iter.stack_len += 1;
                 t = node.right;
             } else {
                 t = node.left;
             }
         }
-        RmqRevIter { tree: self, stack }
+        iter
     }
 }
 
+const RMQ_ITER_STACK_CAP: usize = 64;
+
 struct RmqRevIter<'a> {
     tree: &'a RmqTree,
-    stack: Vec<u32>,
+    stack: [u32; RMQ_ITER_STACK_CAP],
+    stack_len: usize,
 }
 
 impl<'a> Iterator for RmqRevIter<'a> {
@@ -538,12 +549,16 @@ impl<'a> Iterator for RmqRevIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let t = self.stack.pop()?;
+        if self.stack_len == 0 { return None; }
+        self.stack_len -= 1;
+        let t = self.stack[self.stack_len];
         let node = &self.tree.nodes[t as usize];
         let result = (node.key_y, node.key_i as usize, node.pri);
         let mut child = node.left;
         while child != NIL {
-            self.stack.push(child);
+            debug_assert!(self.stack_len < RMQ_ITER_STACK_CAP, "RMQ iter stack overflow");
+            self.stack[self.stack_len] = child;
+            self.stack_len += 1;
             child = self.tree.nodes[child as usize].right;
         }
         Some(result)
