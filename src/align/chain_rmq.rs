@@ -28,6 +28,9 @@ struct RmqTree {
     root: u32,
     size: usize,
     free_head: u32, // free list for node reuse
+    // Scratch buffers reused across insert_elem calls to avoid per-call allocation.
+    insert_path: Vec<u32>,
+    insert_stack: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +47,14 @@ struct AvlNode {
 
 impl RmqTree {
     fn new() -> Self {
-        RmqTree { nodes: Vec::with_capacity(256), root: NIL, size: 0, free_head: NIL }
+        RmqTree {
+            nodes: Vec::with_capacity(256),
+            root: NIL,
+            size: 0,
+            free_head: NIL,
+            insert_path: Vec::with_capacity(64),
+            insert_stack: Vec::with_capacity(64),
+        }
     }
 
     #[inline]
@@ -190,6 +200,15 @@ impl RmqTree {
         self.nodes[idx as usize].sub_min_idx = best;
     }
 
+    /// Insert and rebalance. BST descent records the ancestor path and the
+    /// deepest non-zero-balance ancestor `bp`. Then two independent walks:
+    /// sub_min leaf→root with early break when the new node is no longer the
+    /// subtree min, and balance bp→leaf. One rotation at bp if `|balance|≥2`.
+    ///
+    /// Sub_min and balance walks must not be interleaved: an interleaved walk
+    /// that exits at the rotation point and then re-walks ancestors with
+    /// natural-args `update_sub_min` overrides rotation-specific tie-break
+    /// results at `new_root.parent` on equal-pri ties.
     fn insert_elem(&mut self, y: i32, i: usize, pri: f64) {
         let key_i = i as u32;
         let new_idx = self.alloc_node(y, key_i, pri);
@@ -200,86 +219,86 @@ impl RmqTree {
             return;
         }
 
-        // BST insert
+        // BST descent. Record full ancestor path; bp_idx tracks the deepest
+        // non-zero-balance ancestor seen so far. Balance walk later uses only
+        // stack[bp_idx..]. Buffers are reused across calls to avoid per-call
+        // allocation.
+        let mut path = std::mem::take(&mut self.insert_path);
+        let mut stack = std::mem::take(&mut self.insert_stack);
+        path.clear();
+        stack.clear();
+        let mut bp_idx: usize = 0;
         let mut cur = self.root;
         loop {
+            if self.nodes[cur as usize].balance != 0 {
+                bp_idx = path.len();
+            }
             let n = &self.nodes[cur as usize];
             let go_left = Self::key_lt(y, key_i, n.key_y, n.key_i);
+            let dir = if go_left { 0u8 } else { 1u8 };
             let next = if go_left { n.left } else { n.right };
+            path.push(cur);
+            stack.push(dir);
             if next == NIL {
-                self.set_child(cur, if go_left { 0 } else { 1 }, new_idx);
+                self.set_child(cur, dir as usize, new_idx);
                 break;
             }
             cur = next;
         }
 
-        // Walk up: update sub_min and fix balance
-        self.update_sub_min(new_idx);
-        let mut child = new_idx;
-        let mut p = self.nodes[child as usize].parent;
-        while p != NIL {
-            self.update_sub_min(p);
-            let pn = &self.nodes[p as usize];
-            let dir = if pn.left == child { 0usize } else { 1 };
-            let old_balance = pn.balance;
-            let new_balance = if dir == 0 { old_balance - 1 } else { old_balance + 1 };
-            self.nodes[p as usize].balance = new_balance;
-
-            if new_balance == 0 {
-                break; // height didn't change
-            } else if new_balance == -2 || new_balance == 2 {
-                // Rebalance
-                let heavy_dir = if new_balance > 0 { 1usize } else { 0 };
-                let heavy_child = self.child(p, heavy_dir);
-                let hb = self.nodes[heavy_child as usize].balance;
-                let opposite = 1 - heavy_dir;
-                let new_root;
-                if (heavy_dir == 1 && hb >= 0) || (heavy_dir == 0 && hb <= 0) {
-                    // Single rotation
-                    new_root = self.rotate(p, opposite);
-                    self.nodes[p as usize].balance = if hb == 0 { if heavy_dir == 1 { 1 } else { -1 } } else { 0 };
-                    self.nodes[new_root as usize].balance = if hb == 0 { if heavy_dir == 1 { -1 } else { 1 } } else { 0 };
-                    if self.root == p { self.root = new_root; }
-                } else {
-                    // Double rotation (fused).
-                    let inner = self.child(heavy_child, opposite);
-                    let inner_bal = self.nodes[inner as usize].balance;
-                    new_root = self.rotate2(p, opposite);
-                    self.nodes[p as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
-                        if heavy_dir == 1 { -1 } else { 1 }
-                    } else { 0 };
-                    self.nodes[heavy_child as usize].balance = if (heavy_dir == 1 && inner_bal < 0) || (heavy_dir == 0 && inner_bal > 0) {
-                        if heavy_dir == 1 { 1 } else { -1 }
-                    } else { 0 };
-                    self.nodes[new_root as usize].balance = 0;
-                    if self.root == p { self.root = new_root; }
-                    let _ = inner;
-                }
-                // Rotated nodes already had sub_min set with the rotation-specific
-                // arg order; recomputing them here with natural left/right would
-                // change tie-breaking. Walk from the rotation root's parent upward
-                // with natural args, stopping when the new node is no longer the
-                // subtree min.
-                let mut anc = self.nodes[new_root as usize].parent;
-                while anc != NIL {
-                    self.update_sub_min(anc);
-                    if self.nodes[anc as usize].sub_min_idx != new_idx { break; }
-                    anc = self.nodes[anc as usize].parent;
-                }
-                return;
-            } else {
-                // |balance| == 1, tree grew taller, continue up
-                child = p;
-                p = self.nodes[p as usize].parent;
+        // Step 1: sub_min walk from leaf's parent up to root with early break.
+        // alloc_node already set new leaf's sub_min_idx to itself.
+        for k in (0..path.len()).rev() {
+            let anc = path[k];
+            self.update_sub_min(anc);
+            if self.nodes[anc as usize].sub_min_idx != new_idx {
+                break;
             }
         }
-        // No rotation happened (balance hit 0). Walk up updating sub_min until
-        // the new node is no longer the subtree min.
-        while p != NIL {
-            self.update_sub_min(p);
-            if self.nodes[p as usize].sub_min_idx != new_idx { break; }
-            p = self.nodes[p as usize].parent;
+
+        // Step 2: balance walk from bp down to leaf's parent.
+        for k in bp_idx..path.len() {
+            let anc = path[k];
+            let dir = stack[k];
+            if dir == 0 {
+                self.nodes[anc as usize].balance -= 1;
+            } else {
+                self.nodes[anc as usize].balance += 1;
+            }
         }
+
+        // Step 3: rotate at bp if balance hits ±2.
+        let bp = path[bp_idx];
+        let bp_balance = self.nodes[bp as usize].balance;
+        if bp_balance >= 2 || bp_balance <= -2 {
+            let heavy_dir = if bp_balance > 0 { 1usize } else { 0 };
+            let heavy_child = self.child(bp, heavy_dir);
+            let hb = self.nodes[heavy_child as usize].balance;
+            let opposite = 1 - heavy_dir;
+            let new_root;
+            if (heavy_dir == 1 && hb >= 0) || (heavy_dir == 0 && hb <= 0) {
+                new_root = self.rotate(bp, opposite);
+                self.nodes[bp as usize].balance = if hb == 0 { if heavy_dir == 1 { 1 } else { -1 } } else { 0 };
+                self.nodes[new_root as usize].balance = if hb == 0 { if heavy_dir == 1 { -1 } else { 1 } } else { 0 };
+            } else {
+                let inner = self.child(heavy_child, opposite);
+                let inner_bal = self.nodes[inner as usize].balance;
+                new_root = self.rotate2(bp, opposite);
+                self.nodes[bp as usize].balance = if (heavy_dir == 1 && inner_bal > 0) || (heavy_dir == 0 && inner_bal < 0) {
+                    if heavy_dir == 1 { -1 } else { 1 }
+                } else { 0 };
+                self.nodes[heavy_child as usize].balance = if (heavy_dir == 1 && inner_bal < 0) || (heavy_dir == 0 && inner_bal > 0) {
+                    if heavy_dir == 1 { 1 } else { -1 }
+                } else { 0 };
+                self.nodes[new_root as usize].balance = 0;
+                let _ = inner;
+            }
+            if self.root == bp { self.root = new_root; }
+        }
+
+        // Return scratch buffers to the tree for the next call.
+        self.insert_path = path;
+        self.insert_stack = stack;
     }
 
     fn erase(&mut self, y: i32, i: usize) -> bool {
@@ -726,7 +745,6 @@ pub fn chain_anchors_rmq(
         predecessors[i] = best_predecessor as i32;
         peak_scores[i] = if best_predecessor >= 0 && peak_scores[best_predecessor as usize] > best_score { peak_scores[best_predecessor as usize] } else { best_score };
         if _mmax_f < best_score { _mmax_f = best_score; }
-
     }
 
     // Backtrack to extract chains
