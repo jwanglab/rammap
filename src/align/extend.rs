@@ -204,12 +204,18 @@ pub fn max_stretch(anchors: &[Minimizer]) -> (usize, usize) {
 /// Extends anchor region by ext_len, aligns with lightweight DP to score match quality.
 fn compute_seed_extension_score(
     qseq: &[u8],  // ASCII query on correct strand
-    tseq: &[u8],  // ASCII reference
+    tseq: &[u8],  // ASCII reference (region-relative)
     anchor: &Minimizer,
     ext_len: i32,
     mat: &[i8],
     gapo: i32,
     gape: i32,
+    // (index, rid, rgn_start): when Some, fetch fresh forward-strand bytes from
+    // the index instead of slicing `tseq`. This matches mm2's
+    // `mm_seed_ext_score` behavior and avoids clipping the extension range to
+    // the chain's pre-extracted region. None for the qstrand+reverse path,
+    // where `tseq` already contains the full rev-comp'd chromosome.
+    extract: Option<(&crate::align::index::Index, usize, usize)>,
 ) -> i32 {
     let q_span = anchor.query_span();
     let re_a = anchor.ref_pos() + 1;
@@ -217,18 +223,40 @@ fn compute_seed_extension_score(
     let qe_a = anchor.query_pos() + 1;
     let qs_a = qe_a - q_span;
 
-    let tlen = tseq.len() as i32;
     let qlen = qseq.len() as i32;
 
-    let rs = std::cmp::max(0, rs_a - ext_len) as usize;
     let qs = std::cmp::max(0, qs_a - ext_len) as usize;
-    let re = std::cmp::min(tlen, re_a + ext_len) as usize;
     let qe = std::cmp::min(qlen, qe_a + ext_len) as usize;
 
-    if re <= rs || qe <= qs { return 0; }
+    // Reference range: prefer fresh fetch from index (forward strand) so the
+    // window isn't bounded by the chain's pre-extracted region.
+    let mut owned_t: Vec<u8> = Vec::new();
+    let t_slice: &[u8] = if let Some((mi, rid, rgn_start)) = extract {
+        let chrom_len = mi.seqs[rid].len as i32;
+        // Anchor coords stored in `anchor` are region-relative; rebase to
+        // absolute chromosome coordinates for the index fetch.
+        let abs_re_a = re_a + rgn_start as i32;
+        let abs_rs_a = rs_a + rgn_start as i32;
+        let abs_rs = std::cmp::max(0, abs_rs_a - ext_len) as usize;
+        let abs_re = std::cmp::min(chrom_len, abs_re_a + ext_len) as usize;
+        if abs_re <= abs_rs { return 0; }
+        owned_t.resize(abs_re - abs_rs, 0);
+        mi.extract_nt4_into(rid, abs_rs, abs_re, &mut owned_t);
+        &owned_t[..]
+    } else {
+        // qstrand+reverse: `tseq` is the full rev-comp'd chromosome. Slicing
+        // by region-relative coords here is correct and not bounded by a
+        // smaller region.
+        let tlen = tseq.len() as i32;
+        let rs = std::cmp::max(0, rs_a - ext_len) as usize;
+        let re = std::cmp::min(tlen, re_a + ext_len) as usize;
+        if re <= rs { return 0; }
+        &tseq[rs..re]
+    };
+    if qe <= qs { return 0; }
 
     let mut qp = dp::lightweight_profile_init((qe - qs) as i32, &qseq[qs..qe], 5, mat);
-    let (score, _q_off, _t_off) = dp::lightweight_align_i16(&mut qp, (re - rs) as i32, &tseq[rs..re], gapo, gape);
+    let (score, _q_off, _t_off) = dp::lightweight_align_i16(&mut qp, t_slice.len() as i32, t_slice, gapo, gape);
     score
 }
 
@@ -243,6 +271,7 @@ fn fix_bad_ends_splice(
     anchor_ext_shift: i32,
     gapo: i32,
     gape: i32,
+    extract: Option<(&crate::align::index::Index, usize, usize)>,
 ) -> (usize, usize) {
     let mut as1: usize = 0;
     let mut cnt1 = anchors.len();
@@ -254,7 +283,7 @@ fn fix_bad_ends_splice(
         let log_gap = (gap_left as f64).ln();
         let span = anchors[0].query_span() as f64;
         if span < log_gap + anchor_ext_shift as f64 {
-            let score = compute_seed_extension_score(qseq, tseq, &anchors[0], anchor_ext_len, mat, gapo, gape);
+            let score = compute_seed_extension_score(qseq, tseq, &anchors[0], anchor_ext_len, mat, gapo, gape, extract);
             if (score as f64) / (mat[0] as f64) < log_gap + anchor_ext_shift as f64 {
                 as1 += 1;
                 cnt1 -= 1;
@@ -269,7 +298,7 @@ fn fix_bad_ends_splice(
         let log_gap = (gap_right as f64).ln();
         let span = anchors[n - 1].query_span() as f64;
         if span < log_gap + anchor_ext_shift as f64 {
-            let score = compute_seed_extension_score(qseq, tseq, &anchors[n - 1], anchor_ext_len, mat, gapo, gape);
+            let score = compute_seed_extension_score(qseq, tseq, &anchors[n - 1], anchor_ext_len, mat, gapo, gape, extract);
             if (score as f64) / (mat[0] as f64) < log_gap + anchor_ext_shift as f64 {
                 cnt1 -= 1;
             }
@@ -1266,6 +1295,7 @@ fn trim_and_prepare_anchors(
     is_hpc: bool,
     splice_flag: AlignFlags,
     k_half: i32,
+    extract: Option<(&crate::align::index::Index, usize, usize)>,
 ) -> Option<TrimResult> {
     let w = opt.chaining.bandwidth;
     let min_chain_score = opt.chaining.min_chain_score;
@@ -1301,7 +1331,7 @@ fn trim_and_prepare_anchors(
         } else if !is_splice {
             fix_bad_ends(anchors, w, min_chain_score * 2)
         } else {
-            fix_bad_ends_splice(anchors, qseq, tseq, mat, anchor_ext_len, anchor_ext_shift, q, e)
+            fix_bad_ends_splice(anchors, qseq, tseq, mat, anchor_ext_len, anchor_ext_shift, q, e, extract)
         };
         if cnt == 0 { return None; }
 
@@ -1580,7 +1610,7 @@ pub fn align_anchors(
 
     let trim = match trim_and_prepare_anchors(
         anchors, qseq, tseq, &mat, opt,
-        is_hpc, splice_flag, k_half,
+        is_hpc, splice_flag, k_half, lazy_extract,
     ) {
         Some(t) => t,
         None => return empty,
