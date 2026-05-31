@@ -33,15 +33,6 @@ cargo build --release
 
 Run `rammap -x --help` for the full list of accepted preset names and aliases.
 
-### aarch64 (including macOS)
-
-On ARM64/Mac systems, to enable index prefetch instructions (required), you must use the Rust nightly build:
-
-```bash
-rustup toolchain install nightly
-cargo +nightly build --release
-```
-
 ## Library API
 
 rammap can be used as a Rust library for programmatic alignment, with an API
