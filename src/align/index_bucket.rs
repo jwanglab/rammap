@@ -263,9 +263,10 @@ impl BucketHashLookup {
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 std::arch::x86_64::_mm_prefetch(bucket_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                #[cfg(target_arch = "aarch64")]
-                std::arch::aarch64::_prefetch(bucket_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                // aarch64 prefetch intrinsic (`stdarch_aarch64_prefetch`) is still
+                // nightly-only as of Rust 1.96; skip the hint there to stay on stable.
+                // It seems to cost us nothing on Apple M2 and 1-2% on a Raspberry Pi?
+                #[cfg(not(target_arch = "x86_64"))]
                 { let _ = bucket_ptr; }
             }
         }
@@ -279,9 +280,7 @@ impl BucketHashLookup {
                 let ptr = self.positions.as_ptr().add(range.0 as usize) as *const u8;
                 #[cfg(target_arch = "x86_64")]
                 std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                #[cfg(target_arch = "aarch64")]
-                std::arch::aarch64::_prefetch(ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                #[cfg(not(target_arch = "x86_64"))]
                 { let _ = ptr; }
             }
         }
