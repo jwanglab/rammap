@@ -875,7 +875,7 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         // But for single-part (which is the common case), mmap is faster.
         // Strategy: read first batch; if EOF, we have single-part. Otherwise, switch to streaming.
         #[cfg(not(target_arch = "wasm32"))]
-        let use_streaming = is_fastq || target_path.ends_with(".gz");
+        let use_streaming = is_fastq || target_path.ends_with(".gz") || std::fs::metadata(target_path).map(|m| m.len()).unwrap_or(0) > batch_size;
         #[cfg(target_arch = "wasm32")]
         let use_streaming = true;
 
