@@ -29,7 +29,7 @@ select, button {
 select:focus, button:focus { outline: 2px solid #111; outline-offset: -2px; }
 button { font-weight: 600; }
 button:hover { background: #111; color: #fff; }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled, select:disabled { opacity: 0.4; cursor: not-allowed; }
 button:disabled:hover { background: #fff; color: #111; }
 .drop-zone {
   border: 2px dashed #999; padding: 20px; text-align: center;
@@ -128,6 +128,7 @@ table.results td.cigar:hover { color: #111; overflow: visible; white-space: norm
   <div>
     <label>Threads</label>
     <select id="threads"></select>
+    <span id="thread-note" style="font-size:11px;color:#666;margin-top:2px;"></span>
   </div>
   <div class="check">
     <input type="checkbox" id="cigar" checked>
@@ -378,7 +379,11 @@ function onWorkerMessage(e) {
   if (type === 'ready') {
     wasmReady = true;
     const threads = e.data.threads || 1;
-    log(`[*] WASM ready (SIMD128, ${threads} thread${threads > 1 ? 's' : ''})`);
+    const multithreaded = !!e.data.multithreaded;
+    applyThreadingMode(multithreaded, threads);
+    log(multithreaded
+      ? `[*] WASM ready (SIMD128, ${threads} thread${threads > 1 ? 's' : ''})`
+      : `[*] WASM ready (SIMD128, single-threaded build)`);
     updateRunBtn();
   }
 
@@ -394,6 +399,20 @@ function onWorkerMessage(e) {
     }
   }
 
+  if (type === 'partial') {
+    // Alignment output for the reads completed in one query chunk. Append it
+    // to the raw panel as it arrives so results visibly stream in. Append via
+    // a text node rather than rebuilding textContent (which would be O(n²)).
+    const chunk = e.data.output || '';
+    if (chunk) {
+      lastOutput += chunk;
+      const atBottom = rawPanel.scrollTop + rawPanel.clientHeight >= rawPanel.scrollHeight - 4;
+      rawPanel.appendChild(document.createTextNode(chunk));
+      // Only follow the tail if the user hasn't scrolled up to read.
+      if (currentTab === 'raw' && atBottom) rawPanel.scrollTop = rawPanel.scrollHeight;
+    }
+  }
+
   if (type === 'result') {
     running = false;
     runBtn.classList.remove('running');
@@ -401,9 +420,10 @@ function onWorkerMessage(e) {
     if (e.data.log) log(e.data.log.trim());
     log(`[*] Total wall time: ${elapsed}s`);
 
-    lastOutput = e.data.output || '';
     lastFormat = document.getElementById('format').value === 'sam' ? 'sam' : 'paf';
-    rawPanel.textContent = lastOutput || '(no alignments)';
+    if (!lastOutput) rawPanel.textContent = '(no alignments)';
+    // The table is built once at the end (live-rebuilding it per chunk would
+    // be costly); the raw panel already streamed above.
     if (currentTab === 'table') renderTable(lastOutput, lastFormat);
 
     const nLines = lastOutput.trim().split('\n').filter(l => l).length;
@@ -456,6 +476,19 @@ for (let i = 1; i <= maxThreads; i++) {
   opt.textContent = i === 1 ? '1 (single)' : `${i}`;
   if (i === defaultThreads) opt.selected = true;
   threadSelect.appendChild(opt);
+}
+
+const threadNote = document.getElementById('thread-note');
+
+function applyThreadingMode(multithreaded, threads) {
+  if (multithreaded) {
+    threadSelect.disabled = false;
+    threadNote.textContent = '';
+  } else {
+    threadSelect.value = '1';
+    threadSelect.disabled = true;
+    threadNote.textContent = 'single-threaded build';
+  }
 }
 
 threadSelect.addEventListener('change', () => {

@@ -329,6 +329,74 @@ pub fn force_align_wasm(tseq: &str, qseq: &str) -> String {
 /// Streaming alignment session. Construct, push ref chunks, finalize the
 /// reference, push query chunks (each chunk emits its own output prefix),
 /// then `finalize` to get the trailing log.
+/// Query parser with lazy format detection. The browser demo accepts both
+/// FASTA and FASTQ query files; we check the first non-whitespace byte of the
+/// first chunk (`>` = FASTA, `@` = FASTQ) and dispatch to the appropriate
+/// streamer. Bytes received before detection are buffered and flushed once
+/// the format is known.
+enum QueryParser {
+    /// No non-whitespace bytes seen yet. `buf` accumulates incoming chunks and
+    /// is replayed into the chosen streamer once the format byte arrives.
+    Pending { buf: Vec<u8> },
+    Fasta(FastaStreamer),
+    Fastq(FastqStreamer),
+}
+
+impl QueryParser {
+    fn new() -> Self {
+        QueryParser::Pending { buf: Vec::new() }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        if let QueryParser::Pending { buf } = self {
+            buf.extend_from_slice(chunk);
+            // Look for the first non-whitespace byte to lock in the format.
+            for (i, &b) in buf.iter().enumerate() {
+                if b.is_ascii_whitespace() { continue; }
+                let rest: Vec<u8> = buf[i..].to_vec();
+                *self = match b {
+                    b'>' => {
+                        let mut s = FastaStreamer::new();
+                        s.push(&rest);
+                        QueryParser::Fasta(s)
+                    }
+                    b'@' => {
+                        let mut s = FastqStreamer::new();
+                        s.push(&rest);
+                        QueryParser::Fastq(s)
+                    }
+                    _ => return Err(JsValue::from_str(
+                        "query input is not FASTA (starts with '>') or FASTQ (starts with '@')")),
+                };
+                return Ok(());
+            }
+            return Ok(()); // all whitespace so far — keep buffering
+        }
+        match self {
+            QueryParser::Fasta(s) => s.push(chunk),
+            QueryParser::Fastq(s) => s.push(chunk),
+            QueryParser::Pending { .. } => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn next_record(&mut self) -> Option<(String, Vec<u8>)> {
+        match self {
+            QueryParser::Pending { .. } => None,
+            QueryParser::Fasta(s) => s.next_record(),
+            QueryParser::Fastq(s) => s.next_record(),
+        }
+    }
+
+    fn finalize(&mut self) {
+        match self {
+            QueryParser::Pending { .. } => {}
+            QueryParser::Fasta(s) => s.finalize(),
+            QueryParser::Fastq(s) => s.finalize(),
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct AlignSession {
     // Config
@@ -351,7 +419,7 @@ pub struct AlignSession {
 
     // Align phase (Some after `finalize_ref`).
     idx: Option<Index>,
-    query_parser: Option<FastqStreamer>,
+    query_parser: Option<QueryParser>,
     ctx: Option<AlignmentContext>,
     map_ctx: Option<MapContext>,
     t_align_start: Option<web_time::Instant>,
@@ -463,7 +531,7 @@ impl AlignSession {
             t0.elapsed().as_secs_f64(), self.opt.seeding.mid_occ));
 
         self.idx = Some(idx);
-        self.query_parser = Some(FastqStreamer::new());
+        self.query_parser = Some(QueryParser::new());
         self.ctx = Some(AlignmentContext::new());
         self.map_ctx = Some(MapContext::new());
         self.t_align_start = Some(web_time::Instant::now());
@@ -481,7 +549,7 @@ impl AlignSession {
         let ctx = self.ctx.as_mut().unwrap();
         let map_ctx = self.map_ctx.as_mut().unwrap();
 
-        parser.push(chunk);
+        parser.push(chunk)?;
         let mut out = String::new();
         while let Some((qname, qseq)) = parser.next_record() {
             self.n_queries += 1;

@@ -35,13 +35,17 @@ self.onmessage = async function(e) {
     try {
       mod = await import('../pkg/rammap.js');
       wasmExports = await mod.default();
+      // `initThreadPool` only exists in the threaded build (wasm-bindgen-rayon).
+      // Its absence means this is a single-threaded build, so the thread count
+      // is pinned to 1 regardless of what the UI requested.
+      const multithreaded = !!mod.initThreadPool;
       let threads = 1;
-      if (mod.initThreadPool) {
+      if (multithreaded) {
         threads = data?.numThreads || self.navigator?.hardwareConcurrency || 4;
         await mod.initThreadPool(threads);
       }
       ready = true;
-      postMessage({ type: 'ready', threads });
+      postMessage({ type: 'ready', threads, multithreaded });
       postMessage({ type: 'log', text: `[mem] post-init wasm linear memory: ${formatSize(memBytes())}` });
     } catch (err) {
       postMessage({ type: 'error', text: `Failed to load WASM: ${err.message || err}` });
@@ -129,19 +133,21 @@ async function runAlignment({ refFile, queryFile, preset, outputSam, outputCigar
     qStream = qStream.pipeThrough(new DecompressionStream('gzip'));
   }
   let qBytesSeen = 0;
-  let alignmentOut = '';
   for await (const chunk of streamChunks(qStream, CHUNK_BYTES)) {
-    alignmentOut += session.append_query(chunk);
+    // append_query returns the PAF/SAM for the reads completed in this chunk.
+    // Forward it immediately so the page can render results as they stream in
+    // rather than waiting for the whole query file to finish.
+    const out = session.append_query(chunk);
+    if (out) postMessage({ type: 'partial', output: out });
     qBytesSeen += chunk.byteLength;
     postMessage({ type: 'progress', stage: 'query', bytes: qBytesSeen });
   }
   const tail = session.finalize();
   const [trailingOut, logTail] = splitOnce(tail, '---LOG---\n');
-  alignmentOut += trailingOut;
+  if (trailingOut) postMessage({ type: 'partial', output: trailingOut });
 
   postMessage({
     type: 'result',
-    output: alignmentOut,
     log: logTail || '',
   });
 }
