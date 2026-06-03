@@ -952,8 +952,8 @@ fn try_align_inversion(
     // "primary" reduces to "this chain is itself a split-child".
     if opt.flags.contains(AlignFlags::ALL_CHAINS) {
         if (r1.split & 2) == 0 || (r2.split & 2) == 0 { return None; }
-    } else {
-        if !r1.is_root_chain || !r2.is_root_chain { return None; }
+    } else if !r1.is_root_chain || !r2.is_root_chain {
+        return None;
     }
     if r1.ref_id != r2.ref_id || r1.is_reverse != r2.is_reverse { return None; }
 
