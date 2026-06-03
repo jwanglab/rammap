@@ -52,49 +52,18 @@ pub fn _set_panic_hook() {
     });
 }
 
-/// Apply a named preset (e.g. `map-ont`, `lr:hq`, `sr`, `splice`) to
-/// MapOptions + k/w.
+/// Apply a named preset to MapOptions + k/w/is_hpc.
+///
+/// Delegates to the canonical native preset table (`api::apply_preset_str`) so
+/// the wasm build supports the exact same preset set as the CLI and library —
+/// including the HPC presets (`map-pb`/`ava-pb`) and every alias. An
+/// unrecognized name resets and falls back to `map-ont`, so the wasm entry
+/// points never fail on a bad preset string.
 fn apply_preset_wasm(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) {
-    match preset {
-        "map-ont" => {
-            *k = 15; *w = 10;
-            opt.scoring.match_score = 2; opt.scoring.mismatch_penalty = 4;
-            opt.scoring.gap_open = 4; opt.scoring.gap_extend = 2;
-            opt.scoring.gap_open2 = 24; opt.scoring.gap_extend2 = 1;
-        }
-        "map-hifi" => {
-            *k = 19; *w = 19;
-            opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 4;
-            opt.scoring.gap_open = 6; opt.scoring.gap_extend = 2;
-            opt.scoring.gap_open2 = 26; opt.scoring.gap_extend2 = 1;
-            opt.alignment.min_dp_max = 200;
-        }
-        "sr" => {
-            *k = 21; *w = 11;
-            opt.scoring.match_score = 2; opt.scoring.mismatch_penalty = 8;
-            opt.scoring.gap_open = 12; opt.scoring.gap_extend = 2;
-            opt.scoring.gap_open2 = 24; opt.scoring.gap_extend2 = 1;
-            opt.flags.insert(AlignFlags::SHORT_READ | AlignFlags::FRAG_MODE);
-        }
-        "splice" => {
-            *k = 15; *w = 5;
-            opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 2;
-            opt.scoring.gap_open = 2; opt.scoring.gap_extend = 1;
-            opt.scoring.gap_open2 = 32; opt.scoring.gap_extend2 = 0;
-            opt.filtering.is_splice = true;
-            opt.flags.insert(AlignFlags::SPLICE | AlignFlags::SPLICE_FLANK);
-        }
-        "asm20" => {
-            *k = 19; *w = 10;
-            opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 4;
-            opt.scoring.gap_open = 6; opt.scoring.gap_extend = 2;
-            opt.scoring.gap_open2 = 26; opt.scoring.gap_extend2 = 1;
-            opt.chaining.bandwidth = 1000; opt.chaining.bandwidth_long = 1000;
-            opt.flags.insert(AlignFlags::RMQ_CHAIN);
-        }
-        _ => {
-            *k = 15; *w = 10;
-        }
+    if crate::api::apply_preset_str(opt, k, w, is_hpc, preset).is_err() {
+        *opt = MapOptions::default();
+        *is_hpc = false;
+        let _ = crate::api::apply_preset_str(opt, k, w, is_hpc, "map-ont");
     }
 }
 
