@@ -272,7 +272,9 @@ pub fn chain_anchors(
         };
     }
 
-    chain_anchors_scalar(opt, is_cdna, n_seg, max_dist_x, max_dist_y, a, ctx)
+    // wasm32 the block above always returns, so this is unreachable for wasm32
+    #[cfg(not(target_arch = "wasm32"))]
+    return chain_anchors_scalar(opt, is_cdna, n_seg, max_dist_x, max_dist_y, a, ctx);
 }
 
 /// Partition anchors by (ref_id, strand) and chain each partition independently

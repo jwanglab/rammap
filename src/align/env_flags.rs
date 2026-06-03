@@ -12,8 +12,13 @@ fn flag(name: &'static str) -> bool {
 }
 
 pub static FORCE_SCALAR: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_FORCE_SCALAR"));
+#[cfg(target_arch = "x86_64")]
 pub static FORCE_SSE: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_FORCE_SSE"));
+#[cfg(target_arch = "x86_64")]
 pub static FORCE_AVX2: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_FORCE_AVX2"));
+#[cfg(target_arch = "x86_64")]
 pub static FORCE_AVX512: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_FORCE_AVX512"));
+// wasm always uses the wasm chain kernel, so gate it out there to avoid a dead-code warning
+#[cfg(not(target_arch = "wasm32"))]
 pub static FORCE_SCALAR_CHAIN: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_FORCE_SCALAR_CHAIN"));
 pub static COMPARE_SCALAR: LazyLock<bool> = LazyLock::new(|| flag("RAMMAP_COMPARE_SCALAR"));

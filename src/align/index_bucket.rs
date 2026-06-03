@@ -259,15 +259,13 @@ impl BucketHashLookup {
         let mask = (1u64 << self.bucket_bits) - 1;
         let bi = (hash & mask) as usize;
         if bi < self.buckets.len() {
-            let bucket_ptr = &self.buckets[bi] as *const _ as *const u8;
+            // aarch64's prefetch intrinsic (`stdarch_aarch64_prefetch`) is still
+            // nightly-only as of Rust 1.96, so we skip the hint there to stay on
+            // stable. It costs nothing on Apple M2 and 1-2% on a Raspberry Pi.
+            #[cfg(target_arch = "x86_64")]
             unsafe {
-                #[cfg(target_arch = "x86_64")]
+                let bucket_ptr = &self.buckets[bi] as *const _ as *const u8;
                 std::arch::x86_64::_mm_prefetch(bucket_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                // aarch64 prefetch intrinsic (`stdarch_aarch64_prefetch`) is still
-                // nightly-only as of Rust 1.96; skip the hint there to stay on stable.
-                // It seems to cost us nothing on Apple M2 and 1-2% on a Raspberry Pi?
-                #[cfg(not(target_arch = "x86_64"))]
-                { let _ = bucket_ptr; }
             }
         }
     }

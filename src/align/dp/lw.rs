@@ -309,69 +309,75 @@ unsafe fn lightweight_align_i16_wasm(qp: &mut LightweightProfile, target_len: i3
     let mut query_end: i32 = -1;
     let mut target_end: i32 = -1;
 
-    let zero = _mm_set1_epi32(0);
-    let gapoe = _mm_set1_epi16((gap_open + gap_extend) as i16);
-    let gape_v = _mm_set1_epi16(gap_extend as i16);
+    // SIMD region: every intrinsic call below is an `unsafe fn` (the
+    // simd_compat shims wrap raw-pointer v128 loads/stores), so the whole
+    // computation runs inside one inner `unsafe` block per Rust 2024's
+    // unsafe_op_in_unsafe_fn. Nothing declared here escapes the block.
+    unsafe {
+        let zero = _mm_set1_epi32(0);
+        let gapoe = _mm_set1_epi16((gap_open + gap_extend) as i16);
+        let gape_v = _mm_set1_epi16(gap_extend as i16);
 
-    for v in qp.e.iter_mut() { *v = 0; }
-    for v in qp.h0.iter_mut() { *v = 0; }
-    for v in qp.hmax.iter_mut() { *v = 0; }
+        for v in qp.e.iter_mut() { *v = 0; }
+        for v in qp.h0.iter_mut() { *v = 0; }
+        for v in qp.hmax.iter_mut() { *v = 0; }
 
-    for i in 0..target_len {
-        let mut f = zero;
-        let mut max = zero;
-        let s_offset = target[i as usize] as usize * slen as usize * 8;
-        let h0_last_idx = (slen as usize - 1) * 8;
-        let mut h = _mm_loadu_si128(qp.h0[h0_last_idx..].as_ptr() as *const __m128i);
-        h = _mm_slli_si128(h, 2);
+        for i in 0..target_len {
+            let mut f = zero;
+            let mut max = zero;
+            let s_offset = target[i as usize] as usize * slen as usize * 8;
+            let h0_last_idx = (slen as usize - 1) * 8;
+            let mut h = _mm_loadu_si128(qp.h0[h0_last_idx..].as_ptr() as *const __m128i);
+            h = _mm_slli_si128(h, 2);
 
-        for j in 0..slen as usize {
-            let s = _mm_loadu_si128(qp.query_profile[s_offset + j * 8..].as_ptr() as *const __m128i);
-            h = _mm_adds_epi16(h, s);
-            let e = _mm_loadu_si128(qp.e[j * 8..].as_ptr() as *const __m128i);
-            h = _mm_max_epi16(h, e);
-            h = _mm_max_epi16(h, f);
-            max = _mm_max_epi16(max, h);
-            _mm_storeu_si128(qp.h1[j * 8..].as_mut_ptr() as *mut __m128i, h);
-            let h_sub = _mm_subs_epu16(h, gapoe);
-            let e_sub = _mm_subs_epu16(e, gape_v);
-            let e_new = _mm_max_epi16(e_sub, h_sub);
-            _mm_storeu_si128(qp.e[j * 8..].as_mut_ptr() as *mut __m128i, e_new);
-            f = _mm_subs_epu16(f, gape_v);
-            f = _mm_max_epi16(f, h_sub);
-            h = _mm_loadu_si128(qp.h0[j * 8..].as_ptr() as *const __m128i);
-        }
-
-        for _k in 0..8 {
-            f = _mm_slli_si128(f, 2);
-            let mut did_break = false;
             for j in 0..slen as usize {
-                let mut h1 = _mm_loadu_si128(qp.h1[j * 8..].as_ptr() as *const __m128i);
-                h1 = _mm_max_epi16(h1, f);
-                _mm_storeu_si128(qp.h1[j * 8..].as_mut_ptr() as *mut __m128i, h1);
-                let h1_sub = _mm_subs_epu16(h1, gapoe);
+                let s = _mm_loadu_si128(qp.query_profile[s_offset + j * 8..].as_ptr() as *const __m128i);
+                h = _mm_adds_epi16(h, s);
+                let e = _mm_loadu_si128(qp.e[j * 8..].as_ptr() as *const __m128i);
+                h = _mm_max_epi16(h, e);
+                h = _mm_max_epi16(h, f);
+                max = _mm_max_epi16(max, h);
+                _mm_storeu_si128(qp.h1[j * 8..].as_mut_ptr() as *mut __m128i, h);
+                let h_sub = _mm_subs_epu16(h, gapoe);
+                let e_sub = _mm_subs_epu16(e, gape_v);
+                let e_new = _mm_max_epi16(e_sub, h_sub);
+                _mm_storeu_si128(qp.e[j * 8..].as_mut_ptr() as *mut __m128i, e_new);
                 f = _mm_subs_epu16(f, gape_v);
-                if _mm_movemask_epi8(_mm_cmpgt_epi16(f, h1_sub)) == 0 {
-                    did_break = true;
-                    break;
-                }
+                f = _mm_max_epi16(f, h_sub);
+                h = _mm_loadu_si128(qp.h0[j * 8..].as_ptr() as *const __m128i);
             }
-            if did_break { break; }
+
+            for _k in 0..8 {
+                f = _mm_slli_si128(f, 2);
+                let mut did_break = false;
+                for j in 0..slen as usize {
+                    let mut h1 = _mm_loadu_si128(qp.h1[j * 8..].as_ptr() as *const __m128i);
+                    h1 = _mm_max_epi16(h1, f);
+                    _mm_storeu_si128(qp.h1[j * 8..].as_mut_ptr() as *mut __m128i, h1);
+                    let h1_sub = _mm_subs_epu16(h1, gapoe);
+                    f = _mm_subs_epu16(f, gape_v);
+                    if _mm_movemask_epi8(_mm_cmpgt_epi16(f, h1_sub)) == 0 {
+                        did_break = true;
+                        break;
+                    }
+                }
+                if did_break { break; }
+            }
+
+            let mut imax_v = max;
+            imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 8));
+            imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 4));
+            imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 2));
+            let imax = _mm_extract_epi16::<0>(imax_v) as i16 as i32;
+
+            if imax >= gmax {
+                gmax = imax;
+                target_end = i;
+                qp.hmax.copy_from_slice(&qp.h1);
+            }
+
+            std::mem::swap(&mut qp.h0, &mut qp.h1);
         }
-
-        let mut imax_v = max;
-        imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 8));
-        imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 4));
-        imax_v = _mm_max_epi16(imax_v, _mm_srli_si128(imax_v, 2));
-        let imax = _mm_extract_epi16::<0>(imax_v) as i16 as i32;
-
-        if imax >= gmax {
-            gmax = imax;
-            target_end = i;
-            qp.hmax.copy_from_slice(&qp.h1);
-        }
-
-        std::mem::swap(&mut qp.h0, &mut qp.h1);
     }
 
     // Find query_end from Hmax. Prefer an in-bounds position with value == gmax;

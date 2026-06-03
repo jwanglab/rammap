@@ -51,6 +51,7 @@ pub fn set_simd_cap(cap: SimdCap) {
     SIMD_CAP.store(cap as u8, Ordering::Relaxed);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn simd_cap() -> SimdCap {
     match SIMD_CAP.load(Ordering::Relaxed) {
@@ -61,7 +62,6 @@ fn simd_cap() -> SimdCap {
     }
 }
 
-/// Should we dispatch to the AVX-512 DP path here?
 /// Combines env-var overrides, preset cap, and runtime CPU detection.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -77,7 +77,6 @@ pub fn use_avx512() -> bool {
     is_x86_feature_detected!("avx512bw")
 }
 
-/// Should we dispatch to the AVX2 DP path here?
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn use_avx2() -> bool {

@@ -1,8 +1,5 @@
 // Dual-affine gap penalty DP kernels
 
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
@@ -75,6 +72,8 @@ pub fn extend_dual_affine(
     if *crate::align::env_flags::FORCE_SCALAR {
         // Compare mode: run both SIMD and scalar, report differences
         if *crate::align::env_flags::COMPARE_SCALAR {
+            // only mutated by the x86_64 SIMD call below; on other targets `mut` is unused
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut ez_simd = DpResult::default();
             #[cfg(target_arch = "x86_64")]
             unsafe {

@@ -244,11 +244,12 @@ pub fn radix_sort_pair(arr: &mut [(u64, u64)]) {
 
     // Safety: buckets are non-overlapping slices of arr, so parallel mutable
     // access is safe. We use raw pointer arithmetic to avoid borrow checker issues.
+    // Both bindings exist only for the parallel closure (passing the base as a
+    // usize keeps it Send+Sync), so they're gated to the parallel feature.
+    #[cfg(feature = "parallel")]
     let ptr = arr.as_mut_ptr();
 
-    // Pass base address as usize so the closure is Send+Sync.
-    // Safety: buckets are non-overlapping regions of arr, each thread
-    // gets exclusive access to its own slice.
+    #[cfg(feature = "parallel")]
     let base = ptr as usize;
 
     #[cfg(feature = "parallel")]

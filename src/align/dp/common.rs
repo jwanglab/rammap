@@ -1,6 +1,3 @@
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
@@ -20,13 +17,13 @@ pub(super) mod simd_compat {
 
     // --- Load / Store ---
     #[inline(always)]
-    pub unsafe fn _mm_loadu_si128(p: *const __m128i) -> __m128i { v128_load(p as *const v128) }
+    pub unsafe fn _mm_loadu_si128(p: *const __m128i) -> __m128i { unsafe { v128_load(p as *const v128) } }
     #[inline(always)]
-    pub unsafe fn _mm_load_si128(p: *const __m128i) -> __m128i { v128_load(p as *const v128) }
+    pub unsafe fn _mm_load_si128(p: *const __m128i) -> __m128i { unsafe { v128_load(p as *const v128) } }
     #[inline(always)]
-    pub unsafe fn _mm_storeu_si128(p: *mut __m128i, v: __m128i) { v128_store(p as *mut v128, v) }
+    pub unsafe fn _mm_storeu_si128(p: *mut __m128i, v: __m128i) { unsafe { v128_store(p as *mut v128, v) } }
     #[inline(always)]
-    pub unsafe fn _mm_store_si128(p: *mut __m128i, v: __m128i) { v128_store(p as *mut v128, v) }
+    pub unsafe fn _mm_store_si128(p: *mut __m128i, v: __m128i) { unsafe { v128_store(p as *mut v128, v) } }
 
     // --- Broadcast / Init ---
     #[inline(always)]
@@ -118,23 +115,23 @@ pub(super) mod simd_compat {
     #[inline(always)]
     pub unsafe fn _mm_slli_si128(a: __m128i, imm8: i32) -> __m128i {
         if imm8 <= 0 { return a; }
-        if imm8 >= 16 { return _mm_setzero_si128(); }
+        if imm8 >= 16 { return unsafe { _mm_setzero_si128() }; }
         let n = imm8 as u8;
         let mut idx = [0x80u8; 16];
         let mut i = n;
         while i < 16 { idx[i as usize] = i - n; i += 1; }
-        i8x16_swizzle(a, v128_load(idx.as_ptr() as *const v128))
+        unsafe { i8x16_swizzle(a, v128_load(idx.as_ptr() as *const v128)) }
     }
 
     #[inline(always)]
     pub unsafe fn _mm_srli_si128(a: __m128i, imm8: i32) -> __m128i {
         if imm8 <= 0 { return a; }
-        if imm8 >= 16 { return _mm_setzero_si128(); }
+        if imm8 >= 16 { return unsafe { _mm_setzero_si128() }; }
         let n = imm8 as u8;
         let mut idx = [0x80u8; 16];
         let mut i = 0u8;
         while i + n < 16 { idx[i as usize] = i + n; i += 1; }
-        i8x16_swizzle(a, v128_load(idx.as_ptr() as *const v128))
+        unsafe { i8x16_swizzle(a, v128_load(idx.as_ptr() as *const v128)) }
     }
 
     // --- sse2_insert_byte0 (used unconditionally in DP macros) ---
@@ -172,8 +169,6 @@ pub(super) mod simd_compat {
     pub unsafe fn _mm_movemask_epi8(a: __m128i) -> i32 { u8x16_bitmask(a) as i32 }
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(super) use simd_compat::*;
 
 // ============================================================================
 // SSE2 Helper Functions (emulate SSE4.1 operations)

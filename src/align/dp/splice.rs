@@ -1,8 +1,5 @@
 // Splice-aware DP kernels
 
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
