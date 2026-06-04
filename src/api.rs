@@ -1101,6 +1101,82 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // Deterministic DNA generator (xorshift) for synthetic splice scenarios.
+    fn gen_dna(state: &mut u64, n: usize) -> Vec<u8> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        (0..n).map(|_| {
+            *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17;
+            bases[(*state % 4) as usize]
+        }).collect()
+    }
+
+    // Target offset of the first intron (N) in a CIGAR = sum of target-consuming
+    // ops (M/D/=/X) before it. None if the CIGAR has no intron.
+    fn intron_donor_offset(cigar: &str) -> Option<i32> {
+        let mut consumed = 0i32;
+        let mut num = String::new();
+        for c in cigar.chars() {
+            if c.is_ascii_digit() { num.push(c); continue; }
+            let len: i32 = num.parse().unwrap_or(0);
+            num.clear();
+            match c {
+                'N' => return Some(consumed),
+                'M' | 'D' | '=' | 'X' => consumed += len,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Behavioral test: a junction BED must actually change the alignment, not
+    /// just populate a field. Build a two-exon reference with an intron and
+    /// align the spliced transcript. Without an annotation the splice site
+    /// lands a few bp off; a BED at the true intron boundary snaps the intron
+    /// to the annotated position and improves the score — proving the junction
+    /// DB reaches the splice DP through the Aligner.
+    #[test]
+    fn test_junctions_reposition_splice_site() {
+        let mut st = 0xC0FFEE_u64;
+        let exon1 = gen_dna(&mut st, 100);
+        let intron = gen_dna(&mut st, 100);
+        let exon2 = gen_dna(&mut st, 100);
+        let reference: Vec<u8> = exon1.iter().chain(&intron).chain(&exon2).copied().collect();
+        let query: Vec<u8> = exon1.iter().chain(&exon2).copied().collect();
+        let intron_start = exon1.len() as i32;
+        let intron_end = exon1.len() + intron.len();
+
+        // Baseline: no junction annotation.
+        let a0 = Aligner::from_seqs(vec![("chr1".to_string(), reference.clone())], Preset::Splice);
+        let r0 = a0.map_seq("read", &query);
+        assert_eq!(r0.mappings.len(), 1, "expected one mapping without junctions");
+        let m0 = &r0.mappings[0];
+        let c0 = m0.cigar.clone().expect("cigar present");
+
+        // Same alignment, with the true intron annotated as a junction.
+        let mut a1 = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::Splice);
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_junc_behavior_{}.bed", std::process::id()));
+        std::fs::write(&path, format!("chr1\t{}\t{}\t.\t0\t+\n", intron_start, intron_end))
+            .expect("write test BED");
+        a1.load_junctions_bed(path.to_str().unwrap()).expect("load_junctions_bed");
+        let _ = std::fs::remove_file(&path);
+        let r1 = a1.map_seq("read", &query);
+        assert_eq!(r1.mappings.len(), 1, "expected one mapping with junctions");
+        let m1 = &r1.mappings[0];
+        let c1 = m1.cigar.clone().expect("cigar present");
+
+        assert!(m0.is_spliced && m1.is_spliced, "both alignments should splice (c0={c0}, c1={c1})");
+        // The annotation changed the alignment and improved its score.
+        assert_ne!(c0, c1, "junction BED should change the CIGAR (both = {c0})");
+        assert!(m1.score > m0.score, "junction bonus should raise the score: with={} without={}", m1.score, m0.score);
+        // With the annotation the intron snaps exactly to the annotated donor;
+        // without it, the splice site is mis-placed.
+        assert_eq!(intron_donor_offset(&c1), Some(intron_start),
+            "annotated splice should sit at the junction (cigar {c1})");
+        assert_ne!(intron_donor_offset(&c0), Some(intron_start),
+            "unannotated splice should be mis-placed (cigar {c0})");
+    }
+
     #[test]
     fn test_preset_as_str_roundtrip() {
         let presets = [
