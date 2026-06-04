@@ -573,6 +573,9 @@ mod tests {
         }).collect()
     }
 
+    // Only used by the x86_64-gated SSE-vs-AVX concordance tests below; gate it
+    // to match, so it isn't dead code on aarch64/wasm.
+    #[cfg(target_arch = "x86_64")]
     fn cigar_consumed(cigar: &[u32]) -> (usize, usize) {
         let mut q = 0usize;
         let mut t = 0usize;
