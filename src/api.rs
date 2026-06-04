@@ -31,6 +31,8 @@ use crate::align::index::Index;
 use crate::align::map::{MapOptions, MapContext, AlignFlags};
 use crate::align::extend::AlignmentContext;
 use crate::align::pipeline::{self, OutputConfig, ReadInfo};
+use crate::align::junc::{self, JunctionDb};
+use std::collections::HashMap;
 
 /// Alignment preset (selected via the `-x` flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +185,9 @@ pub struct Aligner {
     index: Index,
     options: MapOptions,
     out_cfg: OutputConfig,
+    /// Optional known-junction database (minimap2 `--junc-bed` equivalent),
+    /// biasing splice scoring toward annotated junctions when set.
+    junc_db: Option<JunctionDb>,
 }
 
 impl Aligner {
@@ -235,7 +240,7 @@ impl Aligner {
             options.seeding.min_mid_occ,
             options.seeding.max_mid_occ,
         );
-        Ok(Aligner { index, options, out_cfg })
+        Ok(Aligner { index, options, out_cfg, junc_db: None })
     }
 
     /// Build an aligner from a FASTA reference file.
@@ -253,7 +258,7 @@ impl Aligner {
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
         opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
-        Ok(Aligner { index, options: opt, out_cfg })
+        Ok(Aligner { index, options: opt, out_cfg, junc_db: None })
     }
 
     /// Build an aligner from in-memory sequences (name, sequence pairs).
@@ -280,7 +285,7 @@ impl Aligner {
             do_cigar: true, do_cs: false, cs_long: false, do_md: false, do_ds: false,
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
-        Aligner { index, options: opt, out_cfg }
+        Aligner { index, options: opt, out_cfg, junc_db: None }
     }
 
     // --- Mapping ---
@@ -297,7 +302,7 @@ impl Aligner {
         let out = self.resolve_out_cfg(&opts);
         let pq = pipeline::process_query(
             &self.options, &self.index, name, seq,
-            &mut ctx, &mut map_ctx, None, &out,
+            &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         to_map_result(&pq, &self.index, &out)
     }
@@ -316,9 +321,57 @@ impl Aligner {
         let read2 = ReadInfo { qname: name, qseq: seq2, qual: None, comment: None, n_seg: 2, seg_idx: 1 };
         let (output, _stats) = pipeline::align_and_format_pair(
             &self.options, &self.index, &read1, &read2,
-            &mut ctx, &mut map_ctx, None, &out,
+            &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         parse_paf_to_map_result(&output, &self.index)
+    }
+
+    /// Load known splice junctions from a BED file (BED6/BED12), enabling
+    /// junction-aware splice scoring on subsequent `map_seq` calls. This is the
+    /// rammap equivalent of minimap2's `--junc-bed` (and minimap2-rs's
+    /// `read_junction_lr`). Reference names in the BED are resolved against the
+    /// built index, so this must be called after construction.
+    pub fn load_junctions_bed(&mut self, path: &str) -> io::Result<()> {
+        let name_to_rid: HashMap<String, usize> = self
+            .index
+            .seqs
+            .iter()
+            .enumerate()
+            .map(|(i, sq)| (sq.name.clone(), i))
+            .collect();
+        let db = junc::load_bed_junctions(path, &name_to_rid, self.index.seqs.len())?;
+        self.junc_db = Some(db);
+        Ok(())
+    }
+
+    /// Load per-position splice-site (SPSC) scores from a file, enabling
+    /// score-weighted junction-aware splice alignment on subsequent `map_seq`
+    /// calls. This is the library equivalent of the CLI's `--spsc` (the
+    /// `--junc-bed` alternative that uses graded donor/acceptor scores rather
+    /// than boolean known-junction flags). `scale` defaults to `0.7` (the CLI
+    /// default for `--spsc-scale`) when `None`. Must be called after construction
+    /// so contig names resolve against the built index.
+    pub fn load_junctions_spsc(&mut self, path: &str, scale: Option<f32>) -> io::Result<()> {
+        let name_to_rid: HashMap<String, usize> = self
+            .index
+            .seqs
+            .iter()
+            .enumerate()
+            .map(|(i, sq)| (sq.name.clone(), i))
+            .collect();
+        let max_sc = junc::max_spsc_bonus(self.options.scoring.gap_open2, self.options.scoring.gap_open);
+        let scale = scale.unwrap_or(0.7);
+        let seq_lens: Vec<usize> = self.index.seqs.iter().map(|s| s.len).collect();
+        let db = junc::load_spsc_scores(
+            path,
+            &name_to_rid,
+            self.index.seqs.len(),
+            &seq_lens,
+            max_sc,
+            scale,
+        )?;
+        self.junc_db = Some(db);
+        Ok(())
     }
 
     // --- Output ---
@@ -1006,6 +1059,47 @@ fn cigar_bounds(cigar: &[u32]) -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_junctions_bed_populates_db() {
+        // Build a tiny in-memory index, then load a BED6 junction referencing
+        // that contig and confirm the junction DB is populated and wired in.
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let mut aligner = Aligner::from_seqs(vec![("ctg1".to_string(), seq)], Preset::Splice);
+        assert!(aligner.junc_db.is_none(), "junctions should be unset before loading");
+
+        // Write a small BED6 file (contig, start, end, name, score, strand).
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_junc_test_{}.bed", std::process::id()));
+        std::fs::write(&path, "ctg1\t5\t25\t.\t0\t+\n").expect("write test BED");
+
+        aligner
+            .load_junctions_bed(path.to_str().unwrap())
+            .expect("load_junctions_bed should succeed");
+        assert!(aligner.junc_db.is_some(), "junctions should be set after loading");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_junctions_spsc_populates_db() {
+        // SPSC file: contig, pos, strand, type(D/A), score (tab-separated).
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let mut aligner = Aligner::from_seqs(vec![("ctg1".to_string(), seq)], Preset::Splice);
+        assert!(aligner.junc_db.is_none());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_spsc_test_{}.tsv", std::process::id()));
+        std::fs::write(&path, "ctg1\t10\t+\tD\t5\nctg1\t20\t+\tA\t5\n")
+            .expect("write test SPSC");
+
+        aligner
+            .load_junctions_spsc(path.to_str().unwrap(), None)
+            .expect("load_junctions_spsc should succeed");
+        assert!(aligner.junc_db.is_some(), "junctions should be set after loading SPSC");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_preset_as_str_roundtrip() {
