@@ -228,9 +228,10 @@ impl Aligner {
 
     // --- Constructors ---
 
-    /// Load an aligner from a pre-built `.mmi` index file.
-    pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
-        let index = Index::load(path)?;
+    /// Build an aligner from an already-loaded [`Index`], applying the preset
+    /// options and calibrating the seed-occurrence threshold from the index.
+    /// Shared by [`Aligner::from_index`] and [`Aligner::from_index_reader`].
+    fn from_loaded_index(index: Index, preset: Preset) -> Self {
         let (mut options, out_cfg) = build_options(preset, index.kmer_size, index.window_size);
         // Calibrate the seed occurrence threshold using the loaded index — matches
         // what from_fasta/from_seqs do. Without this, mid_occ stays at its default
@@ -240,7 +241,29 @@ impl Aligner {
             options.seeding.min_mid_occ,
             options.seeding.max_mid_occ,
         );
-        Ok(Aligner { index, options, out_cfg, junc_db: None })
+        Aligner { index, options, out_cfg, junc_db: None }
+    }
+
+    /// Load an aligner from a pre-built index file (rammap `RMMI`, minimap2
+    /// `.mmi`, or legacy format; the format is detected from the file's magic).
+    pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
+        Ok(Self::from_loaded_index(Index::load(path)?, preset))
+    }
+
+    /// Load an aligner from any seekable reader positioned at the start of a
+    /// rammap (`RMMI`), minimap2 (`.mmi`), or legacy index. Unlike
+    /// [`Aligner::from_index`], the caller owns the reader and may bound it to
+    /// exactly the index bytes — e.g. a [`std::io::Cursor`] over a slice whose
+    /// trailing footer/metadata has been removed, or an index embedded in a
+    /// larger container — so loading never depends on the index format ignoring
+    /// trailing bytes.
+    pub fn from_index_reader<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        preset: Preset,
+    ) -> io::Result<Self> {
+        let index = Index::load_part(reader)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty index"))?;
+        Ok(Self::from_loaded_index(index, preset))
     }
 
     /// Build an aligner from a FASTA reference file.
@@ -1059,6 +1082,41 @@ fn cigar_bounds(cigar: &[u32]) -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_from_index_reader_bounded_and_trailing() {
+        // Build a tiny index and serialize it (RMMI magic + bincode) into a
+        // buffer. Then append junk "footer" bytes after the index.
+        let seqs = vec![
+            ("s1".to_string(), b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec()),
+            ("s2".to_string(), b"TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA".to_vec()),
+            ("s3".to_string(), b"ACGTNNNNACGTACGTACGTACGTNNNNACGT".to_vec()),
+        ];
+        let index = Index::build(seqs, 10, 15, false, usize::MAX);
+        let mut buf: Vec<u8> = Vec::new();
+        index.save_part(&mut buf).expect("serialize index");
+        let index_len = buf.len();
+        buf.extend_from_slice(b"OARFISHSIG-LIKE-TRAILING-FOOTER-BYTES");
+
+        // (a) A reader bounded to exactly the index bytes loads correctly.
+        let mut bounded = std::io::Cursor::new(&buf[..index_len]);
+        let a_bounded = Aligner::from_index_reader(&mut bounded, Preset::MapOnt)
+            .expect("from_index_reader (bounded) should succeed");
+        assert_eq!(a_bounded.index.seqs.len(), 3);
+
+        // (b) A reader that also contains trailing bytes loads the same index
+        // (the loader stops at the end of the serialized structure).
+        let mut with_trailing = std::io::Cursor::new(&buf[..]);
+        let a_trailing = Aligner::from_index_reader(&mut with_trailing, Preset::MapOnt)
+            .expect("from_index_reader (with trailing bytes) should succeed");
+        assert_eq!(a_trailing.index.seqs.len(), 3);
+
+        // Both reader paths agree with each other on the sequence names.
+        let names_b: Vec<&str> = a_bounded.index.seqs.iter().map(|t| t.name.as_str()).collect();
+        let names_t: Vec<&str> = a_trailing.index.seqs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names_b, names_t);
+        assert_eq!(names_b, vec!["s1", "s2", "s3"]);
+    }
 
     #[test]
     fn test_load_junctions_bed_populates_db() {
