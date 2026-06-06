@@ -18,7 +18,7 @@ mod dual;
 mod splice;
 mod lw;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Per-process cap on SIMD width.
 ///
@@ -49,6 +49,53 @@ static SIMD_CAP: AtomicU8 = AtomicU8::new(SimdCap::Auto as u8);
 /// process-global; reset to `Auto` if switching back to a DP-heavy preset.
 pub fn set_simd_cap(cap: SimdCap) {
     SIMD_CAP.store(cap as u8, Ordering::Relaxed);
+}
+
+/// Per-process cap (bytes) on the size of a DP scratch buffer that the thread-local
+/// `DP_MEM_CACHE` retains between alignments. `usize::MAX` is a sentinel for "not yet
+/// resolved": on first use it is initialized from `RAMMAP_DP_CACHE_CAP_MB` (megabytes)
+/// or [`DEFAULT_DP_CACHE_CAP_MB`]. [`set_dp_cache_cap_mb`] overrides it at runtime.
+static DP_CACHE_CAP_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Default per-thread DP cache retention cap, in megabytes, when neither
+/// [`set_dp_cache_cap_mb`] nor `RAMMAP_DP_CACHE_CAP_MB` is set.
+pub const DEFAULT_DP_CACHE_CAP_MB: usize = 128;
+
+/// Pass to [`set_dp_cache_cap_mb`] (or set `RAMMAP_DP_CACHE_CAP_MB=0`) to disable the
+/// cap entirely, restoring the original unbounded high-water-mark caching behavior —
+/// each thread retains its largest-ever DP buffer for the lifetime of the run.
+pub const DP_CACHE_UNBOUNDED: usize = 0;
+
+/// Set the per-process cap, in megabytes, on the DP scratch buffer that each worker
+/// thread's `DP_MEM_CACHE` retains between alignments. Buffers larger than the cap are
+/// freed back to the OS on drop instead of cached, bounding peak RSS at high thread
+/// counts (the minimap2 `cap_kalloc` analog). Pass [`DP_CACHE_UNBOUNDED`] (`0`) to
+/// disable the cap entirely, restoring unbounded high-water-mark caching.
+///
+/// Overrides both the [`DEFAULT_DP_CACHE_CAP_MB`] default and the `RAMMAP_DP_CACHE_CAP_MB`
+/// environment variable for all subsequent alignments on every thread. Process-global,
+/// like [`set_simd_cap`]; call once during setup.
+pub fn set_dp_cache_cap_mb(mb: usize) {
+    DP_CACHE_CAP_BYTES.store(mb.saturating_mul(1 << 20).min(usize::MAX - 1), Ordering::Relaxed);
+}
+
+/// Resolve the current DP cache cap in bytes (`0` = no cap), initializing from
+/// `RAMMAP_DP_CACHE_CAP_MB` (or the default) on first use.
+#[inline]
+pub(crate) fn dp_cache_cap_bytes() -> usize {
+    let v = DP_CACHE_CAP_BYTES.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    // First use with no explicit override: derive from the environment (or default).
+    // Idempotent under races — every thread computes the same value.
+    let mb = std::env::var("RAMMAP_DP_CACHE_CAP_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DP_CACHE_CAP_MB);
+    let bytes = mb.saturating_mul(1 << 20).min(usize::MAX - 1);
+    DP_CACHE_CAP_BYTES.store(bytes, Ordering::Relaxed);
+    bytes
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -122,6 +169,27 @@ mod tests {
     use super::dual::{extend_dual_affine2_impl, extend_dual_affine41_impl, extend_dual_affine_avx2_fn, extend_dual_affine_avx512_fn};
     #[cfg(target_arch = "aarch64")]
     use super::dual::extend_dual_affine_neon_impl;
+
+    #[test]
+    fn test_dp_cache_cap_setter() {
+        // Process-global; save and restore so we don't perturb other tests. The
+        // cap only changes whether oversized buffers are cached vs freed — it is
+        // correctness-neutral, so a transient value here can't affect concurrent
+        // DP tests' results.
+        let saved = DP_CACHE_CAP_BYTES.load(Ordering::Relaxed);
+
+        set_dp_cache_cap_mb(64);
+        assert_eq!(dp_cache_cap_bytes(), 64 << 20);
+
+        set_dp_cache_cap_mb(DP_CACHE_UNBOUNDED); // disables the cap entirely
+        assert_eq!(dp_cache_cap_bytes(), 0);
+        assert_eq!(DP_CACHE_UNBOUNDED, 0);
+
+        set_dp_cache_cap_mb(DEFAULT_DP_CACHE_CAP_MB);
+        assert_eq!(dp_cache_cap_bytes(), DEFAULT_DP_CACHE_CAP_MB << 20);
+
+        DP_CACHE_CAP_BYTES.store(saved, Ordering::Relaxed);
+    }
 
     #[test]
     fn test_scalar_dual_affine() {

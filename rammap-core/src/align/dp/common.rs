@@ -360,6 +360,17 @@ thread_local! {
     pub(super) static DP_MEM_CACHE: Cell<Option<(*mut u8, std::alloc::Layout)>> = const { Cell::new(None) };
 }
 
+// The per-thread DP scratch cache retains each thread's high-water-mark buffer.
+// The splice DP is unbanded, so a single large gap-fill segment needs
+// `O((qlen+tlen)·min(qlen,tlen))` bytes — hundreds of MB for the rare read with a
+// big unaligned gap. Without a cap, that one-off high-water mark is pinned per
+// worker thread for the rest of the run; at high thread counts the sum dominates
+// peak RSS (the genome-mode regression vs minimap2, whose `km`/`cap_kalloc` arena
+// is bounded the same way). The cap (see `super::dp_cache_cap_bytes` /
+// `super::set_dp_cache_cap_mb`) frees buffers larger than the bound on drop; the
+// common case (almost all buffers well under the cap) stays cached and churn-free.
+use super::dp_cache_cap_bytes;
+
 pub(super) struct AlignedMemory {
     ptr: *mut u8,
     layout: std::alloc::Layout,
@@ -397,10 +408,23 @@ impl AlignedMemory {
 
 impl Drop for AlignedMemory {
     fn drop(&mut self) {
+        let cap = dp_cache_cap_bytes();
+        if cap != 0 && self.layout.size() > cap {
+            // Oversized one-off buffer (rare large gap-fill): free it back to the
+            // OS rather than pinning it per-thread for the rest of the run. This
+            // bounds the cached high-water mark, the cap_kalloc analog.
+            unsafe { std::alloc::dealloc(self.ptr, self.layout); }
+            self.ptr = std::ptr::null_mut();
+            return;
+        }
         // Return to cache instead of deallocating. Keep the larger allocation
-        // if the cache already has one (high-water-mark strategy).
+        // if the cache already has one (high-water-mark strategy). If the cache
+        // already holds a (cap-bounded) buffer, free this one to avoid leaking
+        // the displaced allocation.
         DP_MEM_CACHE.with(|cache| {
-            cache.set(Some((self.ptr, self.layout)));
+            if let Some((old_ptr, old_layout)) = cache.replace(Some((self.ptr, self.layout))) {
+                unsafe { std::alloc::dealloc(old_ptr, old_layout); }
+            }
         });
         // Null out to prevent use-after-free if Drop is somehow called twice
         self.ptr = std::ptr::null_mut();
