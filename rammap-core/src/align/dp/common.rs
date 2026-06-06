@@ -360,31 +360,16 @@ thread_local! {
     pub(super) static DP_MEM_CACHE: Cell<Option<(*mut u8, std::alloc::Layout)>> = const { Cell::new(None) };
 }
 
-/// Upper bound (bytes) on the size of a DP scratch buffer that the per-thread
-/// [`DP_MEM_CACHE`] is allowed to retain between alignments. Buffers larger than
-/// this are freed back to the OS on drop instead of cached.
-///
-/// The splice DP is unbanded, so a single large gap-fill segment needs
-/// `O((qlen+tlen)·min(qlen,tlen))` bytes — hundreds of MB for the rare read with
-/// a big unaligned gap. Without a cap, that one-off high-water mark is pinned per
-/// worker thread for the rest of the run; at high thread counts the sum dominates
-/// peak RSS (the genome-mode regression vs minimap2, whose `km`/`cap_kalloc` arena
-/// is bounded the same way). The common case (almost all buffers are well under
-/// the cap) stays cached and churn-free; only the rare giant buffers reallocate.
-///
-/// Override with `RAMMAP_DP_CACHE_CAP_MB` (megabytes; `0` disables the cap).
-fn dp_cache_cap_bytes() -> usize {
-    use std::sync::OnceLock;
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        const DEFAULT_MB: usize = 128;
-        let mb = std::env::var("RAMMAP_DP_CACHE_CAP_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MB);
-        mb.saturating_mul(1_048_576)
-    })
-}
+// The per-thread DP scratch cache retains each thread's high-water-mark buffer.
+// The splice DP is unbanded, so a single large gap-fill segment needs
+// `O((qlen+tlen)·min(qlen,tlen))` bytes — hundreds of MB for the rare read with a
+// big unaligned gap. Without a cap, that one-off high-water mark is pinned per
+// worker thread for the rest of the run; at high thread counts the sum dominates
+// peak RSS (the genome-mode regression vs minimap2, whose `km`/`cap_kalloc` arena
+// is bounded the same way). The cap (see `super::dp_cache_cap_bytes` /
+// `super::set_dp_cache_cap_mb`) frees buffers larger than the bound on drop; the
+// common case (almost all buffers well under the cap) stays cached and churn-free.
+use super::dp_cache_cap_bytes;
 
 pub(super) struct AlignedMemory {
     ptr: *mut u8,
