@@ -61,11 +61,16 @@ static DP_CACHE_CAP_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// [`set_dp_cache_cap_mb`] nor `RAMMAP_DP_CACHE_CAP_MB` is set.
 pub const DEFAULT_DP_CACHE_CAP_MB: usize = 128;
 
+/// Pass to [`set_dp_cache_cap_mb`] (or set `RAMMAP_DP_CACHE_CAP_MB=0`) to disable the
+/// cap entirely, restoring the original unbounded high-water-mark caching behavior —
+/// each thread retains its largest-ever DP buffer for the lifetime of the run.
+pub const DP_CACHE_UNBOUNDED: usize = 0;
+
 /// Set the per-process cap, in megabytes, on the DP scratch buffer that each worker
 /// thread's `DP_MEM_CACHE` retains between alignments. Buffers larger than the cap are
 /// freed back to the OS on drop instead of cached, bounding peak RSS at high thread
-/// counts (the minimap2 `cap_kalloc` analog). `0` disables the cap entirely, restoring
-/// unbounded high-water-mark caching.
+/// counts (the minimap2 `cap_kalloc` analog). Pass [`DP_CACHE_UNBOUNDED`] (`0`) to
+/// disable the cap entirely, restoring unbounded high-water-mark caching.
 ///
 /// Overrides both the [`DEFAULT_DP_CACHE_CAP_MB`] default and the `RAMMAP_DP_CACHE_CAP_MB`
 /// environment variable for all subsequent alignments on every thread. Process-global,
@@ -176,8 +181,9 @@ mod tests {
         set_dp_cache_cap_mb(64);
         assert_eq!(dp_cache_cap_bytes(), 64 << 20);
 
-        set_dp_cache_cap_mb(0); // 0 disables the cap entirely
+        set_dp_cache_cap_mb(DP_CACHE_UNBOUNDED); // disables the cap entirely
         assert_eq!(dp_cache_cap_bytes(), 0);
+        assert_eq!(DP_CACHE_UNBOUNDED, 0);
 
         set_dp_cache_cap_mb(DEFAULT_DP_CACHE_CAP_MB);
         assert_eq!(dp_cache_cap_bytes(), DEFAULT_DP_CACHE_CAP_MB << 20);
