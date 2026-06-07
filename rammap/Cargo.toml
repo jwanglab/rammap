@@ -23,7 +23,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-rammap-core = { path = "../rammap-core", version = "1.1.0", default-features = false }
+rammap-core = { path = "../rammap-core", version = "1.1.1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
