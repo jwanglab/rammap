@@ -248,6 +248,10 @@ See [`docs/performance.md`](docs/performance.md) for detailed benchmarks against
 
 See [`docs/wasm.md`](docs/wasm.md) for WASM build instructions, web demo, and benchmarks.
 
+## Python
+
+[`rammappy`](https://github.com/tomdstanton/rammappy) is an externally maintained module that provides Python bindings directly to the `rammap-core` API via PyO3.
+
 ## License
 
 MIT
