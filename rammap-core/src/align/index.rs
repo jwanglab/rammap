@@ -87,6 +87,35 @@ pub struct Index {
     /// Kept at runtime for on-demand per-region nt4 extraction (~375 MB for GRCh38).
     #[serde(default)]
     pub packed_seqs: Vec<u32>,
+    /// Derived (not serialized): dense lexicographic ranks of the target names,
+    /// computed on first use for the ava self-skip fast path. See [`name_rank`].
+    #[serde(skip)]
+    name_rank: std::sync::OnceLock<NameRankData>,
+}
+
+/// Dense lexicographic ranking of target-sequence names, used to turn the
+/// per-hit `qname.cmp(seq.name)` string comparison (which dominates the ava
+/// seeding phase) into a fast integer comparison. Names that are byte-equal
+/// share a rank — identical ordering to `str::cmp`.
+#[derive(Debug, Clone)]
+pub struct NameRankData {
+    /// Dense rank per rid.
+    pub rank: Vec<u32>,
+    /// rids sorted by name, for resolving a query name's rank via binary search.
+    order: Vec<u32>,
+}
+
+impl NameRankData {
+    /// Lexicographic rank of `qname`, iff it exactly matches an indexed name
+    /// (always true for ava self-mapping). Returns `None` otherwise so callers
+    /// can fall back to a direct string comparison.
+    #[inline]
+    pub fn rank_of(&self, seqs: &[TargetSequence], qname: &str) -> Option<u32> {
+        self.order
+            .binary_search_by(|&idx| seqs[idx as usize].name.as_str().cmp(qname))
+            .ok()
+            .map(|pos| self.rank[self.order[pos] as usize])
+    }
 }
 
 /// nt4 encoding lookup: A→0, C→1, G→2, T→3, anything else (including N) →4.
@@ -137,6 +166,7 @@ impl IndexBuilder {
                 seqs: Vec::new(),
                 backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
                 packed_seqs: Vec::new(),
+                name_rank: Default::default(),
             },
             w, k, is_hpc, max_occ,
             bucket_bits,
@@ -234,6 +264,24 @@ impl IndexBuilder {
 }
 
 impl Index {
+    /// Dense lexicographic ranking of the target names, computed once on first use and cached
+    pub fn name_rank(&self) -> &NameRankData {
+        self.name_rank.get_or_init(|| {
+            let n = self.seqs.len();
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            order.sort_by(|&a, &b| self.seqs[a as usize].name.cmp(&self.seqs[b as usize].name));
+            let mut rank = vec![0u32; n];
+            let mut r = 0u32;
+            for i in 0..n {
+                if i > 0 && self.seqs[order[i] as usize].name != self.seqs[order[i - 1] as usize].name {
+                    r += 1;
+                }
+                rank[order[i] as usize] = r;
+            }
+            NameRankData { rank, order }
+        })
+    }
+
     /// Strip target sequences from index (for --idx-no-seq).
     /// Keeps all metadata (name, len, offset) but clears all sequence data.
     pub fn strip_sequences(&mut self) {
@@ -463,6 +511,7 @@ impl Index {
             seqs,
             backend,
             packed_seqs,
+            name_rank: Default::default(),
         };
 
         eprintln!("[*] Index loaded: {} seqs, {}M bases in {:.1}s",
@@ -482,6 +531,7 @@ impl Index {
             seqs,
             backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
+            name_rank: Default::default(),
         }
     }
 
@@ -494,6 +544,7 @@ impl Index {
             seqs: Vec::new(),
             backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
+            name_rank: Default::default(),
         }
     }
 
@@ -523,6 +574,7 @@ impl Index {
             seqs: Vec::new(),
             backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
             packed_seqs: Vec::new(),
+            name_rank: Default::default(),
         };
 
         let mut offset = 0usize;

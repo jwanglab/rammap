@@ -327,10 +327,24 @@ pub(crate) fn collect_seed_hits_with_occ(
     anchors.clear();
     let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch);
     anchors.reserve(n_a);
-    let matched_seeds = &scratch.matched_seeds;
 
     let seed_tandem: u64 = crate::align::sketch::SEED_TANDEM;
     let skip_flags = opt.flags & (AlignFlags::NO_DIAG | AlignFlags::NO_DUAL);
+    // Hoist loop-invariant flag checks out of the per-hit inner loop.
+    let f_no_diag = opt.flags.contains(AlignFlags::NO_DIAG);
+    let f_no_dual = opt.flags.contains(AlignFlags::NO_DUAL);
+    let f_qstrand = opt.flags.contains(AlignFlags::QSTRAND);
+    let do_skip = qname.is_some() && !skip_flags.is_empty();
+
+    // for ava self-skip (only): compare the query name to each target name by Vec<u32> lookup rather than strings - saves a lot of time
+    let (name_ranks, rank_q): (&[u32], Option<u32>) = if do_skip {
+        let nr = mi.name_rank();
+        (&nr.rank, nr.rank_of(&mi.seqs, qname.unwrap()))
+    } else {
+        (&[], None)
+    };
+
+    let matched_seeds = &scratch.matched_seeds;
 
     for (si, seed) in matched_seeds.iter().enumerate() {
         // Prefetch positions for the next seed
@@ -348,18 +362,30 @@ pub(crate) fn collect_seed_hits_with_occ(
             for &r_packed in hits {
                 // skip_seed logic
                 let mut is_self = false;
-                if let Some(qn) = qname && !skip_flags.is_empty() {
+                if do_skip {
                     let rid = (r_packed >> 32) as usize;
-                    let tname = &mi.seqs[rid].name;
-                    let tlen = mi.seqs[rid].len;
-                    let cmp = qn.cmp(tname.as_str());
-                    if opt.flags.contains(AlignFlags::NO_DIAG) && cmp == std::cmp::Ordering::Equal && tlen == qlen {
-                        let r_pos_raw = (r_packed as u32) >> 1;
-                        let q_pos_raw = (m.y as u32) >> 1;
-                        if r_pos_raw == q_pos_raw { continue; } // skip diagonal
-                        if (r_packed & 1) == (m.y & 1) { is_self = true; } // same strand
+                    if let Some(rq) = rank_q {
+                        // Fast path: name comparison by dense rank.
+                        let rt = name_ranks[rid];
+                        if f_no_diag && rq == rt && mi.seqs[rid].len == qlen {
+                            let r_pos_raw = (r_packed as u32) >> 1;
+                            let q_pos_raw = (m.y as u32) >> 1;
+                            if r_pos_raw == q_pos_raw { continue; } // skip diagonal
+                            if (r_packed & 1) == (m.y & 1) { is_self = true; } // same strand
+                        }
+                        if f_no_dual && rq > rt { continue; }
+                    } else {
+                        // Fallback: query name not indexed; compare strings.
+                        use std::cmp::Ordering::{Equal, Greater};
+                        let cmp = qname.unwrap().cmp(mi.seqs[rid].name.as_str());
+                        if f_no_diag && cmp == Equal && mi.seqs[rid].len == qlen {
+                            let r_pos_raw = (r_packed as u32) >> 1;
+                            let q_pos_raw = (m.y as u32) >> 1;
+                            if r_pos_raw == q_pos_raw { continue; } // skip diagonal
+                            if (r_packed & 1) == (m.y & 1) { is_self = true; } // same strand
+                        }
+                        if f_no_dual && cmp == Greater { continue; }
                     }
-                    if opt.flags.contains(AlignFlags::NO_DUAL) && cmp == std::cmp::Ordering::Greater { continue; }
                 }
 
                 let r_pos = (r_packed as u32) >> 1;
@@ -374,7 +400,7 @@ pub(crate) fn collect_seed_hits_with_occ(
                 if !is_rev {
                     x = (r_packed & 0xFFFFFFFF00000000) | (r_pos as u64);
                     y = (q_span as u64) << 32 | (q_pos_u32 as u64);
-                } else if opt.flags.contains(AlignFlags::QSTRAND) {
+                } else if f_qstrand {
                     // qstrand mode: keep query pos, reverse reference pos.
                     let rid = (r_packed >> 32) as usize;
                     let tlen = mi.seqs[rid].len as u64;
