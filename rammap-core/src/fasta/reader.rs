@@ -39,6 +39,7 @@ pub struct Reader<R> {
     record_type: Option<RecordType>, // Detected on first read
     buf: Vec<u8>,
     line_number: usize,
+    done: bool,
 }
 
 impl<R: BufRead> Reader<R> {
@@ -48,18 +49,22 @@ impl<R: BufRead> Reader<R> {
             record_type: None,
             buf: Vec::with_capacity(64 * 1024),
             line_number: 1,
+            done: false,
         }
     }
 
-    fn detect_format(&mut self) -> Result<RecordType, FastxError> {
+    /// `Ok(None)` = empty input (EOF before any byte): zero records
+    /// `Ok(Some(fmt))` = recognized
+    /// `Err(UnknownFormat)` only for non-empty, unrecognized input
+    fn detect_format(&mut self) -> Result<Option<RecordType>, FastxError> {
         let buffer = self.reader.fill_buf()?;
         if buffer.is_empty() {
-             return Err(FastxError::UnknownFormat);
+             return Ok(None);
         }
         if buffer[0] == b'>' {
-            Ok(RecordType::Fasta)
+            Ok(Some(RecordType::Fasta))
         } else if buffer[0] == b'@' {
-            Ok(RecordType::Fastq)
+            Ok(Some(RecordType::Fastq))
         } else {
             // maybe skip empty lines? For now strict.
             Err(FastxError::UnknownFormat)
@@ -72,7 +77,10 @@ impl<R: BufRead> Reader<R> {
         F: FnMut(RefRecord),
     {
         if self.record_type.is_none() {
-            self.record_type = Some(self.detect_format()?);
+            match self.detect_format()? {
+                Some(fmt) => self.record_type = Some(fmt),
+                None => return Ok(()), // empty input: nothing to do
+            }
         }
 
         match self.record_type.unwrap() {
@@ -98,9 +106,7 @@ impl<R: BufRead> Reader<R> {
             let n1 = self.reader.read_until(b'\n', &mut self.buf)?;
             if n1 == 0 { break; } // Normal EOF
             if self.buf[0] != b'@' {
-                // Determine if we should warn or error. 
-                // For robustness, maybe skip? But alignment needs correctness.
-                // strict for now but warn.
+                // we quietly skip malformed records...
                 // eprintln!("Warning: Line {} does not start with '@'. Skipping.", self.line_number);
                 self.line_number += 1;
                 continue;
@@ -243,25 +249,25 @@ impl<R: BufRead> Iterator for RecordIter<R> {
 
 impl<R: BufRead> Reader<R> {
      pub fn read_next(&mut self) -> Result<Option<Record>, FastxError> {
-        // State machine needed if we want to mix both styles, but generally 
-        // Iterator usage means "read one now".
-        // BUT we have internal state `buf` which `for_each` abuses.
-        // `for_each` implementation above is a loop.
-        
-        // We will implement `read_next` by copying the logic but stopping after one.
-        // BUT `parse_fasta` has state (stashed buffer). `parse_fastq` is easier.
-        // Actually, let's keep `buf` in struct.
-        // For mixed usage, `buf` might contain the next header line if Fasta.
-        // We need to store that state.
-        
-        if self.record_type.is_none() {
-            self.record_type = Some(self.detect_format()?);
+        if self.done {
+            return Ok(None);
         }
-        
-        match self.record_type.unwrap() {
+        if self.record_type.is_none() {
+            match self.detect_format() {
+                Ok(Some(fmt)) => self.record_type = Some(fmt),
+                Ok(None) => { self.done = true; return Ok(None); } // empty input: 0 records
+                Err(e) => { self.done = true; return Err(e); }     // report once, then done
+            }
+        }
+
+        let r = match self.record_type.unwrap() {
              RecordType::Fastq => self.read_next_fastq(),
              RecordType::Fasta => self.read_next_fasta(),
+        };
+        if r.is_err() {
+            self.done = true;
         }
+        r
     }
     
     fn read_next_fastq(&mut self) -> Result<Option<Record>, FastxError> {
@@ -507,7 +513,7 @@ mod tests {
         let cursor = Cursor::new(data);
         let mut reader = Reader::new(cursor);
         let format = reader.detect_format().unwrap();
-        assert_eq!(format, RecordType::Fasta);
+        assert_eq!(format, Some(RecordType::Fasta));
     }
 
     #[test]
@@ -516,7 +522,7 @@ mod tests {
         let cursor = Cursor::new(data);
         let mut reader = Reader::new(cursor);
         let format = reader.detect_format().unwrap();
-        assert_eq!(format, RecordType::Fastq);
+        assert_eq!(format, Some(RecordType::Fastq));
     }
 
     #[test]
@@ -579,5 +585,44 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, 1);
+    }
+
+    /// Empty input (e.g. an empty stdin query when only one positional is
+    /// given, as in `-x ava-ont reads.fq`) must yield ZERO records and
+    /// terminate cleanly — no error
+    #[test]
+    fn test_empty_input_is_clean_eof() {
+        let mut it = Reader::new(Cursor::new(b"" as &[u8])).records();
+        assert!(it.next().is_none(), "empty input must yield no records");
+        // And it must STAY terminated (fused), not resurrect an error.
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+    }
+
+    /// Non-empty but unrecognized input reports the error exactly ONCE
+    #[test]
+    fn test_bad_input_errors_once_then_fused() {
+        let mut it = Reader::new(Cursor::new(b"not a fastx file\nsecond line\n" as &[u8])).records();
+        assert!(matches!(it.next(), Some(Err(_))), "first read should surface the error");
+        for _ in 0..1000 {
+            assert!(it.next().is_none(), "iterator must not re-emit the error (no spin/spam)");
+        }
+    }
+
+    /// Simulate a log-and-continue consumer (like the CLI read loops) over bad
+    /// input: it must terminate with a bounded number of warnings, not forever
+    #[test]
+    fn test_consumer_loop_terminates_on_bad_input() {
+        let it = Reader::new(Cursor::new(b"garbage not fastx\n" as &[u8])).records();
+        let mut warnings = 0usize;
+        let mut records = 0usize;
+        for item in it {
+            match item {
+                Ok(_) => records += 1,
+                Err(_) => { warnings += 1; continue; } // mirrors the CLI's warn+continue
+            }
+        }
+        assert_eq!(records, 0);
+        assert!(warnings <= 1, "bad input should warn at most once, got {warnings}");
     }
 }
