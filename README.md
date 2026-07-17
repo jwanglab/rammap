@@ -44,7 +44,7 @@ compatible with [minimap2-rs](https://github.com/jguhlin/minimap2-rs).
 [dependencies]
 # The library is published as `rammap-core` but imported in code as `rammap`
 # (e.g. `use rammap::api::Aligner;`).
-rammap-core = { version = "1.1.0", default-features = false, features = ["parallel"] }
+rammap-core = { version = "1.1.2", default-features = false, features = ["parallel"] }
 ```
 
 Library features (on `rammap-core`): `parallel` (rayon-based threading), `wasm-threads`
