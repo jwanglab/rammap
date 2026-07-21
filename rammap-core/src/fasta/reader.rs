@@ -437,6 +437,28 @@ pub fn parse_fasta_bytes(data: &[u8]) -> io::Result<Vec<(String, Vec<u8>)>> {
         return Ok(sequences);
     }
 
+    // The streaming reader (Reader::detect_format) requires the first byte to be
+    // '>' before accepting input as FASTA. This mmap/batch path used to skip
+    // forward to the first '>' *anywhere* in the buffer instead of checking the
+    // first byte, which meant any non-FASTA binary file containing a stray 0x3E
+    // byte (near-guaranteed for any file of a few hundred bytes or more — e.g. a
+    // wrong path, a corrupted download, or an index file with an unrecognized
+    // extension that fell through the index/sequence-file dispatch) was silently
+    // "parsed" as one bogus sequence with binary garbage as its name, with no
+    // error at all. Enforce the same first-byte check here for consistency.
+    if data[0] != b'>' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "not a valid FASTA file: expected '>' as the first byte, found {:?}. \
+                 Check that the correct file was provided — this is not a FASTA/FASTQ \
+                 file, and if it's meant to be a pre-built index it may have an \
+                 unrecognized extension (expected .mmi/.idx/.rmmi).",
+                data[0] as char
+            ),
+        ));
+    }
+
     // Use memchr for fast newline scanning
     let mut pos = 0;
     let len = data.len();
