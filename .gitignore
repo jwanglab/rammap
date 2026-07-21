@@ -1,0 +1,19 @@
+# Rust build artifacts (workspace-wide; Cargo.lock IS committed — this is a binary crate)
+/target
+**/target
+
+# wasm-pack build output (generated at repo root by scripts/build-wasm, see docs/wasm.md)
+/pkg
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local cargo config overrides (keep the committed .cargo/config.toml, ignore personal overrides)
+.cargo/config.local.toml
