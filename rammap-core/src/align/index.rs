@@ -389,6 +389,27 @@ impl Index {
     /// .mmi format magic: "MMI..02"
     const MINIMAP2_INDEX_MAGIC: &'static [u8; 4] = b"MMI\x02";
 
+    /// Peek at a file's leading 4 bytes to detect a binary index (RMMI or minimap2
+    /// `.mmi`), independent of file extension. Callers deciding whether to load a
+    /// pre-built index or build a new one from a sequence file should not rely on
+    /// extension alone: a real minimap2/rammap index saved under a non-standard name
+    /// (e.g. `.mm2` instead of `.mmi`) is otherwise silently misread as sequence
+    /// input, producing a bogus index built from the raw index bytes with no error.
+    /// Returns false on any read error, or for the legacy no-magic bincode format
+    /// (which can't be distinguished from arbitrary binary data by sniffing alone —
+    /// that format still needs the extension-based check as a fallback).
+    pub fn sniff_is_index_file(path: &str) -> bool {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_err() {
+            return false;
+        }
+        &magic == RMMI_MAGIC || &magic == Self::MINIMAP2_INDEX_MAGIC
+    }
+
     /// Load the next index part from a reader. Returns None on EOF.
     /// Detects RMMI (bincode-serialized), MMI\2 (.mmi binary layout), or
     /// legacy no-magic bincode formats.

@@ -797,7 +797,12 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     // ─── Build index parts iterator ───
     // Each iteration yields one Index part. For small references or large batch_size,
     // this will be a single iteration (matching current behavior exactly).
-    let is_idx_file = target_path.ends_with(".mmi") || target_path.ends_with(".idx") || target_path.ends_with(".rmmi");
+    // Extension is just a naming convention and not always reliable (e.g. a real
+    // minimap2/rammap index saved under a non-standard name) — fall back to sniffing
+    // the file's magic bytes so a mis-named index isn't silently misread as sequence
+    // input to build a new (bogus) index from.
+    let is_idx_file = target_path.ends_with(".mmi") || target_path.ends_with(".idx") || target_path.ends_with(".rmmi")
+        || Index::sniff_is_index_file(target_path);
     let mut n_parts = 0usize;
     let mut sam_header_written = false;
     let split_prefix = cli.split_prefix.clone();
