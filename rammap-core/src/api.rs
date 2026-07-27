@@ -190,6 +190,199 @@ pub struct Aligner {
     junc_db: Option<JunctionDb>,
 }
 
+/// Largest supported k-mer size.
+pub const MAX_KMER: usize = 28;
+
+/// Recompute the [`MapOptions`] fields derived from the k-mer size of the index
+/// that will actually be used. Call after a preset and any overrides have been
+/// applied.
+pub fn finalize_options(opt: &mut MapOptions, k: usize) {
+    opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * k as f64) as f32;
+    opt.chaining.chn_pen_skip = (opt.filtering.chain_skip_scale as f64 * 0.01 * k as f64) as f32;
+}
+
+/// Calibrate `seeding.mid_occ` against the index, unless it has already been
+/// set explicitly (by a preset or by the caller).
+pub fn calibrate_mid_occ(opt: &mut MapOptions, mi: &Index, mid_occ_frac: f32) {
+    if opt.seeding.mid_occ == 0 {
+        opt.seeding.mid_occ =
+            mi.cal_mid_occ(mid_occ_frac, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
+    }
+}
+
+fn invalid(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// Builder for [`Aligner`], overriding preset defaults at construction time.
+///
+/// Only parameters consumed while the index is built or while the seed
+/// occurrence threshold is calibrated need to be set here. Anything else in
+/// [`MapOptions`] can be adjusted after construction via
+/// [`Aligner::options_mut`].
+///
+/// ```no_run
+/// use rammap::api::{Aligner, Preset};
+/// // Dense seeding for short, degraded cDNA reads: w = 1 indexes every k-mer,
+/// // at proportionally higher index memory cost.
+/// let aligner = Aligner::builder(Preset::MapOnt).k(12).w(1).from_fasta("cdna.fa")?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct AlignerBuilder {
+    preset: Preset,
+    k: Option<usize>,
+    w: Option<usize>,
+    hpc: Option<bool>,
+    index_max_occ: usize,
+    mid_occ: Option<usize>,
+    mid_occ_frac: f32,
+    min_mid_occ: Option<i32>,
+    max_mid_occ: Option<i32>,
+    cigar: bool,
+}
+
+impl AlignerBuilder {
+    fn new(preset: Preset) -> Self {
+        AlignerBuilder {
+            preset,
+            k: None,
+            w: None,
+            hpc: None,
+            index_max_occ: usize::MAX,
+            mid_occ: None,
+            mid_occ_frac: 2e-4,
+            min_mid_occ: None,
+            max_mid_occ: None,
+            cigar: true,
+        }
+    }
+
+    /// k-mer size, in `1..=`[`MAX_KMER`]. Also scales the chaining gap penalty.
+    pub fn k(mut self, k: usize) -> Self { self.k = Some(k); self }
+
+    /// Minimizer window size. `1` indexes every k-mer.
+    pub fn w(mut self, w: usize) -> Self { self.w = Some(w); self }
+
+    /// Homopolymer-compressed seeding.
+    pub fn hpc(mut self, hpc: bool) -> Self { self.hpc = Some(hpc); self }
+
+    /// Occurrence cap applied while building the index (default: uncapped).
+    pub fn index_max_occ(mut self, max_occ: usize) -> Self { self.index_max_occ = max_occ; self }
+
+    /// Seed occurrence threshold. Setting this skips calibration from the index.
+    pub fn mid_occ(mut self, mid_occ: usize) -> Self { self.mid_occ = Some(mid_occ); self }
+
+    /// Fraction of the most repetitive minimizers to filter when calibrating
+    /// `mid_occ` (default: 2e-4).
+    pub fn mid_occ_frac(mut self, frac: f32) -> Self { self.mid_occ_frac = frac; self }
+
+    /// Floor for the calibrated `mid_occ`.
+    pub fn min_mid_occ(mut self, min_mid_occ: i32) -> Self { self.min_mid_occ = Some(min_mid_occ); self }
+
+    /// Ceiling for the calibrated `mid_occ`.
+    pub fn max_mid_occ(mut self, max_mid_occ: i32) -> Self { self.max_mid_occ = Some(max_mid_occ); self }
+
+    /// Produce CIGAR strings (default: true).
+    pub fn cigar(mut self, cigar: bool) -> Self { self.cigar = cigar; self }
+
+    /// Build the index from a FASTA reference file.
+    pub fn from_fasta(self, path: &str) -> io::Result<Aligner> {
+        let (opt, k, w, hpc) = self.resolve()?;
+        let seqs = crate::fasta::read_fasta(path)?;
+        Ok(self.finish(opt, Index::build(seqs, w, k, hpc, self.index_max_occ)))
+    }
+
+    /// Build the index from in-memory `(name, sequence)` pairs.
+    pub fn from_seqs(self, seqs: Vec<(String, Vec<u8>)>) -> io::Result<Aligner> {
+        let (opt, k, w, hpc) = self.resolve()?;
+        Ok(self.finish(opt, Index::build(seqs, w, k, hpc, self.index_max_occ)))
+    }
+
+    /// Load a pre-built index file (rammap `RMMI`, minimap2 `.mmi`, or legacy
+    /// format; detected from the file's magic).
+    pub fn from_index(self, path: &str) -> io::Result<Aligner> {
+        let index = Index::load(path)?;
+        self.from_loaded_index(index)
+    }
+
+    /// Load a pre-built index from any seekable reader positioned at its start.
+    /// See [`Aligner::from_index_reader`].
+    pub fn from_index_reader<R: std::io::Read + std::io::Seek>(
+        self,
+        reader: &mut R,
+    ) -> io::Result<Aligner> {
+        let index = Index::load_part(reader)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty index"))?;
+        self.from_loaded_index(index)
+    }
+
+    /// Apply the preset to an already-loaded index. Its seeding geometry is
+    /// fixed, so any `k`, `w`, or `hpc` set here must agree with the stored values.
+    fn from_loaded_index(self, index: Index) -> io::Result<Aligner> {
+        let (opt, _, _, _) = self.resolve()?;
+        if let Some(k) = self.k && k != index.kmer_size {
+            return Err(invalid(format!("k={} does not match index k={}", k, index.kmer_size)));
+        }
+        if let Some(w) = self.w && w != index.window_size {
+            return Err(invalid(format!("w={} does not match index w={}", w, index.window_size)));
+        }
+        if let Some(hpc) = self.hpc && hpc != index.homopolymer_compressed {
+            return Err(invalid(format!(
+                "hpc={} does not match index hpc={}", hpc, index.homopolymer_compressed)));
+        }
+        Ok(self.finish(opt, index))
+    }
+
+    /// Preset plus overrides, before any index-derived values are filled in.
+    fn resolve(&self) -> io::Result<(MapOptions, usize, usize, bool)> {
+        let mut k = 15usize;
+        let mut w = 10usize;
+        let mut hpc = false;
+        let mut opt = MapOptions::default();
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut hpc, self.preset.as_str())
+            .expect("Preset enum variants are all recognized");
+        let k = self.k.unwrap_or(k);
+        let w = self.w.unwrap_or(w);
+        let hpc = self.hpc.unwrap_or(hpc);
+
+        if k == 0 || k > MAX_KMER {
+            return Err(invalid(format!("k must be in 1..={}, got {}", MAX_KMER, k)));
+        }
+        if w == 0 {
+            return Err(invalid("w must be at least 1".to_string()));
+        }
+        if !(0.0..1.0).contains(&self.mid_occ_frac) {
+            return Err(invalid(format!("mid_occ_frac must be in [0, 1), got {}", self.mid_occ_frac)));
+        }
+
+        if let Some(v) = self.mid_occ { opt.seeding.mid_occ = v; }
+        if let Some(v) = self.min_mid_occ { opt.seeding.min_mid_occ = v; }
+        if let Some(v) = self.max_mid_occ { opt.seeding.max_mid_occ = v; }
+        if opt.seeding.min_mid_occ > opt.seeding.max_mid_occ {
+            return Err(invalid(format!(
+                "min_mid_occ ({}) exceeds max_mid_occ ({})",
+                opt.seeding.min_mid_occ, opt.seeding.max_mid_occ)));
+        }
+        Ok((opt, k, w, hpc))
+    }
+
+    fn finish(&self, mut opt: MapOptions, index: Index) -> Aligner {
+        finalize_options(&mut opt, index.kmer_size);
+        calibrate_mid_occ(&mut opt, &index, self.mid_occ_frac);
+        if self.cigar {
+            opt.flags.insert(AlignFlags::OUT_CIGAR);
+        } else {
+            opt.flags.remove(AlignFlags::OUT_CIGAR);
+        }
+        let out_cfg = OutputConfig {
+            do_cigar: self.cigar, do_cs: false, cs_long: false, do_md: false, do_ds: false,
+            eqx: false, output_sam: false, rg_id: None, split_mode: false,
+        };
+        Aligner { index, options: opt, out_cfg, junc_db: None }
+    }
+}
+
 impl Aligner {
     // --- Preset convenience methods (minimap2-rs compatibility) ---
 
@@ -228,26 +421,21 @@ impl Aligner {
 
     // --- Constructors ---
 
-    /// Build an aligner from an already-loaded [`Index`], applying the preset
-    /// options and calibrating the seed-occurrence threshold from the index.
-    /// Shared by [`Aligner::from_index`] and [`Aligner::from_index_reader`].
-    fn from_loaded_index(index: Index, preset: Preset) -> Self {
-        let (mut options, out_cfg) = build_options(preset, index.kmer_size, index.window_size);
-        // Calibrate the seed occurrence threshold using the loaded index — matches
-        // what from_fasta/from_seqs do. Without this, mid_occ stays at its default
-        // (unset) and all seeds are rejected, producing zero alignments.
-        options.seeding.mid_occ = index.cal_mid_occ(
-            2e-4,
-            options.seeding.min_mid_occ,
-            options.seeding.max_mid_occ,
-        );
-        Aligner { index, options, out_cfg, junc_db: None }
+    /// Start a builder for overriding the preset's seeding parameters.
+    ///
+    /// ```no_run
+    /// use rammap::api::{Aligner, Preset};
+    /// let aligner = Aligner::builder(Preset::MapOnt).k(12).w(1).from_fasta("ref.fa")?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn builder(preset: Preset) -> AlignerBuilder {
+        AlignerBuilder::new(preset)
     }
 
     /// Load an aligner from a pre-built index file (rammap `RMMI`, minimap2
     /// `.mmi`, or legacy format; the format is detected from the file's magic).
     pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
-        Ok(Self::from_loaded_index(Index::load(path)?, preset))
+        Aligner::builder(preset).from_index(path)
     }
 
     /// Load an aligner from any seekable reader positioned at the start of a
@@ -261,27 +449,12 @@ impl Aligner {
         reader: &mut R,
         preset: Preset,
     ) -> io::Result<Self> {
-        let index = Index::load_part(reader)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty index"))?;
-        Ok(Self::from_loaded_index(index, preset))
+        Aligner::builder(preset).from_index_reader(reader)
     }
 
     /// Build an aligner from a FASTA reference file.
     pub fn from_fasta(path: &str, preset: Preset) -> io::Result<Self> {
-        let mut k = 15usize;
-        let mut w = 10usize;
-        let mut is_hpc = false;
-        let mut opt = MapOptions::default();
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
-
-        let seqs = crate::fasta::read_fasta(path)?;
-        let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
-        let out_cfg = OutputConfig {
-            do_cigar: true, do_cs: false, cs_long: false, do_md: false, do_ds: false,
-            eqx: false, output_sam: false, rg_id: None, split_mode: false,
-        };
-        opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
-        Ok(Aligner { index, options: opt, out_cfg, junc_db: None })
+        Aligner::builder(preset).from_fasta(path)
     }
 
     /// Build an aligner from in-memory sequences (name, sequence pairs).
@@ -295,20 +468,9 @@ impl Aligner {
     /// let aligner = Aligner::from_seqs(seqs, Preset::MapOnt);
     /// ```
     pub fn from_seqs(seqs: Vec<(String, Vec<u8>)>, preset: Preset) -> Self {
-        let mut k = 15usize;
-        let mut w = 10usize;
-        let mut is_hpc = false;
-        let mut opt = MapOptions::default();
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
-        opt.flags.insert(AlignFlags::OUT_CIGAR);
-
-        let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
-        opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
-        let out_cfg = OutputConfig {
-            do_cigar: true, do_cs: false, cs_long: false, do_md: false, do_ds: false,
-            eqx: false, output_sam: false, rg_id: None, split_mode: false,
-        };
-        Aligner { index, options: opt, out_cfg, junc_db: None }
+        Aligner::builder(preset)
+            .from_seqs(seqs)
+            .expect("Preset defaults are always valid")
     }
 
     // --- Mapping ---
@@ -451,27 +613,6 @@ impl Aligner {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-fn build_options(preset: Preset, index_k: usize, index_w: usize) -> (MapOptions, OutputConfig) {
-    let mut k = index_k;
-    let mut w = index_w;
-    let mut is_hpc = false;
-    let mut opt = MapOptions::default();
-    apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str()).expect("Preset enum variants are all recognized");
-
-    let out_cfg = OutputConfig {
-        do_cigar: true,
-        do_cs: false,
-        cs_long: false,
-        do_md: false,
-        do_ds: false,
-        eqx: false,
-        output_sam: false,
-        rg_id: None,
-        split_mode: false,
-    };
-    (opt, out_cfg)
-}
 
 fn to_map_result(
     pq: &pipeline::ProcessedQuery,
@@ -753,8 +894,7 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             return Err(format!("unrecognized preset '{}'", preset));
         }
     }
-    opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * (*k as f64)) as f32;
-    opt.chaining.chn_pen_skip = 0.0;
+    finalize_options(opt, *k);
     Ok(())
 }
 
@@ -1082,6 +1222,124 @@ fn cigar_bounds(cigar: &[u32]) -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small reference with enough distinct k-mers to build a usable index.
+    fn test_seqs() -> Vec<(String, Vec<u8>)> {
+        let bases = b"ACGTTGCAAGGCTTAACCGGATCGATCGGATTACAGGCCTTAACGTATCG";
+        let seq: Vec<u8> = (0..4000).map(|i| bases[i % bases.len()]).collect();
+        vec![("chr1".to_string(), seq)]
+    }
+
+    /// chain_gap_scale * 0.01 * k, with chain_gap_scale at its 0.8 default.
+    /// Widened from f32 exactly as `finalize_options` does.
+    fn expected_chn_pen_gap(k: usize) -> f32 {
+        (0.8f32 as f64 * 0.01 * k as f64) as f32
+    }
+
+    #[test]
+    fn test_builder_k_override_rescales_chn_pen_gap() {
+        let a = Aligner::builder(Preset::MapOnt).k(12).w(1).from_seqs(test_seqs()).unwrap();
+        assert_eq!(a.index().kmer_size, 12);
+        assert_eq!(a.index().window_size, 1);
+        assert_eq!(a.options().chaining.chn_pen_gap, expected_chn_pen_gap(12));
+
+        let b = Aligner::builder(Preset::Sr).k(15).from_seqs(test_seqs()).unwrap();
+        assert_eq!(b.options().chaining.chn_pen_gap, expected_chn_pen_gap(15));
+    }
+
+    #[test]
+    fn test_from_index_derives_chn_pen_gap_from_index_k() {
+        let path = std::env::temp_dir().join("rammap_api_from_index_k25.rmmi");
+        let p = path.to_str().unwrap();
+        Aligner::builder(Preset::MapOnt).k(25).w(20).from_seqs(test_seqs()).unwrap()
+            .save_index(p).unwrap();
+
+        let a = Aligner::from_index(p, Preset::MapOnt).unwrap();
+        assert_eq!(a.index().kmer_size, 25);
+        assert_eq!(a.options().chaining.chn_pen_gap, expected_chn_pen_gap(25));
+
+        // Geometry of a pre-built index is fixed; a conflicting override is an error.
+        assert!(Aligner::builder(Preset::MapOnt).k(15).from_index(p).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(25).w(20).from_index(p).is_ok());
+
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_mid_occ_only_calibrated_when_unset() {
+        // sr sets mid_occ = 1000 explicitly.
+        let sr = Aligner::from_seqs(test_seqs(), Preset::Sr);
+        assert_eq!(sr.options().seeding.mid_occ, 1000);
+
+        // map-ont leaves it at 0, so it is calibrated from the index.
+        let ont = Aligner::from_seqs(test_seqs(), Preset::MapOnt);
+        assert!(ont.options().seeding.mid_occ > 0);
+
+        let explicit = Aligner::builder(Preset::MapOnt).mid_occ(77).from_seqs(test_seqs()).unwrap();
+        assert_eq!(explicit.options().seeding.mid_occ, 77);
+    }
+
+    #[test]
+    fn test_out_cigar_flag_matches_output_config() {
+        for a in [
+            Aligner::from_seqs(test_seqs(), Preset::MapOnt),
+            Aligner::builder(Preset::MapOnt).cigar(true).from_seqs(test_seqs()).unwrap(),
+        ] {
+            assert!(a.options().flags.contains(AlignFlags::OUT_CIGAR));
+        }
+        let off = Aligner::builder(Preset::MapOnt).cigar(false).from_seqs(test_seqs()).unwrap();
+        assert!(!off.options().flags.contains(AlignFlags::OUT_CIGAR));
+    }
+
+    #[test]
+    fn test_builder_rejects_invalid_params() {
+        assert!(Aligner::builder(Preset::MapOnt).k(0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(MAX_KMER + 1).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).w(0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).mid_occ_frac(1.0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).min_mid_occ(100).max_mid_occ(10)
+            .from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(MAX_KMER).from_seqs(test_seqs()).is_ok());
+    }
+
+    /// A homopolymer-compressed seed can span more query bases than target
+    /// bases. Matched at the start of the target, the chain start computation
+    /// goes below zero and must clamp rather than wrap.
+    #[test]
+    fn test_hpc_chain_start_clamps_at_target_start() {
+        // Both sequences compress to the same k-mers, but every run in the
+        // query is three bases long, so its seeds span 3x the target's.
+        let mut x = 12345u64;
+        let mut tseq: Vec<u8> = Vec::new();
+        while tseq.len() < 2000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = b"ACGT"[(x >> 33) as usize % 4];
+            if tseq.last() != Some(&b) { tseq.push(b); }
+        }
+        let qseq: Vec<u8> = tseq.iter().flat_map(|&b| [b; 3]).collect();
+
+        let aligner = Aligner::builder(Preset::MapPb)
+            .hpc(true)
+            .cigar(false)
+            .from_seqs(vec![("target".to_string(), tseq.clone())])
+            .unwrap();
+        let res = aligner.map_seq("query", &qseq);
+        assert!(!res.mappings.is_empty(), "expected at least one mapping");
+        for m in &res.mappings {
+            assert!(m.target_start <= m.target_end,
+                "target_start {} exceeds target_end {} (underflow)", m.target_start, m.target_end);
+            assert!(m.target_end <= tseq.len(),
+                "target_end {} exceeds target length {}", m.target_end, tseq.len());
+        }
+    }
+
+    #[test]
+    fn test_builder_hpc_override() {
+        let a = Aligner::builder(Preset::MapOnt).hpc(true).from_seqs(test_seqs()).unwrap();
+        assert!(a.index().homopolymer_compressed);
+        let b = Aligner::builder(Preset::MapPb).hpc(false).from_seqs(test_seqs()).unwrap();
+        assert!(!b.index().homopolymer_compressed);
+    }
 
     #[test]
     fn test_from_index_reader_bounded_and_trailing() {

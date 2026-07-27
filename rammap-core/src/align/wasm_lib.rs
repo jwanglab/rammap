@@ -52,19 +52,44 @@ pub fn _set_panic_hook() {
     });
 }
 
-/// Apply a named preset to MapOptions + k/w/is_hpc.
+/// Fraction of the most repetitive minimizers to filter when calibrating the
+/// seed occurrence threshold.
+const MID_OCC_FRAC: f32 = 2e-4;
+
+/// Occurrence cap applied during index construction, bounding WASM linear
+/// memory on highly repetitive references.
+const INDEX_MAX_OCC: usize = 50_000;
+
+/// Apply a named preset to MapOptions + k/w/is_hpc, returning the preset that
+/// was actually applied.
 ///
 /// Delegates to the canonical native preset table (`api::apply_preset_str`) so
 /// the wasm build supports the exact same preset set as the CLI and library —
 /// including the HPC presets (`map-pb`/`ava-pb`) and every alias. An
 /// unrecognized name resets and falls back to `map-ont`, so the wasm entry
 /// points never fail on a bad preset string.
-fn apply_preset_wasm(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) {
-    if crate::api::apply_preset_str(opt, k, w, is_hpc, preset).is_err() {
-        *opt = MapOptions::default();
-        *is_hpc = false;
-        let _ = crate::api::apply_preset_str(opt, k, w, is_hpc, "map-ont");
+fn apply_preset_wasm<'a>(
+    opt: &mut MapOptions,
+    k: &mut usize,
+    w: &mut usize,
+    is_hpc: &mut bool,
+    preset: &'a str,
+) -> &'a str {
+    if crate::api::apply_preset_str(opt, k, w, is_hpc, preset).is_ok() {
+        return preset;
     }
+    // A rejected preset may have left `opt` partly modified.
+    *opt = MapOptions::default();
+    *k = 15; *w = 10; *is_hpc = false;
+    crate::api::apply_preset_str(opt, k, w, is_hpc, "map-ont")
+        .expect("map-ont is a valid preset");
+    "map-ont"
+}
+
+/// Fill in the option values derived from the built index.
+fn finalize_for_index(opt: &mut MapOptions, idx: &Index) {
+    crate::api::finalize_options(opt, idx.kmer_size);
+    crate::api::calibrate_mid_occ(opt, idx, MID_OCC_FRAC);
 }
 
 /// Parse FASTA or FASTQ text, returning (name, sequence) pairs.
@@ -130,11 +155,11 @@ pub fn align_wasm_full(
     let mut w = 10usize;
     let mut is_hpc = false;
     let mut opt = MapOptions::default();
-    apply_preset_wasm(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
+    let preset = apply_preset_wasm(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
     if output_cigar || output_sam {
         opt.flags.insert(AlignFlags::OUT_CIGAR);
     }
-    emit_log!("[*] Preset: {} (k={}, w={})", preset, k, w);
+    emit_log!("[*] Preset: {} (k={}, w={}, hpc={})", preset, k, w, is_hpc as u8);
 
     // Parse reference
     let target_seqs: Vec<(String, Vec<u8>)> = parse_sequences(target_text)
@@ -150,8 +175,8 @@ pub fn align_wasm_full(
 
     // Build index
     let t0 = web_time::Instant::now();
-    let idx = Index::build(target_seqs, w, k, is_hpc, 50000);
-    opt.seeding.mid_occ = idx.cal_mid_occ(2e-4, 10, 10000);
+    let idx = Index::build(target_seqs, w, k, is_hpc, INDEX_MAX_OCC);
+    finalize_for_index(&mut opt, &idx);
     emit_log!("[*] Index built in {:.3}s (mid_occ={})", t0.elapsed().as_secs_f64(), opt.seeding.mid_occ);
 
     // Parse queries
@@ -406,7 +431,7 @@ impl AlignSession {
         let mut w = 10usize;
         let mut is_hpc = false;
         let mut opt = MapOptions::default();
-        apply_preset_wasm(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
+        let preset = apply_preset_wasm(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
         if output_cigar || output_sam {
             opt.flags.insert(AlignFlags::OUT_CIGAR);
         }
@@ -422,7 +447,7 @@ impl AlignSession {
             split_mode: false,
         };
         let mut log_buf = String::new();
-        log_buf.push_str(&format!("[*] Preset: {} (k={}, w={})\n", preset, k, w));
+        log_buf.push_str(&format!("[*] Preset: {} (k={}, w={}, hpc={})\n", preset, k, w, is_hpc as u8));
 
         Self {
             preset: preset.to_string(),
@@ -432,7 +457,7 @@ impl AlignSession {
             out_cfg,
             k, w, is_hpc,
             log_buf,
-            builder: Some(IndexBuilder::new(w, k, is_hpc, 50000)),
+            builder: Some(IndexBuilder::new(w, k, is_hpc, INDEX_MAX_OCC)),
             ref_parser: Some(FastaStreamer::new()),
             t_ref_start: Some(web_time::Instant::now()),
             idx: None,
@@ -493,7 +518,7 @@ impl AlignSession {
             "[*] Reference: {} sequence(s), {} bases\n", n_seqs, total_bases));
 
         let idx = builder.finish();
-        self.opt.seeding.mid_occ = idx.cal_mid_occ(2e-4, 10, 10000);
+        finalize_for_index(&mut self.opt, &idx);
         self.log_buf.push_str(&format!(
             "[*] Index built in {:.3}s (mid_occ={})\n",
             t0.elapsed().as_secs_f64(), self.opt.seeding.mid_occ));

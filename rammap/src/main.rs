@@ -717,12 +717,11 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Recompute chaining penalties after all CLI overrides
-    opt.chaining.chn_pen_gap = (opt.chaining.chain_gap_scale as f64 * 0.01 * (k as f64)) as f32;
     if let Some(v) = cli.chain_skip_scale {
         opt.filtering.chain_skip_scale = v;
     }
-    opt.chaining.chn_pen_skip = opt.filtering.chain_skip_scale * opt.scoring.match_score as f32 * 0.01;
+    // Recompute chaining penalties after all CLI overrides
+    rammap::api::finalize_options(&mut opt, k);
 
     let target_path = &cli.target;
     let batch_size: u64 = cli.batch_size.as_ref()
