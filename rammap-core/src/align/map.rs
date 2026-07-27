@@ -784,6 +784,51 @@ pub struct SegResult {
     pub anchors: Vec<Minimizer>,
 }
 
+/// A chain's span on the target and query, plus the hash identifying it.
+struct ChainCoords {
+    rid: usize,
+    rev: bool,
+    rs: usize,
+    re: usize,
+    qs: usize,
+    qe: usize,
+    hash: u32,
+}
+
+/// Derive a chain's coordinates and identity hash from its anchors, which must
+/// be exactly the chain's own (the hash mixes in their count). `qlen` flips
+/// reverse-strand chains into query orientation (the segment sum for
+/// multi-segment reads); `is_qstrand` keeps them in chain orientation instead.
+fn chain_coords(
+    anchors: &[Minimizer],
+    qlen: usize,
+    is_qstrand: bool,
+    read_hash: u32,
+) -> ChainCoords {
+    let first = &anchors[0];
+    let last = &anchors[anchors.len() - 1];
+    let span = first.query_span() as usize;
+    let rev = (first.x >> 63) == 1;
+    // A seed's span is measured on the query; under homopolymer compression the
+    // same seed can cover fewer target bases, placing the target start before
+    // the sequence begins. The query start needs no such guard.
+    let rs = ((first.ref_pos() as usize) + 1).saturating_sub(span);
+    let re = (last.ref_pos() as usize) + 1;
+    let qs_fwd = (first.query_pos() as usize) + 1 - span;
+    let qe_fwd = (last.query_pos() as usize) + 1;
+    let (qs, qe) = if !rev || is_qstrand {
+        (qs_fwd, qe_fwd)
+    } else {
+        (qlen.saturating_sub(qe_fwd), qlen.saturating_sub(qs_fwd))
+    };
+    let h = hash64(hash64(first.x).wrapping_add(hash64(first.y)) ^ (read_hash as u64)) as u32;
+    ChainCoords {
+        rid: first.ref_id(),
+        rev, rs, re, qs, qe,
+        hash: (anchors.len() as u32) ^ h,
+    }
+}
+
 /// Split combined-query chains into per-segment registrations.
 /// Split multi-segment chains into per-segment sub-chains.
 fn split_chains_into_segments(
@@ -871,30 +916,8 @@ fn split_chains_into_segments(
             if cnt == 0 { continue; }
 
             let chain_a = a[k_offset..k_offset + cnt as usize].to_vec();
-            let first = &chain_a[0];
-            let last = &chain_a[cnt as usize - 1];
-
-            let rid = first.ref_id();
-            let rev = (first.x >> 63) == 1;
-
-            let first_r_end = first.ref_pos() as usize;
-            let first_span = first.query_span() as usize;
-            let rs = first_r_end + 1 - first_span;
-            let last_r_end = last.ref_pos() as usize;
-            let re = last_r_end + 1;
-
-            let first_q_end = first.query_pos() as usize;
-            let last_q_end = last.query_pos() as usize;
-            let (qs, qe) = if !rev || is_qstrand {
-                (first_q_end + 1 - first_span, last_q_end + 1)
-            } else {
-                let qs_rev = first_q_end + 1 - first_span;
-                let qe_rev = last_q_end + 1;
-                (qlen_s.saturating_sub(qe_rev), qlen_s.saturating_sub(qs_rev))
-            };
-
-            let h = hash64(hash64(first.x).wrapping_add(hash64(first.y)) ^ (read_hash as u64)) as u32;
-            let chain_hash = (cnt as u32) ^ h;
+            let ChainCoords { rid, rev, rs, re, qs, qe, hash: chain_hash } =
+                chain_coords(&chain_a, qlen_s, is_qstrand, read_hash);
 
             let tlen = if rid < mi.seqs.len() { mi.seqs[rid].len as i32 } else { 0 };
             regs_s.push(Mapping {
@@ -1103,30 +1126,8 @@ pub fn map_query_multi(
         if cnt == 0 { continue; }
 
         let chain_a = chains[k_offset..k_offset + cnt as usize].to_vec();
-        let first = &chain_a[0];
-        let last = &chain_a[cnt as usize - 1];
-
-        let rid = first.ref_id();
-        let rev = (first.x >> 63) == 1;
-
-        let first_r_end = first.ref_pos() as usize;
-        let first_span = first.query_span() as usize;
-        let rs = first_r_end + 1 - first_span;
-        let last_r_end = last.ref_pos() as usize;
-        let re = last_r_end + 1;
-
-        let first_q_end = first.query_pos() as usize;
-        let last_q_end = last.query_pos() as usize;
-        let (qs, qe) = if !rev || is_qstrand {
-            (first_q_end + 1 - first_span, last_q_end + 1)
-        } else {
-            let qs_rev = first_q_end + 1 - first_span;
-            let qe_rev = last_q_end + 1;
-            (qlen_sum.saturating_sub(qe_rev), qlen_sum.saturating_sub(qs_rev))
-        };
-
-        let h = hash64(hash64(first.x).wrapping_add(hash64(first.y)) ^ (read_hash as u64)) as u32;
-        let chain_hash = (cnt as u32) ^ h;
+        let ChainCoords { rid, rev, rs, re, qs, qe, hash: chain_hash } =
+            chain_coords(&chain_a, qlen_sum, is_qstrand, read_hash);
 
         let tlen = if rid < mi.seqs.len() { mi.seqs[rid].len as i32 } else { 0 };
         regs0.push(Mapping {
@@ -1432,37 +1433,9 @@ pub fn map_query(
         // Collect chain anchors
         let chain_anchors_vec = chains[k_offset..k_offset + cnt as usize].to_vec();
 
-        let first_anchor = &chain_anchors_vec[0];
-        let last_anchor = &chain_anchors_vec[cnt as usize - 1];
-        
-        let rid = first_anchor.ref_id();
-        let rev = (first_anchor.x >> 63) == 1;
-
-        let first_r_end = first_anchor.ref_pos() as usize;
-        let first_span = first_anchor.query_span() as usize;
-
-        let rs = first_r_end + 1 - first_span;
-        let last_r_end = last_anchor.ref_pos() as usize;
-        let re = last_r_end + 1;
-
-        let first_q_end = first_anchor.query_pos() as usize;
-        let last_q_end = last_anchor.query_pos() as usize;
-        
         let is_qstrand = opt.flags.contains(AlignFlags::QSTRAND);
-        let (qs, qe) = if !rev || is_qstrand {
-            (first_q_end + 1 - first_span, last_q_end + 1)
-        } else {
-            let qlen = qseq.len();
-            let qs_rev = first_q_end + 1 - first_span;
-            let qe_rev = last_q_end + 1;
-            (qlen.saturating_sub(qe_rev), qlen.saturating_sub(qs_rev))
-        };
-
-        // Compute per-chain hash
-        // h = (uint32_t)hash64((hash64(a[k].x) + hash64(a[k].y)) ^ hash)
-        // r->hash = (uint32_t)(u[i] ^ h) = cnt ^ h
-        let h = hash64(hash64(first_anchor.x).wrapping_add(hash64(first_anchor.y)) ^ (read_hash as u64)) as u32;
-        let chain_hash = (cnt as u32) ^ h;
+        let ChainCoords { rid, rev, rs, re, qs, qe, hash: chain_hash } =
+            chain_coords(&chain_anchors_vec, qseq.len(), is_qstrand, read_hash);
 
         regs.push(Mapping {
             ref_id: rid,
