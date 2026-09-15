@@ -148,11 +148,11 @@ pub fn encode_base(b: u8) -> u8 {
 pub fn kmer_hash(mut bits: u64, mask: u64) -> u64 {
   bits = (!bits).wrapping_add(bits << 21) & mask; // bits = (bits << 21) - bits - 1;
   bits = bits ^ (bits >> 24);
-  bits = ((bits + (bits << 3)).wrapping_add(bits << 8)) & mask; // bits * 265
+  bits = (bits.wrapping_add(bits << 3)).wrapping_add(bits << 8) & mask; // bits * 265
   bits = bits ^ (bits >> 14);
-  bits = ((bits + (bits << 2)).wrapping_add(bits << 4)) & mask; // bits * 21
+  bits = (bits.wrapping_add(bits << 2)).wrapping_add(bits << 4) & mask; // bits * 21
   bits = bits ^ (bits >> 28);
-  (bits + (bits << 31)) & mask
+  bits.wrapping_add(bits << 31) & mask
 }
 
 /// Standard (w,k)-minimizer sketcher. Wraps [`sketch_sequence`] to implement
@@ -327,6 +327,21 @@ mod tests {
         let mut mins = Vec::new();
         sketch_sequence(seq.as_bytes(), seq.len(), 10, 15, 0, false, &mut mins);
         assert_eq!(mins.len(), 0);
+    }
+
+    /// The hash wraps by design. These k-mers make an intermediate exceed
+    /// u64, which panics in overflow-checked builds unless every step wraps.
+    #[test]
+    fn test_kmer_hash_wraps_instead_of_overflowing() {
+        assert_eq!(kmer_hash(5210431, (1 << 42) - 1), 401579441571); // k=21
+        assert_eq!(kmer_hash(68568, (1 << 56) - 1), 636782588647065); // k=28
+        // Every k-mer for the largest supported k must be hashable.
+        for k in [15usize, 17, 19, 21, 25, 28] {
+            let mask = (1u64 << (2 * k)) - 1;
+            for b in 0..200_000u64 {
+                let _ = kmer_hash(b, mask);
+            }
+        }
     }
 
 }
