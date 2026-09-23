@@ -159,6 +159,13 @@ pub struct Mapping {
     pub score: i32,
     /// Sequence divergence (0.0 = identical).
     pub divergence: f64,
+    /// The `SA:Z:...` tag value listing every other non-secondary mapping from the same
+    /// alignment call, or `None` if there are none (a non-chimeric read, or this mapping is
+    /// itself secondary). Each sibling's CIGAR here is a lossy single-block approximation
+    /// (matching minimap2's own SA-tag formatting exactly) -- not a copy of that sibling's own
+    /// printed CIGAR -- see [`crate::align::pipeline::build_sa_tag`] for the exact formula.
+    /// Always `None` on the paired-end/PAF path (no sibling data available there).
+    pub sa_tag: Option<String>,
 }
 
 /// Result of aligning one read (or read pair).
@@ -489,7 +496,7 @@ impl Aligner {
             &self.options, &self.index, name, seq,
             &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
-        to_map_result(&pq, &self.index, &out)
+        to_map_result(&pq, &self.index, &out, seq.len())
     }
 
     /// Align a paired-end read pair against the reference.
@@ -618,11 +625,12 @@ fn to_map_result(
     pq: &pipeline::ProcessedQuery,
     mi: &Index,
     out: &OutputConfig,
+    qlen: usize,
 ) -> MapResult {
     // Cache Arc<str> per target to avoid cloning the name for each alignment
     let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
 
-    let mappings = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).enumerate().map(|(idx, (r, &mapq))| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
         let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
         let trans_strand = match r.trans_strand {
@@ -656,6 +664,7 @@ fn to_map_result(
             md: if out.do_md && !r.md_str.is_empty() { Some(r.md_str.clone()) } else { None },
             score: r.align_score,
             divergence: r.divergence,
+            sa_tag: pipeline::build_sa_tag(idx, &pq.results, &pq.mapqs, mi, qlen),
         }
     }).collect();
     MapResult { mappings }
@@ -733,6 +742,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
             is_spliced, trans_strand: None,
             matches, block_len,
             edit_distance, cigar, cigar_ops, cs, md, score, divergence,
+            sa_tag: None,
         });
     }
     MapResult { mappings }
@@ -1614,5 +1624,54 @@ mod tests {
     fn test_encode_nt4() {
         let encoded = encode_nt4(b"ACGTNacgtn");
         assert_eq!(encoded, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+    }
+
+    /// Deterministic pseudo-random ACGT sequence, no homopolymer runs (LCG).
+    fn random_seq(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed;
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < len {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = b"ACGT"[(x >> 33) as usize % 4];
+            if seq.last() != Some(&b) { seq.push(b); }
+        }
+        seq
+    }
+
+    /// A read whose two halves independently chain to two different, unrelated contigs gets a
+    /// correct `sa_tag` on each non-secondary mapping, referencing the other by
+    /// rname/pos/strand/mapq/NM -- using `build_sa_tag`'s single-block CIGAR approximation, not
+    /// a copy of the sibling's own printed CIGAR.
+    #[test]
+    fn test_independent_chimeric_read_sa_tag() {
+        let contig_a = random_seq(11, 1000);
+        let contig_b = random_seq(22, 1000);
+        let seqs = vec![
+            ("contigA".to_string(), contig_a.clone()),
+            ("contigB".to_string(), contig_b.clone()),
+        ];
+        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci, not a
+        // continuous chain that could z-drop-split into these same two pieces.
+        let mut query = contig_a[600..1000].to_vec();
+        query.extend_from_slice(&contig_b[0..400]);
+
+        let aligner = Aligner::builder(Preset::MapOnt)
+            .from_seqs(seqs)
+            .unwrap();
+        let result = aligner.map_seq("chimeric_query", &query);
+
+        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
+        assert_eq!(
+            non_secondary.len(), 2,
+            "expected exactly 2 non-secondary mappings (one per locus), got {}: {:?}",
+            non_secondary.len(), result.mappings,
+        );
+
+        let sa0 = non_secondary[0].sa_tag.as_ref().expect("mapping 0 should have an SA tag");
+        let sa1 = non_secondary[1].sa_tag.as_ref().expect("mapping 1 should have an SA tag");
+
+        // Each SA tag references the OTHER mapping's own rname/pos/strand/mapq/NM.
+        assert!(sa0.starts_with(&format!("{},{},", non_secondary[1].target_name, non_secondary[1].target_start + 1)));
+        assert!(sa1.starts_with(&format!("{},{},", non_secondary[0].target_name, non_secondary[0].target_start + 1)));
     }
 }
