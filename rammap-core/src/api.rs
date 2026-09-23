@@ -135,8 +135,19 @@ pub struct Mapping {
     pub mapq: i32,
     /// Whether this is a primary alignment.
     pub is_primary: bool,
-    /// Whether this is a supplementary alignment.
+    /// Whether this mapping would receive SAM FLAG 0x800 (supplementary) if written out.
+    /// `false` for secondary mappings (`!is_primary`) and for the first non-secondary mapping
+    /// of a read (which is SAM-primary, FLAG 0); `true` for every subsequent non-secondary
+    /// mapping. This is the real primary/supplementary determination minimap2 and rammap's own
+    /// SAM writer use (`align/pipeline.rs`'s `sam_pri`).
     pub is_supplementary: bool,
+    /// Whether this mapping was rescued by a z-drop chain split (`split != 0`): the alignment
+    /// score collapsed mid-extension, so the aligner split the chain and re-seeded the
+    /// leftover query for this mapping separately. Independent of SAM FLAG assignment — a
+    /// chimeric read whose segments were found by independent chaining from the start (never
+    /// one continuous chain) is not z-drop-rescued on either side, yet can still be
+    /// SAM-supplementary on one of them; see [`Mapping::is_supplementary`] for that.
+    pub is_zdrop_rescued: bool,
     /// Whether this alignment contains splice junctions (N_SKIP operations).
     pub is_spliced: bool,
     /// Transcript strand for splice alignments: None=unknown, Some(Forward)=+, Some(Reverse)=-.
@@ -622,7 +633,7 @@ fn to_map_result(
     // Cache Arc<str> per target to avoid cloning the name for each alignment
     let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
 
-    let mappings = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).zip(pq.sam_pri.iter()).map(|((r, &mapq), &sam_pri_i)| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
         let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
         let trans_strand = match r.trans_strand {
@@ -644,7 +655,8 @@ fn to_map_result(
             strand: if r.is_reverse { Strand::Reverse } else { Strand::Forward },
             mapq,
             is_primary: !r.is_secondary,
-            is_supplementary: r.split != 0,
+            is_supplementary: !r.is_secondary && !sam_pri_i,
+            is_zdrop_rescued: r.split != 0,
             is_spliced: r.is_spliced,
             trans_strand,
             matches: r.matches,
@@ -683,6 +695,10 @@ fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
 /// Parse PAF-formatted output back into a MapResult (for paired-end path).
 fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
     let mut mappings = Vec::new();
+    // No ProcessedQuery.sam_pri available here (this path only sees already-formatted PAF
+    // text), but the rule itself is simple and order-preserving, so rederive it locally:
+    // first non-secondary line -> SAM-primary, every later non-secondary line -> supplementary.
+    let mut seen_primary = false;
     for line in paf.lines() {
         if line.is_empty() { continue; }
         let fields: Vec<&str> = line.split('\t').collect();
@@ -726,10 +742,19 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         // Find target_id by name
         let target_id = _mi.seqs.iter().position(|s| s.name.as_str() == &*target_name).unwrap_or(0);
 
+        let is_supplementary = if is_secondary {
+            false
+        } else if seen_primary {
+            true
+        } else {
+            seen_primary = true;
+            false
+        };
+
         mappings.push(Mapping {
             target_name, target_id, target_len, target_start, target_end,
             query_start, query_end, strand, mapq,
-            is_primary: !is_secondary, is_supplementary: false,
+            is_primary: !is_secondary, is_supplementary, is_zdrop_rescued: false,
             is_spliced, trans_strand: None,
             matches, block_len,
             edit_distance, cigar, cigar_ops, cs, md, score, divergence,
@@ -1519,6 +1544,63 @@ mod tests {
     fn test_map_result_empty() {
         let result = MapResult { mappings: Vec::new() };
         assert!(result.mappings.is_empty());
+    }
+
+    /// Deterministic pseudo-random ACGT sequence, no homopolymer runs (LCG, same
+    /// construction as `test_hpc_chain_start_clamps_at_target_start`).
+    fn random_seq(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed;
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < len {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = b"ACGT"[(x >> 33) as usize % 4];
+            if seq.last() != Some(&b) { seq.push(b); }
+        }
+        seq
+    }
+
+    /// A read whose two halves independently chain to two different, unrelated contigs
+    /// (not a z-drop chain split) is a genuine chimeric alignment: both mappings should be
+    /// SAM-primary/-supplementary (FLAG 0 / 0x800) per `is_supplementary`, even though neither
+    /// one is `is_zdrop_rescued` (that field only covers z-drop-rescued splits, see its doc
+    /// comment) — this is exactly the case that was previously indistinguishable from a
+    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics.
+    #[test]
+    fn test_independent_chimeric_read_sets_is_supplementary_not_is_zdrop_rescued() {
+        let contig_a = random_seq(11, 1000);
+        let contig_b = random_seq(22, 1000);
+        let seqs = vec![
+            ("contigA".to_string(), contig_a.clone()),
+            ("contigB".to_string(), contig_b.clone()),
+        ];
+        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci,
+        // not a continuous chain that could z-drop-split into these same two pieces.
+        let mut query = contig_a[600..1000].to_vec();
+        query.extend_from_slice(&contig_b[0..400]);
+
+        let aligner = Aligner::builder(Preset::MapOnt)
+            .from_seqs(seqs)
+            .unwrap();
+        let result = aligner.map_seq("chimeric_query", &query);
+
+        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
+        assert_eq!(
+            non_secondary.len(), 2,
+            "expected exactly 2 non-secondary mappings (one per locus), got {}: {:?}",
+            non_secondary.len(), result.mappings,
+        );
+
+        assert!(
+            !non_secondary[0].is_supplementary,
+            "first non-secondary mapping should be SAM-primary (FLAG 0)"
+        );
+        assert!(
+            non_secondary[1].is_supplementary,
+            "second non-secondary mapping should be SAM-supplementary (FLAG 0x800)"
+        );
+        // Neither came from a z-drop split — this is genuine independent-chaining chimerism.
+        assert!(!non_secondary[0].is_zdrop_rescued);
+        assert!(!non_secondary[1].is_zdrop_rescued);
     }
 
     #[test]
