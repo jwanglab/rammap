@@ -101,9 +101,20 @@ impl JumpDb {
             }
         }
 
-        // Sort each per-ref array by (off, off2)
+        // Sort each per-ref array by (off, off2), then collapse duplicate (left_pos, right_pos,
+        // strand) entries -- multiple transcripts in a real annotation routinely share the exact
+        // same intron, so a BED12 file with N transcripts covering one junction produces N
+        // identical entries here. jump_split's own candidate search requires an *unambiguous*
+        // (exactly one distinct) match to actually splice a clipped end in, so leaving these
+        // duplicates in place means any shared junction is silently never recovered, even when
+        // it is the single correct annotated boundary.
         for juncs in &mut junctions {
-            juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+            juncs.sort_by(|a, b| {
+                a.left_pos.cmp(&b.left_pos)
+                    .then(a.right_pos.cmp(&b.right_pos))
+                    .then(a.strand.cmp(&b.strand))
+            });
+            juncs.dedup_by(|a, b| a.left_pos == b.left_pos && a.right_pos == b.right_pos && a.strand == b.strand);
         }
 
         Ok(JumpDb { junctions })
@@ -519,4 +530,42 @@ fn trim_last_cigar_op(cigar: &str, new_len: usize) -> String {
 
 fn replace_last_cigar_len(cigar: &str, new_len: usize) -> String {
     trim_last_cigar_op(cigar, new_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::index::Index;
+
+    /// A real transcript annotation routinely has several transcripts sharing the exact same
+    /// intron (alternative UTRs/exons elsewhere in the same gene). A naive load produced one
+    /// `JumpJunc` entry per BED12 record per intron, so N transcripts sharing a junction produced
+    /// N duplicate entries -- and `jump_split`'s candidate search requires an unambiguous (exactly
+    /// one distinct) match to ever splice a clipped end in, so any shared junction was silently
+    /// never recovered. `JumpDb::load` must collapse these to one entry per (left, right, strand).
+    #[test]
+    fn test_load_dedups_junctions_shared_across_transcripts() {
+        let seq = vec![("chr1".to_string(), b"A".repeat(1000))];
+        let index = Index::build(seq, 5, 15, false, usize::MAX);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_jumpdb_dedup_test_{}.bed", std::process::id()));
+        // Three transcripts, different overall spans, all sharing the exact same 100..200 intron.
+        std::fs::write(
+            &path,
+            "chr1\t0\t300\ttx1\t0\t+\t0\t300\t0\t2\t100,100\t0,200\n\
+             chr1\t50\t250\ttx2\t0\t+\t0\t250\t0\t2\t50,50\t0,150\n\
+             chr1\t0\t1000\ttx3\t0\t+\t0\t1000\t0\t2\t100,800\t0,200\n",
+        ).expect("write test BED12");
+
+        let db = JumpDb::load(&index, path.to_str().unwrap(), 0x1, -1).expect("JumpDb::load");
+        let _ = std::fs::remove_file(&path);
+
+        // Both directions of the 100/200 junction, deduplicated to exactly one entry each,
+        // despite three transcripts describing it.
+        let forward: Vec<&JumpJunc> = db.junctions[0].iter().filter(|j| j.left_pos == 100 && j.right_pos == 200).collect();
+        let reverse: Vec<&JumpJunc> = db.junctions[0].iter().filter(|j| j.left_pos == 200 && j.right_pos == 100).collect();
+        assert_eq!(forward.len(), 1, "expected exactly one deduped forward entry, got {:?}", forward);
+        assert_eq!(reverse.len(), 1, "expected exactly one deduped reverse entry, got {:?}", reverse);
+    }
 }
