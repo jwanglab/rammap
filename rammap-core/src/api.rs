@@ -160,11 +160,9 @@ pub struct Mapping {
     /// Sequence divergence (0.0 = identical).
     pub divergence: f64,
     /// The `SA:Z:...` tag value listing every other non-secondary mapping from the same
-    /// alignment call, or `None` if there are none (a non-chimeric read, or this mapping is
-    /// itself secondary). Each sibling's CIGAR here is a lossy single-block approximation
-    /// (matching minimap2's own SA-tag formatting exactly) -- not a copy of that sibling's own
-    /// printed CIGAR -- see [`crate::align::pipeline::build_sa_tag`] for the exact formula.
-    /// Always `None` on the paired-end/PAF path (no sibling data available there).
+    /// alignment call, or `None` if there are none. See
+    /// [`crate::align::pipeline::build_sa_tag`] for the exact formula. Always `None` on the
+    /// paired-end/PAF path.
     pub sa_tag: Option<String>,
 }
 
@@ -1638,10 +1636,8 @@ mod tests {
         seq
     }
 
-    /// A read whose two halves independently chain to two different, unrelated contigs gets a
-    /// correct `sa_tag` on each non-secondary mapping, referencing the other by
-    /// rname/pos/strand/mapq/NM -- using `build_sa_tag`'s single-block CIGAR approximation, not
-    /// a copy of the sibling's own printed CIGAR.
+    /// A chimeric read (mapping to two different loci) gets a correct `sa_tag` on each
+    /// mapping, referencing the sibling mapping's exact rname/pos/strand/CIGAR/mapq/NM.
     #[test]
     fn test_independent_chimeric_read_sa_tag() {
         let contig_a = random_seq(11, 1000);
@@ -1650,8 +1646,7 @@ mod tests {
             ("contigA".to_string(), contig_a.clone()),
             ("contigB".to_string(), contig_b.clone()),
         ];
-        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci, not a
-        // continuous chain that could z-drop-split into these same two pieces.
+        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci.
         let mut query = contig_a[600..1000].to_vec();
         query.extend_from_slice(&contig_b[0..400]);
 
@@ -1667,11 +1662,17 @@ mod tests {
             non_secondary.len(), result.mappings,
         );
 
-        let sa0 = non_secondary[0].sa_tag.as_ref().expect("mapping 0 should have an SA tag");
-        let sa1 = non_secondary[1].sa_tag.as_ref().expect("mapping 1 should have an SA tag");
+        let primary_aln_contig_b = non_secondary[0];
+        let supp_aln_contig_a = non_secondary[1];
+        assert_eq!(primary_aln_contig_b.target_name.as_ref(), "contigB");
+        assert_eq!(supp_aln_contig_a.target_name.as_ref(), "contigA");
 
-        // Each SA tag references the OTHER mapping's own rname/pos/strand/mapq/NM.
-        assert!(sa0.starts_with(&format!("{},{},", non_secondary[1].target_name, non_secondary[1].target_start + 1)));
-        assert!(sa1.starts_with(&format!("{},{},", non_secondary[0].target_name, non_secondary[0].target_start + 1)));
+        let sa_on_primary = primary_aln_contig_b.sa_tag.as_ref().expect("primary mapping should have an SA tag");
+        let sa_on_supp = supp_aln_contig_a.sa_tag.as_ref().expect("supplementary mapping should have an SA tag");
+
+        // Each half is a 400bp exact match starting at the query's edge, so the sibling's CIGAR
+        // in the SA tag is the 400bp match plus a 400bp soft-clip for the other half of the read.
+        assert_eq!(sa_on_primary, "contigA,601,+,400M400S,60,0;");
+        assert_eq!(sa_on_supp, "contigB,1,+,400S400M,60,0;");
     }
 }
