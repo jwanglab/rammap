@@ -100,14 +100,10 @@ impl JumpDb {
                 });
             }
         }
-
-        // Sort each per-ref array by (off, off2), then collapse duplicate (left_pos, right_pos,
-        // strand) entries -- multiple transcripts in a real annotation routinely share the exact
-        // same intron, so a BED12 file with N transcripts covering one junction produces N
-        // identical entries here. jump_split's own candidate search requires an *unambiguous*
-        // (exactly one distinct) match to actually splice a clipped end in, so leaving these
-        // duplicates in place means any shared junction is silently never recovered, even when
-        // it is the single correct annotated boundary.
+        
+        // Sort and collapse duplicate junctions by (left_pos, right_pos, strand).
+        // Transcripts sharing identical introns create duplicate BED12 entries,
+        // which prevents jump_split from making unique alignment matches.
         for juncs in &mut junctions {
             juncs.sort_by(|a, b| {
                 a.left_pos.cmp(&b.left_pos)
