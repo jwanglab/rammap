@@ -139,7 +139,8 @@ pub struct Mapping {
     /// `false` for secondary mappings (`!is_primary`) and for the first non-secondary mapping
     /// of a read (which is SAM-primary, FLAG 0); `true` for every subsequent non-secondary
     /// mapping. This is the real primary/supplementary determination minimap2 and rammap's own
-    /// SAM writer use (`align/pipeline.rs`'s `sam_pri`).
+    /// SAM writer use (`align/pipeline.rs`'s `sam_pri`). Always `false` on the paired-end path,
+    /// which only sees formatted text with no per-mate boundaries.
     pub is_supplementary: bool,
     /// Whether this mapping was rescued by a z-drop chain split (`split != 0`): the alignment
     /// score collapsed mid-extension, so the aligner split the chain and re-seeded the
@@ -695,10 +696,6 @@ fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
 /// Parse PAF-formatted output back into a MapResult (for paired-end path).
 fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
     let mut mappings = Vec::new();
-    // No ProcessedQuery.sam_pri available here (this path only sees already-formatted PAF
-    // text), but the rule itself is simple and order-preserving, so rederive it locally:
-    // first non-secondary line -> SAM-primary, every later non-secondary line -> supplementary.
-    let mut seen_primary = false;
     for line in paf.lines() {
         if line.is_empty() { continue; }
         let fields: Vec<&str> = line.split('\t').collect();
@@ -742,19 +739,10 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         // Find target_id by name
         let target_id = _mi.seqs.iter().position(|s| s.name.as_str() == &*target_name).unwrap_or(0);
 
-        let is_supplementary = if is_secondary {
-            false
-        } else if seen_primary {
-            true
-        } else {
-            seen_primary = true;
-            false
-        };
-
         mappings.push(Mapping {
             target_name, target_id, target_len, target_start, target_end,
             query_start, query_end, strand, mapq,
-            is_primary: !is_secondary, is_supplementary, is_zdrop_rescued: false,
+            is_primary: !is_secondary, is_supplementary: false, is_zdrop_rescued: false,
             is_spliced, trans_strand: None,
             matches, block_len,
             edit_distance, cigar, cigar_ops, cs, md, score, divergence,
@@ -1696,5 +1684,23 @@ mod tests {
     fn test_encode_nt4() {
         let encoded = encode_nt4(b"ACGTNacgtn");
         assert_eq!(encoded, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+    }
+
+    /// A normal read pair whose mates both map cleanly: each mate's alignment is SAM-primary, so
+    /// neither is supplementary. (`map_pair` only sees formatted PAF text, which has no mate
+    /// boundaries, so `is_supplementary` must not be derived from line order there.)
+    #[test]
+    fn test_paired_end_mates_are_not_supplementary() {
+        let reference = random_seq(7, 2000);
+        let read1 = reference[100..250].to_vec();
+        let read2 = crate::align::extend::rev_comp(&reference[400..550]);
+        let aligner = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::Sr);
+
+        let result = aligner.map_pair("pair", &read1, &read2);
+        assert_eq!(result.mappings.len(), 2, "expected one mapping per mate: {:?}", result.mappings);
+        assert!(
+            result.mappings.iter().all(|m| m.is_primary && !m.is_supplementary),
+            "neither mate of a clean pair is supplementary: {:?}", result.mappings,
+        );
     }
 }
