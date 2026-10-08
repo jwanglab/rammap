@@ -128,6 +128,7 @@ impl CigarOp {
 /// **Invariant**: Sequence-consuming ops (`M`, `I`, `S`, `=`, `X`) sum to `seq_range.len()`.
 /// Reverse-strand mappings reverse QUAL and reverse-complement SEQ over `read[seq_range]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FullCigar {
     /// CIGAR ops including leading and trailing clips.
     pub ops: Vec<CigarOp>,

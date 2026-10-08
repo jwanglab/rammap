@@ -2964,6 +2964,8 @@ pub fn get_mate_info(pq: &ProcessedQuery) -> Option<MateInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::align::index::Index;
+    use crate::align::extend::AlignmentContext;
 
     #[test]
     fn test_seq_style_follows_sam_flag_and_clip_options() {
@@ -2980,8 +2982,6 @@ mod tests {
         opt.flags.insert(AlignFlags::SECONDARY_SEQ);
         assert_eq!(seq_style(true, false, &opt), SeqStyle::AlignedOnly, "secondary with --secondary-seq");
     }
-    use crate::align::index::Index;
-    use crate::align::extend::AlignmentContext;
 
     #[test]
     fn test_count_cigar_ops() {
