@@ -2313,6 +2313,50 @@ fn write_cigar_as_bam_uints(out: &mut String, cigar: &str) {
     }
 }
 
+/// Build the `SA:Z:...` tag value for the non-secondary result at `results[idx]`, listing every
+/// other non-secondary result that has a computed CIGAR. Returns `None` if there are no such
+/// siblings (including when `results[idx]` is itself secondary, or out of range).
+///
+/// Each sibling's CIGAR here is a lossy single-block approximation derived only from its
+/// `query_start`/`query_end`/`ref_start`/`ref_end` span -- matched length capped at
+/// `min(qspan, rspan)`, plus at most one trailing `I` (qspan > rspan) or `D` (qspan < rspan) to
+/// reconcile the difference -- not a copy of that sibling's own printed CIGAR. This matches
+/// minimap2's own SA-tag formatting exactly; it deliberately discards interior indel structure.
+pub(crate) fn build_sa_tag(idx: usize, results: &[AlnResult], mapqs: &[i32], mi: &Index, qlen: usize) -> Option<String> {
+    let r = results.get(idx)?;
+    if r.is_secondary || results.len() <= 1 {
+        return None;
+    }
+    let mut sa = String::new();
+    for (j, rj) in results.iter().enumerate() {
+        if j == idx || rj.is_secondary || rj.cigar_str.is_empty() { continue; }
+        let l_m;
+        let mut l_i = 0usize;
+        let mut l_d = 0usize;
+        let qspan = rj.query_end - rj.query_start;
+        let rspan = rj.ref_end - rj.ref_start;
+        if qspan < rspan {
+            l_m = qspan;
+            l_d = rspan - l_m;
+        } else {
+            l_m = rspan;
+            l_i = qspan - l_m;
+        }
+        let clip5 = if rj.is_reverse { qlen - rj.query_end } else { rj.query_start };
+        let clip3 = if rj.is_reverse { rj.query_start } else { qlen - rj.query_end };
+        let strand = if rj.is_reverse { '-' } else { '+' };
+
+        write!(sa, "{},{},{},", mi.seqs[rj.ref_id].name, rj.ref_start + 1, strand).ok();
+        if clip5 > 0 { write!(sa, "{}S", clip5).ok(); }
+        if l_m > 0 { write!(sa, "{}M", l_m).ok(); }
+        if l_i > 0 { write!(sa, "{}I", l_i).ok(); }
+        if l_d > 0 { write!(sa, "{}D", l_d).ok(); }
+        if clip3 > 0 { write!(sa, "{}S", clip3).ok(); }
+        write!(sa, ",{},{};", mapqs[j], rj.edit_distance).ok();
+    }
+    if sa.is_empty() { None } else { Some(sa) }
+}
+
 fn format_sam_record(
     output_buffer: &mut String,
     r: &AlnResult,
@@ -2502,41 +2546,8 @@ fn format_sam_record(
         write!(output_buffer, "\tzd:i:{}", r.split).ok();
     }
     // SA tag
-    if !r.is_secondary && results.len() > 1 {
-        let n_sa = results.iter().enumerate()
-            .filter(|&(j, rj)| j != idx && !rj.is_secondary && !rj.cigar_str.is_empty())
-            .count();
-        if n_sa > 0 {
-            write!(output_buffer, "\tSA:Z:").ok();
-            for (j, rj) in results.iter().enumerate() {
-                if j == idx || rj.is_secondary || rj.cigar_str.is_empty() { continue; }
-                let l_m;
-                let mut l_i = 0usize;
-                let mut l_d = 0usize;
-                let qspan = rj.query_end - rj.query_start;
-                let rspan = rj.ref_end - rj.ref_start;
-                if qspan < rspan {
-                    l_m = qspan;
-                    l_d = rspan - l_m;
-                } else {
-                    l_m = rspan;
-                    l_i = qspan - l_m;
-                }
-                let clip5 = if rj.is_reverse { qlen - rj.query_end } else { rj.query_start };
-                let clip3 = if rj.is_reverse { rj.query_start } else { qlen - rj.query_end };
-                let strand = if rj.is_reverse { '-' } else { '+' };
-                let sa_nm = rj.edit_distance;
-                let sa_mapq = mapqs[j];
-
-                write!(output_buffer, "{},{},{},", mi.seqs[rj.ref_id].name, rj.ref_start + 1, strand).ok();
-                if clip5 > 0 { write!(output_buffer, "{}S", clip5).ok(); }
-                if l_m > 0 { write!(output_buffer, "{}M", l_m).ok(); }
-                if l_i > 0 { write!(output_buffer, "{}I", l_i).ok(); }
-                if l_d > 0 { write!(output_buffer, "{}D", l_d).ok(); }
-                if clip3 > 0 { write!(output_buffer, "{}S", clip3).ok(); }
-                write!(output_buffer, ",{},{};", sa_mapq, sa_nm).ok();
-            }
-        }
+    if let Some(sa) = build_sa_tag(idx, results, mapqs, mi, qlen) {
+        write!(output_buffer, "\tSA:Z:{}", sa).ok();
     }
 
     if let Some(id) = rg_id {

@@ -172,6 +172,11 @@ pub struct Mapping {
     pub score: i32,
     /// Sequence divergence (0.0 = identical).
     pub divergence: f64,
+    /// The `SA:Z:...` tag value listing every other non-secondary mapping from the same
+    /// alignment call, or `None` if there are none. See
+    /// [`crate::align::pipeline::build_sa_tag`] for the exact formula. Always `None` on the
+    /// paired-end/PAF path.
+    pub sa_tag: Option<String>,
 }
 
 /// Result of aligning one read (or read pair).
@@ -516,7 +521,7 @@ impl Aligner {
                 crate::align::jump::jump_split(&self.index, &self.options, &out, qlen, seq, r, jdb);
             }
         }
-        to_map_result(&pq, &self.index, &out)
+        to_map_result(&pq, &self.index, &out, seq.len())
     }
 
     /// Align a paired-end read pair against the reference.
@@ -653,11 +658,12 @@ fn to_map_result(
     pq: &pipeline::ProcessedQuery,
     mi: &Index,
     out: &OutputConfig,
+    qlen: usize,
 ) -> MapResult {
     // Cache Arc<str> per target to avoid cloning the name for each alignment
     let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
 
-    let mappings = pq.results.iter().zip(pq.mapqs.iter()).zip(pq.sam_pri.iter()).map(|((r, &mapq), &sam_pri_i)| {
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).zip(pq.sam_pri.iter()).enumerate().map(|(idx, ((r, &mapq), &sam_pri_i))| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
         let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
         let trans_strand = match r.trans_strand {
@@ -692,6 +698,7 @@ fn to_map_result(
             md: if out.do_md && !r.md_str.is_empty() { Some(r.md_str.clone()) } else { None },
             score: r.align_score,
             divergence: r.divergence,
+            sa_tag: pipeline::build_sa_tag(idx, &pq.results, &pq.mapqs, mi, qlen),
         }
     }).collect();
     MapResult { mappings }
@@ -769,6 +776,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
             is_spliced, trans_strand: None,
             matches, block_len,
             edit_distance, cigar, cigar_ops, cs, md, score, divergence,
+            sa_tag: None,
         });
     }
     MapResult { mappings }
@@ -1635,9 +1643,10 @@ mod tests {
     /// SAM-primary/-supplementary (FLAG 0 / 0x800) per `is_supplementary`, even though neither
     /// one is `is_zdrop_rescued` (that field only covers z-drop-rescued splits, see its doc
     /// comment) — this is exactly the case that was previously indistinguishable from a
-    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics.
+    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics. Each mapping's
+    /// `sa_tag` names the other.
     #[test]
-    fn test_independent_chimeric_read_sets_is_supplementary_not_is_zdrop_rescued() {
+    fn test_independent_chimeric_read_flags_and_sa_tag() {
         let contig_a = random_seq(11, 1000);
         let contig_b = random_seq(22, 1000);
         let seqs = vec![
@@ -1672,6 +1681,13 @@ mod tests {
         // Neither came from a z-drop split — this is genuine independent-chaining chimerism.
         assert!(!non_secondary[0].is_zdrop_rescued);
         assert!(!non_secondary[1].is_zdrop_rescued);
+
+        // Each half is a 400bp exact match at a query edge, so the sibling's SA CIGAR is
+        // 400M plus a 400bp soft-clip for the other half.
+        assert_eq!(non_secondary[0].target_name.as_ref(), "contigB");
+        assert_eq!(non_secondary[1].target_name.as_ref(), "contigA");
+        assert_eq!(non_secondary[0].sa_tag.as_deref(), Some("contigA,601,+,400M400S,60,0;"));
+        assert_eq!(non_secondary[1].sa_tag.as_deref(), Some("contigB,1,+,400S400M,60,0;"));
     }
 
     #[test]
