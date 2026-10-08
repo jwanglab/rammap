@@ -754,6 +754,10 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         }
     };
     let pe_mode = two_file_pe || frag_mode;
+    if cli.eqx && (cli.junc_jump.is_some() || cli.pass1.is_some())
+        && opt.flags.contains(AlignFlags::SPLICE) && !pe_mode {
+        anyhow::bail!("--eqx is incompatible with jump splice extension (-j/--pass1)");
+    }
 
     // Validate query file existence
     for qf in &query_files {
