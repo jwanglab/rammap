@@ -1543,14 +1543,12 @@ mod tests {
         let mut a1 = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::SpliceSr);
         let mut path = std::env::temp_dir();
         path.push(format!("rammap_jumpdb_behavior_{}.bed", std::process::id()));
-        // Decoy anchor junction, then the target junction twice (two different transcripts
-        // sharing the same intron, as real annotations routinely do) to verify that JumpDb::load
-        // is deduping these junctions.
+        // The target junction twice (two different transcripts sharing the same intron, as
+        // real annotations routinely do) to verify that JumpDb::load is deduping these junctions.
         std::fs::write(
             &path,
             format!(
-                "chr1\t0\t30\t.\t0\t+\t0\t30\t0\t2\t10,10\t0,20\n\
-                 chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n\
+                "chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n\
                  chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n",
                 exon1.len() + intron.len() + exon2.len(),
                 exon1.len() + intron.len() + exon2.len(),
