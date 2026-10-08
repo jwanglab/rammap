@@ -101,18 +101,8 @@ impl JumpDb {
                 });
             }
         }
-        
-        // Sort and collapse duplicate junctions by (left_pos, right_pos, strand).
-        // Transcripts sharing identical introns create duplicate BED12 entries,
-        // which prevents jump_split from making unique alignment matches.
-        for juncs in &mut junctions {
-            juncs.sort_by(|a, b| {
-                a.left_pos.cmp(&b.left_pos)
-                    .then(a.right_pos.cmp(&b.right_pos))
-                    .then(a.strand.cmp(&b.strand))
-            });
-            juncs.dedup_by(|a, b| a.left_pos == b.left_pos && a.right_pos == b.right_pos && a.strand == b.strand);
-        }
+
+        for juncs in &mut junctions { sort_merge(juncs); }
 
         Ok(JumpDb { junctions })
     }
@@ -122,7 +112,7 @@ impl JumpDb {
         for (rid, juncs) in self.junctions.iter_mut().enumerate() {
             if rid < other.junctions.len() {
                 juncs.extend_from_slice(&other.junctions[rid]);
-                juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+                sort_merge(juncs);
             }
         }
     }
@@ -157,6 +147,17 @@ impl JumpDb {
         if hi < lo { return &[]; }
         &juncs[lo..=hi]
     }
+}
+
+/// Sort by (left_pos, right_pos) and merge duplicates, summing counts and OR-ing flags.
+fn sort_merge(juncs: &mut Vec<JumpJunc>) {
+    juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+    juncs.dedup_by(|a, b| {
+        if a.left_pos != b.left_pos || a.right_pos != b.right_pos { return false; }
+        b.count += a.count;
+        b.flag |= a.flag;
+        true
+    });
 }
 
 /// Encode ASCII base to nt4 (A=0,C=1,G=2,T=3,N=4).
@@ -676,6 +677,15 @@ mod tests {
     }
 
     fn lefts(js: &[JumpJunc]) -> Vec<i32> { js.iter().map(|j| j.left_pos).collect() }
+
+    #[test]
+    fn test_sort_merge_ignores_strand_and_combines_flags() {
+        let j = |l, r, strand, flag| JumpJunc { left_pos: l, right_pos: r, count: 1, strand, flag };
+        let mut v = vec![j(600, 100, 1, JUNC_ANNO), j(100, 600, -1, JUNC_ANNO), j(100, 600, 1, 0x2), j(100, 600, 0, JUNC_ANNO)];
+        sort_merge(&mut v);
+        assert_eq!(v.iter().map(|x| (x.left_pos, x.right_pos, x.count, x.flag)).collect::<Vec<_>>(),
+            vec![(100, 600, 3, JUNC_ANNO | 0x2), (600, 100, 1, JUNC_ANNO)]);
+    }
 
     #[test]
     fn test_get_window_starting_before_first_junction() {
