@@ -100,10 +100,17 @@ impl JumpDb {
                 });
             }
         }
-
-        // Sort each per-ref array by (off, off2)
+        
+        // Sort and collapse duplicate junctions by (left_pos, right_pos, strand).
+        // Transcripts sharing identical introns create duplicate BED12 entries,
+        // which prevents jump_split from making unique alignment matches.
         for juncs in &mut junctions {
-            juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+            juncs.sort_by(|a, b| {
+                a.left_pos.cmp(&b.left_pos)
+                    .then(a.right_pos.cmp(&b.right_pos))
+                    .then(a.strand.cmp(&b.strand))
+            });
+            juncs.dedup_by(|a, b| a.left_pos == b.left_pos && a.right_pos == b.right_pos && a.strand == b.strand);
         }
 
         Ok(JumpDb { junctions })
@@ -137,16 +144,17 @@ impl JumpDb {
         None // should not happen for valid input
     }
 
-    /// Get all junctions with off in [st, en) for reference rid.
+    /// Get all junctions with st < off <= en for reference rid.
     pub fn get(&self, rid: usize, st: i32, en: i32) -> &[JumpJunc] {
         if rid >= self.junctions.len() { return &[]; }
         let juncs = &self.junctions[rid];
         if juncs.is_empty() { return &[]; }
         // en used directly (already clamped by caller)
-        let l = match Self::get_core(juncs, st) { Some(v) => v, None => return &[] };
-        let r = match Self::get_core(juncs, en) { Some(v) => v, None => return &[] };
-        if r < l { return &[]; }
-        &juncs[l + 1..=r]  // return a[l+1..r] inclusive
+        // A start below the first junction means the window begins at index 0.
+        let lo = Self::get_core(juncs, st).map_or(0, |v| v + 1);
+        let hi = match Self::get_core(juncs, en) { Some(v) => v, None => return &[] };
+        if hi < lo { return &[]; }
+        &juncs[lo..=hi]
     }
 }
 
@@ -865,5 +873,31 @@ mod tests {
         assert_eq!(r.edit_distance, 1);
         assert_eq!(r.md_str, "98C11");
         assert!((r.divergence - expected_divergence).abs() < 1e-9);
+    }
+
+    fn db(offs: &[i32]) -> JumpDb {
+        let juncs = offs.iter()
+            .map(|&o| JumpJunc { left_pos: o, right_pos: o + 500, count: 0, strand: 1, flag: JUNC_ANNO })
+            .collect();
+        JumpDb { junctions: vec![juncs] }
+    }
+
+    fn lefts(js: &[JumpJunc]) -> Vec<i32> { js.iter().map(|j| j.left_pos).collect() }
+
+    #[test]
+    fn test_get_window_starting_before_first_junction() {
+        let d = db(&[100, 600]);
+        assert_eq!(lefts(d.get(0, 96, 104)), vec![100]);
+        assert_eq!(lefts(d.get(0, 0, 700)), vec![100, 600]);
+        assert!(d.get(0, 0, 99).is_empty());
+    }
+
+    #[test]
+    fn test_get_window_interior() {
+        let d = db(&[100, 200, 300, 400]);
+        assert_eq!(lefts(d.get(0, 150, 350)), vec![200, 300]);
+        assert_eq!(lefts(d.get(0, 200, 300)), vec![300]);
+        assert!(d.get(0, 210, 290).is_empty());
+        assert!(d.get(1, 0, 1000).is_empty());
     }
 }
