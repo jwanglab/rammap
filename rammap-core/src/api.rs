@@ -500,7 +500,7 @@ impl Aligner {
         if let Some(jdb) = self.jump_db.as_ref().filter(|_| self.options.flags.contains(AlignFlags::SPLICE)) {
             let qlen = seq.len();
             for r in pq.results.iter_mut() {
-                crate::align::jump::jump_split(&self.index, &self.options, qlen, seq, r, jdb);
+                crate::align::jump::jump_split(&self.index, &self.options, &out, qlen, seq, r, jdb);
             }
         }
         to_map_result(&pq, &self.index, &out)
