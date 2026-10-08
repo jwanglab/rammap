@@ -113,6 +113,7 @@ pub struct MapOpts {
 
 /// A single alignment result.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Mapping {
     /// Target sequence name (shared via Arc to reduce allocation when many
     /// alignments reference the same target).
