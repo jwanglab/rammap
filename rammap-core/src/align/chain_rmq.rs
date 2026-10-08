@@ -12,7 +12,7 @@
 //!
 //! Backtracking, chain extraction, and output format (score|count descriptors
 //! plus reordered anchors) are shared with the DP chaining module via
-//! [`chain_backtrack`].
+//! `chain_backtrack`.
 
 use crate::align::sketch::Minimizer;
 use crate::align::chain::{fast_log2, chain_backtrack};

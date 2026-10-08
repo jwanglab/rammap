@@ -5,13 +5,13 @@
 //! sorted anchor array of `Minimizer` structs with repacked (ref, query) coords.
 //!
 //! Two collection strategies:
-//! - [`collect_seed_hits`] / [`collect_seed_hits_with_occ`]: radix-sort based,
+//! - [`collect_seed_hits`] / `collect_seed_hits_with_occ`: radix-sort based,
 //!   used by most presets.
 //! - [`collect_seed_hits_heap`]: min-heap merge producing sorted output directly,
 //!   used by short-read (sr) presets.
 //!
 //! High-frequency seeds are filtered by `mid_occ` (max occurrence threshold).
-//! For runs of consecutive high-occ minimizers, [`select_seeds`] retains a
+//! For runs of consecutive high-occ minimizers, `select_seeds` retains a
 //! density-limited subset with the lowest occurrence counts rather than
 //! discarding them all. Filtered seed spans are accumulated into `rep_len`
 //! (repetitive length) for mapping quality estimation.

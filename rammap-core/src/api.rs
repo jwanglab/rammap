@@ -210,9 +210,8 @@ pub struct Mapping {
     /// Sequence divergence (0.0 = identical).
     pub divergence: f64,
     /// The `SA:Z:...` tag value listing every other non-secondary mapping from the same
-    /// alignment call, or `None` if there are none. See
-    /// [`crate::align::pipeline::build_sa_tag`] for the exact formula. Always `None` on the
-    /// paired-end/PAF path.
+    /// alignment call, or `None` if there are none. Identical to the CLI's SAM `SA:Z` tag.
+    /// Always `None` on the paired-end/PAF path.
     pub sa_tag: Option<String>,
 }
 
