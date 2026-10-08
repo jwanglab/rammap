@@ -100,10 +100,17 @@ impl JumpDb {
                 });
             }
         }
-
-        // Sort each per-ref array by (off, off2)
+        
+        // Sort and collapse duplicate junctions by (left_pos, right_pos, strand).
+        // Transcripts sharing identical introns create duplicate BED12 entries,
+        // which prevents jump_split from making unique alignment matches.
         for juncs in &mut junctions {
-            juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+            juncs.sort_by(|a, b| {
+                a.left_pos.cmp(&b.left_pos)
+                    .then(a.right_pos.cmp(&b.right_pos))
+                    .then(a.strand.cmp(&b.strand))
+            });
+            juncs.dedup_by(|a, b| a.left_pos == b.left_pos && a.right_pos == b.right_pos && a.strand == b.strand);
         }
 
         Ok(JumpDb { junctions })
