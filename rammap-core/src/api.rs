@@ -1643,9 +1643,10 @@ mod tests {
     /// SAM-primary/-supplementary (FLAG 0 / 0x800) per `is_supplementary`, even though neither
     /// one is `is_zdrop_rescued` (that field only covers z-drop-rescued splits, see its doc
     /// comment) — this is exactly the case that was previously indistinguishable from a
-    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics.
+    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics. Each mapping's
+    /// `sa_tag` names the other.
     #[test]
-    fn test_independent_chimeric_read_sets_is_supplementary_not_is_zdrop_rescued() {
+    fn test_independent_chimeric_read_flags_and_sa_tag() {
         let contig_a = random_seq(11, 1000);
         let contig_b = random_seq(22, 1000);
         let seqs = vec![
@@ -1680,6 +1681,13 @@ mod tests {
         // Neither came from a z-drop split — this is genuine independent-chaining chimerism.
         assert!(!non_secondary[0].is_zdrop_rescued);
         assert!(!non_secondary[1].is_zdrop_rescued);
+
+        // Each half is a 400bp exact match at a query edge, so the sibling's SA CIGAR is
+        // 400M plus a 400bp soft-clip for the other half.
+        assert_eq!(non_secondary[0].target_name.as_ref(), "contigB");
+        assert_eq!(non_secondary[1].target_name.as_ref(), "contigA");
+        assert_eq!(non_secondary[0].sa_tag.as_deref(), Some("contigA,601,+,400M400S,60,0;"));
+        assert_eq!(non_secondary[1].sa_tag.as_deref(), Some("contigB,1,+,400S400M,60,0;"));
     }
 
     #[test]
@@ -1793,45 +1801,5 @@ mod tests {
             result.mappings.iter().all(|m| m.is_primary && !m.is_supplementary),
             "neither mate of a clean pair is supplementary: {:?}", result.mappings,
         );
-    }
-
-    /// A chimeric read (mapping to two different loci) gets a correct `sa_tag` on each
-    /// mapping, referencing the sibling mapping's exact rname/pos/strand/CIGAR/mapq/NM.
-    #[test]
-    fn test_independent_chimeric_read_sa_tag() {
-        let contig_a = random_seq(11, 1000);
-        let contig_b = random_seq(22, 1000);
-        let seqs = vec![
-            ("contigA".to_string(), contig_a.clone()),
-            ("contigB".to_string(), contig_b.clone()),
-        ];
-        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci.
-        let mut query = contig_a[600..1000].to_vec();
-        query.extend_from_slice(&contig_b[0..400]);
-
-        let aligner = Aligner::builder(Preset::MapOnt)
-            .from_seqs(seqs)
-            .unwrap();
-        let result = aligner.map_seq("chimeric_query", &query);
-
-        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
-        assert_eq!(
-            non_secondary.len(), 2,
-            "expected exactly 2 non-secondary mappings (one per locus), got {}: {:?}",
-            non_secondary.len(), result.mappings,
-        );
-
-        let primary_aln_contig_b = non_secondary[0];
-        let supp_aln_contig_a = non_secondary[1];
-        assert_eq!(primary_aln_contig_b.target_name.as_ref(), "contigB");
-        assert_eq!(supp_aln_contig_a.target_name.as_ref(), "contigA");
-
-        let sa_on_primary = primary_aln_contig_b.sa_tag.as_ref().expect("primary mapping should have an SA tag");
-        let sa_on_supp = supp_aln_contig_a.sa_tag.as_ref().expect("supplementary mapping should have an SA tag");
-
-        // Each half is a 400bp exact match starting at the query's edge, so the sibling's CIGAR
-        // in the SA tag is the 400bp match plus a 400bp soft-clip for the other half of the read.
-        assert_eq!(sa_on_primary, "contigA,601,+,400M400S,60,0;");
-        assert_eq!(sa_on_supp, "contigB,1,+,400S400M,60,0;");
     }
 }
