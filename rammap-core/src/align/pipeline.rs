@@ -2313,6 +2313,59 @@ fn write_cigar_as_bam_uints(out: &mut String, cigar: &str) {
     }
 }
 
+/// How a record's clips and SEQ/QUAL are written, following minimap2's `-Y` (`SOFTCLIP`) and
+/// `--secondary-seq` (`SECONDARY_SEQ`) rules. The clip character and the SEQ/QUAL choice are
+/// always made together, so a hard-clipped CIGAR is never paired with the full read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeqStyle {
+    /// SEQ/QUAL are the whole read; clips are soft (`S`). Primary records, and supplementary
+    /// ones when `SOFTCLIP` is set.
+    FullRead,
+    /// SEQ/QUAL are `*`; clips are soft (`S`). Secondary records without `SECONDARY_SEQ`.
+    NoSeq,
+    /// SEQ/QUAL are only the aligned span; clips are hard (`H`). Supplementary records without
+    /// `SOFTCLIP`, and secondary records with `SECONDARY_SEQ`.
+    AlignedOnly,
+}
+
+impl SeqStyle {
+    pub fn clip_char(self) -> char {
+        if self == Self::AlignedOnly { 'H' } else { 'S' }
+    }
+
+    pub fn seq_range(self, qlen: usize, query_start: usize, query_end: usize) -> Option<std::ops::Range<usize>> {
+        match self {
+            Self::FullRead => Some(0..qlen),
+            Self::AlignedOnly => Some(query_start..query_end),
+            Self::NoSeq => None,
+        }
+    }
+}
+
+/// `is_sam_primary` is the `sam_pri` entry for this record (the first non-secondary mapping of a
+/// read); a non-secondary record that is not SAM-primary is supplementary.
+pub(crate) fn seq_style(is_secondary: bool, is_sam_primary: bool, opt: &MapOptions) -> SeqStyle {
+    let soft_clip = opt.flags.contains(AlignFlags::SOFTCLIP);
+    let secondary_seq = opt.flags.contains(AlignFlags::SECONDARY_SEQ);
+    if is_secondary {
+        if secondary_seq { SeqStyle::AlignedOnly } else { SeqStyle::NoSeq }
+    } else if is_sam_primary || soft_clip {
+        SeqStyle::FullRead
+    } else {
+        SeqStyle::AlignedOnly
+    }
+}
+
+/// Number of unaligned query bases before (`head`) and after (`tail`) the aligned block, in
+/// CIGAR (reference-forward) order: the lengths of the leading and trailing clip operations.
+pub(crate) fn clip_lengths(r: &AlnResult, qlen: usize) -> (usize, usize) {
+    if r.is_reverse {
+        (qlen.saturating_sub(r.query_end), r.query_start)
+    } else {
+        (r.query_start, qlen.saturating_sub(r.query_end))
+    }
+}
+
 /// Build the `SA:Z:...` tag value for the non-secondary result at `results[idx]`, listing every
 /// other non-secondary result that has a computed CIGAR. Returns `None` if there are no such
 /// siblings (including when `results[idx]` is itself secondary, or out of range).
@@ -2407,14 +2460,10 @@ fn format_sam_record(
     let mapq = mapqs[idx];
     let mut full_cigar = String::new();
 
-    let (clip_head, clip_tail) = if r.is_reverse {
-        (qlen.saturating_sub(r.query_end), r.query_start)
-    } else {
-        (r.query_start, qlen.saturating_sub(r.query_end))
-    };
+    let (clip_head, clip_tail) = clip_lengths(r, qlen);
 
-    let clip_char = if (flag & 0x800 != 0 && !opt.flags.contains(AlignFlags::SOFTCLIP))
-        || (flag & 0x100 != 0 && opt.flags.contains(AlignFlags::SECONDARY_SEQ)) { 'H' } else { 'S' };
+    let style = seq_style(r.is_secondary, sam_pri_i, opt);
+    let clip_char = style.clip_char();
     if clip_head > 0 { full_cigar.push_str(&format!("{}{}", clip_head, clip_char)); }
     full_cigar.push_str(&r.cigar_str);
     if clip_tail > 0 { full_cigar.push_str(&format!("{}{}", clip_tail, clip_char)); }
@@ -2447,9 +2496,7 @@ fn format_sam_record(
     };
 
     let no_qual = opt.flags.contains(AlignFlags::NO_QUAL);
-    let sec_seq = opt.flags.contains(AlignFlags::SECONDARY_SEQ);
-    let soft_supp = opt.flags.contains(AlignFlags::SOFTCLIP);
-    let (out_seq, out_qual) = if flag & 0x900 == 0 || (flag & 0x800 != 0 && soft_supp) {
+    let (out_seq, out_qual) = if style == SeqStyle::FullRead {
         let seq = if r.is_reverse {
             String::from_utf8(rev_comp(qseq)).unwrap_or_else(|_| "INVALID_UTF8".to_string())
         } else {
@@ -2463,7 +2510,7 @@ fn format_sam_record(
             "*".to_string()
         };
         (seq, q)
-    } else if flag & 0x100 != 0 && !sec_seq {
+    } else if style == SeqStyle::NoSeq {
         ("*".to_string(), "*".to_string())
     } else {
         let partial_seq = &qseq[r.query_start..r.query_end];
@@ -2919,6 +2966,22 @@ mod tests {
     use super::*;
     use crate::align::index::Index;
     use crate::align::extend::AlignmentContext;
+
+    #[test]
+    fn test_seq_style_follows_sam_flag_and_clip_options() {
+        let mut opt = MapOptions::default();
+        // Defaults: no -Y, no --secondary-seq.
+        assert_eq!(seq_style(false, true, &opt), SeqStyle::FullRead, "primary");
+        assert_eq!(seq_style(false, false, &opt), SeqStyle::AlignedOnly, "supplementary");
+        assert_eq!(seq_style(true, false, &opt), SeqStyle::NoSeq, "secondary");
+        // -Y keeps the whole read on supplementary records.
+        opt.flags.insert(AlignFlags::SOFTCLIP);
+        assert_eq!(seq_style(false, false, &opt), SeqStyle::FullRead, "supplementary with -Y");
+        assert_eq!(seq_style(true, false, &opt), SeqStyle::NoSeq, "secondary with -Y");
+        // --secondary-seq gives secondary records their aligned span, hard-clipped.
+        opt.flags.insert(AlignFlags::SECONDARY_SEQ);
+        assert_eq!(seq_style(true, false, &opt), SeqStyle::AlignedOnly, "secondary with --secondary-seq");
+    }
 
     #[test]
     fn test_count_cigar_ops() {

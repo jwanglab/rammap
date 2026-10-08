@@ -91,7 +91,8 @@ pub enum Strand {
 pub struct CigarOp {
     /// Operation length.
     pub len: u32,
-    /// Operation type: 0=M, 1=I, 2=D, 3=N (intron skip).
+    /// Operation type: 0=M, 1=I, 2=D, 3=N (intron skip); 4=S (soft clip) and 5=H (hard clip)
+    /// appear only in [`FullCigar`].
     pub op: u8,
 }
 
@@ -100,6 +101,39 @@ impl CigarOp {
     pub fn op_char(&self) -> char {
         match self.op { 0 => 'M', 1 => 'I', 2 => 'D', 3 => 'N', 4 => 'S', 5 => 'H', 7 => '=', 8 => 'X', _ => '?' }
     }
+
+    /// Build an operation from its CIGAR character (the inverse of [`CigarOp::op_char`]);
+    /// `None` for any other character.
+    pub fn from_char(len: u32, c: char) -> Option<Self> {
+        let op = match c {
+            'M' => 0, 'I' => 1, 'D' => 2, 'N' => 3, 'S' => 4, 'H' => 5, '=' => 7, 'X' => 8,
+            _ => return None,
+        };
+        Some(CigarOp { len, op })
+    }
+
+    /// Returns true if this op consumes query bases present in SEQ/QUAL (`M`, `I`, `S`, `=`, `X`).
+    pub fn consumes_query(&self) -> bool {
+        matches!(self.op_char(), 'M' | 'I' | 'S' | '=' | 'X')
+    }
+}
+
+/// A CIGAR sequence paired with the read range for SEQ and QUAL to guarantee consistency.
+///
+/// Follows minimap2 SAM formatting rules:
+/// - **Primary**: Full read with soft clips (`S`).
+/// - **Supplementary**: Aligned span with hard clips (`H`), unless `SOFTCLIP` (`-Y`) is set.
+/// - **Secondary**: No sequence (`None`), unless `SECONDARY_SEQ` is set (then hard-clipped).
+///
+/// **Invariant**: Sequence-consuming ops (`M`, `I`, `S`, `=`, `X`) sum to `seq_range.len()`.
+/// Reverse-strand mappings reverse QUAL and reverse-complement SEQ over `read[seq_range]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FullCigar {
+    /// CIGAR ops including leading and trailing clips.
+    pub ops: Vec<CigarOp>,
+    /// Forward-read index range for SEQ/QUAL, or `None` if outputting `*`.
+    pub seq_range: Option<std::ops::Range<usize>>,
 }
 
 /// Per-call options for CS/MD tag generation, overriding the aligner default.
@@ -164,6 +198,9 @@ pub struct Mapping {
     pub cigar: Option<String>,
     /// Structured CIGAR (if CIGAR output enabled). Each element is (len, op).
     pub cigar_ops: Option<Vec<CigarOp>>,
+    /// `cigar_ops` with clip operations and the read range for SEQ/QUAL (see [`FullCigar`]).
+    /// `None` when `cigar_ops` is `None`, and always `None` on the paired-end/PAF path.
+    pub full_cigar: Option<FullCigar>,
     /// CS tag string (if requested).
     pub cs: Option<String>,
     /// MD tag string (if requested).
@@ -521,7 +558,7 @@ impl Aligner {
                 crate::align::jump::jump_split(&self.index, &self.options, &out, qlen, seq, r, jdb);
             }
         }
-        to_map_result(&pq, &self.index, &out, seq.len())
+        to_map_result(&pq, &self.index, &out, &self.options, seq.len())
     }
 
     /// Align a paired-end read pair against the reference.
@@ -658,6 +695,7 @@ fn to_map_result(
     pq: &pipeline::ProcessedQuery,
     mi: &Index,
     out: &OutputConfig,
+    opt: &MapOptions,
     qlen: usize,
 ) -> MapResult {
     // Cache Arc<str> per target to avoid cloning the name for each alignment
@@ -666,6 +704,21 @@ fn to_map_result(
     let mappings = pq.results.iter().zip(pq.mapqs.iter()).zip(pq.sam_pri.iter()).enumerate().map(|(idx, ((r, &mapq), &sam_pri_i))| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
         let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
+        let full_cigar = cigar_ops.as_ref().map(|ops| {
+            let style = pipeline::seq_style(r.is_secondary, sam_pri_i, opt);
+            let (head, tail) = pipeline::clip_lengths(r, qlen);
+            let clip = |len| CigarOp::from_char(len as u32, style.clip_char()).unwrap();
+
+            let mut full = Vec::with_capacity(ops.len() + 2);
+            if head > 0 { full.push(clip(head)); }
+            full.extend_from_slice(ops);
+            if tail > 0 { full.push(clip(tail)); }
+
+            FullCigar {
+                ops: full,
+                seq_range: style.seq_range(qlen, r.query_start, r.query_end),
+            }
+        });
         let trans_strand = match r.trans_strand {
             1 => Some(Strand::Forward),
             2 => Some(Strand::Reverse),
@@ -694,6 +747,7 @@ fn to_map_result(
             edit_distance: r.edit_distance,
             cigar: cigar_str,
             cigar_ops,
+            full_cigar,
             cs: if out.do_cs && !r.cs_str.is_empty() { Some(r.cs_str.clone()) } else { None },
             md: if out.do_md && !r.md_str.is_empty() { Some(r.md_str.clone()) } else { None },
             score: r.align_score,
@@ -712,11 +766,8 @@ fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
         if c.is_ascii_digit() {
             num = num * 10 + (c as u32 - '0' as u32);
         } else {
-            let op = match c {
-                'M' => 0, 'I' => 1, 'D' => 2, 'N' => 3, 'S' => 4, 'H' => 5, '=' => 7, 'X' => 8,
-                _ => continue,
-            };
-            if num > 0 { ops.push(CigarOp { len: num, op }); }
+            let Some(op) = CigarOp::from_char(num, c) else { continue };
+            if num > 0 { ops.push(op); }
             num = 0;
         }
     }
@@ -775,7 +826,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
             is_primary: !is_secondary, is_supplementary: false, is_zdrop_rescued: false,
             is_spliced, trans_strand: None,
             matches, block_len,
-            edit_distance, cigar, cigar_ops, cs, md, score, divergence,
+            edit_distance, cigar, cigar_ops, full_cigar: None, cs, md, score, divergence,
             sa_tag: None,
         });
     }
@@ -1801,5 +1852,84 @@ mod tests {
             result.mappings.iter().all(|m| m.is_primary && !m.is_supplementary),
             "neither mate of a clean pair is supplementary: {:?}", result.mappings,
         );
+    }
+
+    fn ops_string(ops: &[CigarOp]) -> String {
+        ops.iter().map(|o| format!("{}{}", o.len, o.op_char())).collect()
+    }
+
+    fn assert_full_cigar(
+        full: &FullCigar,
+        expected_cigar: &str,
+        expected_range: std::ops::Range<usize>,
+        expected_seq_len: usize,
+    ) {
+        let actual_seq_len: usize = full.ops.iter().filter(|o| o.consumes_query()).map(|o| o.len as usize).sum();
+        assert_eq!(ops_string(&full.ops), expected_cigar, "CIGAR string mismatch");
+        assert_eq!(full.seq_range, Some(expected_range), "seq_range mismatch");
+        assert_eq!(actual_seq_len, expected_seq_len, "seq_len invariant failed");
+    }
+
+    #[test]
+    fn test_full_cigar_soft_clips_and_full_seq_range_on_both_strands() {
+        let mut st = 0xC0FFEE_u64;
+        let reference = gen_dna(&mut st, 400);
+        let head_junk = gen_dna(&mut st, 20);
+        let tail_junk = gen_dna(&mut st, 15);
+
+        // Construct query: 20bp head + 200bp reference + 15bp tail (235bp total).
+        let query: Vec<u8> = head_junk.iter()
+            .chain(&reference[100..300])
+            .chain(&tail_junk)
+            .copied()
+            .collect();
+
+        let aligner = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::Sr);
+
+        // Forward strand: 1bp at each junk boundary matches the reference, extending alignment to 202bp.
+        let fwd = aligner.map_seq("fwd", &query);
+        let m_fwd = &fwd.mappings[0];
+        let full_fwd = m_fwd.full_cigar.as_ref().expect("full_cigar present");
+
+        assert_full_cigar(full_fwd, "19S202M14S", 0..235, 235);
+        assert_eq!(ops_string(m_fwd.cigar_ops.as_ref().unwrap()), "202M");
+        // Reverse strand: should yield identical clip lengths and seq_range.
+        let rev = aligner.map_seq("rev", &crate::align::extend::rev_comp(&query));
+        let m_rev = &rev.mappings[0];
+        assert_eq!(m_rev.strand, Strand::Reverse);
+
+        let full_rev = m_rev.full_cigar.as_ref().expect("full_cigar present");
+        assert_full_cigar(full_rev, "19S202M14S", 0..235, 235);
+    }
+
+    #[test]
+    fn test_full_cigar_hard_clips_supplementary_unless_soft_clip_is_set() {
+        let contig_a = random_seq(11, 1000);
+        let contig_b = random_seq(22, 1000);
+        let seqs = vec![
+            ("contigA".to_string(), contig_a.clone()),
+            ("contigB".to_string(), contig_b.clone()),
+        ];
+        // Chimeric query: last 400bp of contig A + first 400bp of contig B (800bp total).
+        let mut query = contig_a[600..1000].to_vec();
+        query.extend_from_slice(&contig_b[0..400]);
+
+        let mut aligner = Aligner::builder(Preset::MapOnt).from_seqs(seqs).unwrap();
+        // Default (no -Y): Primary keeps full read (soft clipped); supplementary is hard clipped.
+        let result = aligner.map_seq("chimeric", &query);
+        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
+        assert_eq!(non_secondary.len(), 2);
+
+        let (primary, supp) = (non_secondary[0], non_secondary[1]);
+        assert_eq!((primary.target_name.as_ref(), supp.target_name.as_ref()), ("contigB", "contigA"));
+        assert_full_cigar(primary.full_cigar.as_ref().unwrap(), "400S400M", 0..800, 800);
+        assert_full_cigar(supp.full_cigar.as_ref().unwrap(), "400M400H", 0..400, 400);
+
+        // With SOFTCLIP (-Y): Supplementary keeps the full read with soft clips.
+        aligner.options_mut().flags.insert(AlignFlags::SOFTCLIP);
+        let result = aligner.map_seq("chimeric", &query);
+        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
+        let supp_soft = non_secondary[1].full_cigar.as_ref().unwrap();
+        assert_full_cigar(supp_soft, "400M400S", 0..800, 800);
     }
 }
