@@ -200,6 +200,9 @@ pub struct Aligner {
     /// Optional known-junction database (minimap2 `--junc-bed` equivalent),
     /// biasing splice scoring toward annotated junctions when set.
     junc_db: Option<JunctionDb>,
+    /// Optional jump-splice database (minimap2 `-j`). Post-alignment step (see [`Aligner::load_jump_bed`])
+    /// that extends clipped ends across annotated junctions missed during chaining.
+    jump_db: Option<crate::align::jump::JumpDb>,
 }
 
 /// Largest supported k-mer size.
@@ -391,7 +394,7 @@ impl AlignerBuilder {
             do_cigar: self.cigar, do_cs: false, cs_long: false, do_md: false, do_ds: false,
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
-        Aligner { index, options: opt, out_cfg, junc_db: None }
+        Aligner { index, options: opt, out_cfg, junc_db: None, jump_db: None }
     }
 }
 
@@ -493,14 +496,25 @@ impl Aligner {
     }
 
     /// Align a single-end read with per-call options (CS/MD toggles).
+    ///
+    /// If a jump-splice database is loaded ([`Aligner::load_jump_bed`]) and `AlignFlags::SPLICE` is set,
+    /// results pass through [`crate::align::jump::jump_split`] before conversion to [`Mapping`].
+    ///
+    /// Single-end only; ignored by [`Aligner::map_pair_with`].
     pub fn map_seq_with(&self, name: &str, seq: &[u8], opts: MapOpts) -> MapResult {
         let mut ctx = AlignmentContext::new();
         let mut map_ctx = MapContext::new();
         let out = self.resolve_out_cfg(&opts);
-        let pq = pipeline::process_query(
+        let mut pq = pipeline::process_query(
             &self.options, &self.index, name, seq,
             &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
+        if let Some(jdb) = self.jump_db.as_ref().filter(|_| self.options.flags.contains(AlignFlags::SPLICE)) {
+            let qlen = seq.len();
+            for r in pq.results.iter_mut() {
+                crate::align::jump::jump_split(&self.index, &self.options, &out, qlen, seq, r, jdb);
+            }
+        }
         to_map_result(&pq, &self.index, &out)
     }
 
@@ -521,6 +535,14 @@ impl Aligner {
             &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         parse_paf_to_map_result(&output, &self.index)
+    }
+
+    /// Loads a BED12 database to extend clipped alignment ends across missed junctions (`minimap2 -j`).
+    /// Distinct from [`Aligner::load_junctions_bed`], which only biases splice scoring. Must be called after index construction.
+    pub fn load_jump_bed(&mut self, path: &str) -> io::Result<()> {
+        let db = crate::align::jump::JumpDb::load(&self.index, path, 0x1, -1)?;
+        self.jump_db = Some(db);
+        Ok(())
     }
 
     /// Load known splice junctions from a BED file (BED6/BED12), enabling
@@ -1504,6 +1526,66 @@ mod tests {
             "annotated splice should sit at the junction (cigar {c1})");
         assert_ne!(intron_donor_offset(&c0), Some(intron_start),
             "unannotated splice should be mis-placed (cigar {c0})");
+    }
+
+    /// Behavioral test: a jump-splice BED must actually change the alignment output by
+    /// recovering clipped short exons. Build a two-exon reference with a second exon shorter
+    /// than the k-mer size. Without a jump BED, ordinary seed-chaining clips the unchainable exon;
+    /// loading the BED recovers the full-length spliced alignment — proving the jump DB reaches
+    /// the aligner output.
+    #[test]
+    fn test_jump_db_recovers_clipped_short_exon() {
+        let mut st = 0xC0FFEE_u64;
+        let exon1 = gen_dna(&mut st, 100);
+        let intron = gen_dna(&mut st, 500);
+        let exon2 = gen_dna(&mut st, 10);
+        let padding = gen_dna(&mut st, 30);
+        let reference: Vec<u8> = exon1.iter().chain(&intron).chain(&exon2).chain(&padding).copied().collect();
+        let query: Vec<u8> = exon1.iter().chain(&exon2).copied().collect();
+        let intron_start = exon1.len() as i32;
+        let intron_end = exon1.len() + intron.len();
+
+        // Baseline: no jump DB annotation.
+        let a0 = Aligner::from_seqs(vec![("chr1".to_string(), reference.clone())], Preset::SpliceSr);
+        let r0 = a0.map_seq("read", &query);
+        assert_eq!(r0.mappings.len(), 1, "expected one mapping without jump DB");
+        let m0 = &r0.mappings[0];
+        let c0 = m0.cigar.clone().expect("cigar present");
+
+        // Same alignment, with the true intron loaded via jump BED12.
+        let mut a1 = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::SpliceSr);
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_jumpdb_behavior_{}.bed", std::process::id()));
+        // The target junction twice (two different transcripts sharing the same intron, as
+        // real annotations routinely do) to verify that JumpDb::load is deduping these junctions.
+        std::fs::write(
+            &path,
+            format!(
+                "chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n\
+                 chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n",
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len(), exon2.len(), intron_end,
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len(), exon2.len(), intron_end,
+            ),
+        ).expect("write test BED");
+        a1.load_jump_bed(path.to_str().unwrap()).expect("load_jump_bed");
+        let _ = std::fs::remove_file(&path);
+        let r1 = a1.map_seq("read", &query);
+        assert_eq!(r1.mappings.len(), 1, "expected one mapping with jump DB");
+        let m1 = &r1.mappings[0];
+        let c1 = m1.cigar.clone().expect("cigar present");
+
+        // The jump annotation changed the alignment and recovered the clipped exon.
+        assert_ne!(c0, c1, "jump BED should change the CIGAR (both = {c0})");
+        assert!(!m0.is_spliced && m1.is_spliced, "jump BED should recover splice (c0={c0}, c1={c1})");
+        assert_eq!(m1.query_end, query.len(), "jump BED should extend to cover the full query (cigar {c1})");
+        // With the annotation the intron snaps exactly to the annotated donor;
+        // without it, the second exon remains unaligned.
+        assert_eq!(intron_donor_offset(&c1), Some(intron_start),
+            "annotated splice should sit at the junction (cigar {c1})");
     }
 
     #[test]

@@ -6,7 +6,8 @@
 
 use crate::align::index::Index;
 use crate::align::map::MapOptions;
-use crate::align::pipeline::AlnResult;
+use crate::align::extend::{convert_cigar_to_eqx_pub, fmt_cs, fmt_ds, fmt_md, CigarOp};
+use crate::align::pipeline::{AlnResult, OutputConfig};
 
 const MIN_EXON_LEN: usize = 20;
 const JUNC_ANNO: u16 = 0x1;
@@ -100,10 +101,17 @@ impl JumpDb {
                 });
             }
         }
-
-        // Sort each per-ref array by (off, off2)
+        
+        // Sort and collapse duplicate junctions by (left_pos, right_pos, strand).
+        // Transcripts sharing identical introns create duplicate BED12 entries,
+        // which prevents jump_split from making unique alignment matches.
         for juncs in &mut junctions {
-            juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+            juncs.sort_by(|a, b| {
+                a.left_pos.cmp(&b.left_pos)
+                    .then(a.right_pos.cmp(&b.right_pos))
+                    .then(a.strand.cmp(&b.strand))
+            });
+            juncs.dedup_by(|a, b| a.left_pos == b.left_pos && a.right_pos == b.right_pos && a.strand == b.strand);
         }
 
         Ok(JumpDb { junctions })
@@ -137,16 +145,17 @@ impl JumpDb {
         None // should not happen for valid input
     }
 
-    /// Get all junctions with off in [st, en) for reference rid.
+    /// Get all junctions with st < off <= en for reference rid.
     pub fn get(&self, rid: usize, st: i32, en: i32) -> &[JumpJunc] {
         if rid >= self.junctions.len() { return &[]; }
         let juncs = &self.junctions[rid];
         if juncs.is_empty() { return &[]; }
         // en used directly (already clamped by caller)
-        let l = match Self::get_core(juncs, st) { Some(v) => v, None => return &[] };
-        let r = match Self::get_core(juncs, en) { Some(v) => v, None => return &[] };
-        if r < l { return &[]; }
-        &juncs[l + 1..=r]  // return a[l+1..r] inclusive
+        // A start below the first junction means the window begins at index 0.
+        let lo = Self::get_core(juncs, st).map_or(0, |v| v + 1);
+        let hi = match Self::get_core(juncs, en) { Some(v) => v, None => return &[] };
+        if hi < lo { return &[]; }
+        &juncs[lo..=hi]
     }
 }
 
@@ -194,14 +203,17 @@ fn get_tseq(mi: &Index, rid: usize, st: usize, en: usize) -> Vec<u8> {
 pub fn jump_split(
     mi: &Index,
     opt: &MapOptions,
+    out: &OutputConfig,
     qlen: usize,
     qseq: &[u8],  // ASCII query
     r: &mut AlnResult,
     jump_db: &JumpDb,
 ) {
     // EQX mode not supported for jump split
+    let cigar0 = r.cigar_str.clone();
     jump_split_left(mi, opt, qlen, qseq, r, jump_db, 0);
     jump_split_right(mi, opt, qlen, qseq, r, jump_db, 0);
+    if r.cigar_str != cigar0 { refresh_tags(mi, out, qseq, r); }
 }
 
 /// Check if alignment is eligible for jump extension.
@@ -328,15 +340,16 @@ fn jump_split_left(
     };
 
     let ai = &candidates[i0];
-    let l = ai.left_pos - r.ref_start as i32; // may be negative
+    // Signed offset from the original alignment start to the new post-intron boundary.
+    let junction_shift = ai.left_pos - r.ref_start as i32;
 
-    if m == 1 && clip as i32 + l >= opt.filtering.jump_min_match {
+    if m == 1 && clip as i32 + junction_shift >= opt.filtering.jump_min_match {
         // Add one more exon: prepend match + intron to CIGAR
-        let new_match_len = clip as i32 + l;
+        let new_match_len = clip as i32 + junction_shift;
         let intron_len = ai.left_pos - ai.right_pos;
 
-        // Modify existing first CIGAR op (reduce its length by l)
-        let first_op_new_len = get_first_cigar_len(&r.cigar_str) as i32 - l;
+        // Modify existing first CIGAR op (reduce its length by junction_shift)
+        let first_op_new_len = get_first_cigar_len(&r.cigar_str) as i32 - junction_shift;
         let rest_cigar = trim_first_cigar_op(&r.cigar_str, first_op_new_len as usize);
 
         r.cigar_str = format!("{}M{}N{}", new_match_len, intron_len, rest_cigar);
@@ -352,11 +365,11 @@ fn jump_split_left(
             r.dp_score += bonus;
         }
     } else if m > 0 && ai.left_pos > r.ref_start as i32 {
-        // Trim by l (positive)
-        let first_new_len = get_first_cigar_len(&r.cigar_str) as i32 - l;
+        // Trim by junction_shift (positive)
+        let first_new_len = get_first_cigar_len(&r.cigar_str) as i32 - junction_shift;
         r.cigar_str = replace_first_cigar_len(&r.cigar_str, first_new_len as usize);
-        r.ref_start += l as usize;
-        if !r.is_reverse { r.query_start += l as usize; } else { r.query_end -= l as usize; }
+        r.ref_start += junction_shift as usize;
+        if !r.is_reverse { r.query_start += junction_shift as usize; } else { r.query_end -= junction_shift as usize; }
     }
 }
 
@@ -443,15 +456,16 @@ fn jump_split_right(
     };
 
     let ai = &candidates[i0];
-    let l = r.ref_end as i32 - ai.left_pos; // may be negative
+    // Signed offset from the original alignment end to the new pre-intron boundary.
+    let junction_shift = r.ref_end as i32 - ai.left_pos;
 
-    if m == 1 && clip as i32 + l >= opt.filtering.jump_min_match {
+    if m == 1 && clip as i32 + junction_shift >= opt.filtering.jump_min_match {
         // Add one more exon: append intron + match to CIGAR
-        let new_match_len = clip as i32 + l;
+        let new_match_len = clip as i32 + junction_shift;
         let intron_len = ai.right_pos - ai.left_pos;
 
-        // Modify existing last CIGAR op (reduce its length by l)
-        let last_new_len = get_last_cigar_len(&r.cigar_str) as i32 - l;
+        // Modify existing last CIGAR op (reduce its length by junction_shift)
+        let last_new_len = get_last_cigar_len(&r.cigar_str) as i32 - junction_shift;
         let prefix_cigar = trim_last_cigar_op(&r.cigar_str, last_new_len as usize);
 
         r.cigar_str = format!("{}{}N{}M", prefix_cigar, intron_len, new_match_len);
@@ -467,11 +481,11 @@ fn jump_split_right(
             r.dp_score += bonus;
         }
     } else if m > 0 && r.ref_end as i32 > ai.left_pos {
-        // Trim by l (positive)
-        let last_new_len = get_last_cigar_len(&r.cigar_str) as i32 - l;
+        // Trim by junction_shift (positive)
+        let last_new_len = get_last_cigar_len(&r.cigar_str) as i32 - junction_shift;
         r.cigar_str = replace_last_cigar_len(&r.cigar_str, last_new_len as usize);
-        r.ref_end -= l as usize;
-        if !r.is_reverse { r.query_end -= l as usize; } else { r.query_start += l as usize; }
+        r.ref_end -= junction_shift as usize;
+        if !r.is_reverse { r.query_end -= junction_shift as usize; } else { r.query_start += junction_shift as usize; }
     }
 }
 
@@ -519,4 +533,164 @@ fn trim_last_cigar_op(cigar: &str, new_len: usize) -> String {
 
 fn replace_last_cigar_len(cigar: &str, new_len: usize) -> String {
     trim_last_cigar_op(cigar, new_len)
+}
+
+/// Recompute NM and de, and regenerate requested MD/cs/ds, from the final CIGAR.
+fn refresh_tags(mi: &Index, out: &OutputConfig, qseq: &[u8], r: &mut AlnResult) {
+    let raw: Vec<u32> = parse_cigar_ops(&r.cigar_str).iter().map(|&(len, op)| {
+        let code = match op { b'I' => 1, b'D' => 2, b'N' => 3, b'=' => 7, b'X' => 8, _ => 0 };
+        (len << 4) | code
+    }).collect();
+    let (mut n_gap, mut n_gapo) = (0usize, 0usize);
+    for &c in &raw {
+        if matches!(c & 0xf, 1 | 2) { n_gap += (c >> 4) as usize; n_gapo += 1; }
+    }
+    r.edit_distance = (r.block_len - r.matches + r.num_ambiguous) as u32;
+    let denom = (r.block_len + r.num_ambiguous + n_gapo) as f64 - n_gap as f64;
+    r.divergence = if denom > 0.0 { 1.0 - r.matches as f64 / denom } else { 0.0 };
+
+    if !(out.do_md || out.do_cs || out.do_ds) { return; }
+    let q: Vec<u8> = if !r.is_reverse {
+        qseq[r.query_start..r.query_end].iter().map(|&b| seq_nt4(b)).collect()
+    } else {
+        qseq[r.query_start..r.query_end].iter().rev()
+            .map(|&b| { let c = seq_nt4(b); if c < 4 { 3 - c } else { c } }).collect()
+    };
+    let t = get_tseq(mi, r.ref_id, r.ref_start, r.ref_end);
+    let mut ops: Vec<CigarOp> = Vec::new();
+    for op in convert_cigar_to_eqx_pub(&raw, &q, &t, 0, 0) {
+        match ops.last_mut() {
+            Some(last) if last.op == op.op => last.len += op.len,
+            _ => ops.push(op),
+        }
+    }
+    if out.do_md { r.md_str = fmt_md(&ops, &t, 0); }
+    if out.do_cs { r.cs_str = fmt_cs(&ops, &q, &t, 0, 0, out.cs_long); }
+    if out.do_ds { r.ds_str = fmt_ds(&ops, &q, &t, 0, 0); }
+}
+
+fn parse_cigar_ops(cigar: &str) -> Vec<(u32, u8)> {
+    let mut ops = Vec::new();
+    let mut n = 0u32;
+    for &c in cigar.as_bytes() {
+        if c.is_ascii_digit() { n = n * 10 + (c - b'0') as u32; } else { ops.push((n, c)); n = 0; }
+    }
+    ops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::index::Index;
+
+    // Deterministic pseudo-random ACGT sequence, no homopolymer runs (LCG).
+    fn gen_dna(state: &mut u64, n: usize) -> Vec<u8> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < n {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = bases[(*state >> 33) as usize % 4];
+            if seq.last() != Some(&b) { seq.push(b); }
+        }
+        seq
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_aln_result(
+        ref_id: usize, cigar_str: &str, md_str: &str, query_start: usize, query_end: usize,
+        ref_start: usize, ref_end: usize, matches: usize, block_len: usize, divergence: f64,
+    ) -> AlnResult {
+        AlnResult {
+            ref_id, is_reverse: false, chain_score: 0, initial_chain_score: 0, anchor_count: 0, s2_score: None, hash: 0,
+            align_score: 0, matches, block_len, cigar_str: cigar_str.to_string(), cs_str: String::new(), ds_str: String::new(),
+            md_str: md_str.to_string(), query_start, query_end, ref_start, ref_end, edit_distance: 0, num_ambiguous: 0, divergence,
+            is_secondary: false, split: 0, split_depth: 0, dp_score: 0, dp_score_original: 0, effective_cnt: 0, pre_num_suboptimal: 0,
+            is_spliced: false, trans_strand: 0, dp_score_secondary: 0, secondary_chain_score: 0, num_suboptimal: 0, split_inv: false,
+            inv: false, proper_frag: false, seg_split: false, div: 0.0, is_alt: false, is_root_chain: false,
+        }
+    }
+
+    /// Verifies that `jump_split` updates derived alignment fields (`md_str`, `cs_str`,
+    /// `divergence`, and `edit_distance`) alongside `cigar_str` when extending an alignment.
+    ///
+    /// Specifically tests boundary expansion ("growth") where a mismatch falls within
+    /// the confirmation/growth window (`mm2`) prior to the new exon junction.
+    #[test]
+    fn test_jump_split_right_extends_derived_fields_through_a_growth_mismatch() {
+        let mut st = 0xC0FFEE_u64;
+        let mut exon1 = gen_dna(&mut st, 100); // true first exon, full length
+        let intron = gen_dna(&mut st, 500);
+        let exon2 = gen_dna(&mut st, 10);
+        let padding = gen_dna(&mut st, 30); // room for jump_split_right's own bounds check
+
+        // Hardcode an explicit C -> A SNP at position 98
+        let mismatch_pos = 98;
+        let ref_base_at_mismatch = b'C';
+        exon1[mismatch_pos] = ref_base_at_mismatch;
+        let reference = [&exon1[..], &intron[..], &exon2[..], &padding[..]].concat();
+
+        let mut query_exon1 = exon1.clone();
+        query_exon1[mismatch_pos] = b'A'; // Mismatch in query sequence
+        let query = [&query_exon1[..], &exon2[..]].concat();
+
+        let index = Index::build(vec![("chr1".to_string(), reference)], 5, 15, false, usize::MAX);
+
+        // Build candidate splice database entry for the intron
+        let intron_start = exon1.len() as i32;
+        let intron_end = (exon1.len() + intron.len()) as i32;
+        let jump_db = JumpDb {
+            junctions: vec![vec![
+                JumpJunc { left_pos: intron_start, right_pos: intron_end, count: 1, strand: 1, flag: JUNC_ANNO },
+                JumpJunc { left_pos: intron_end, right_pos: intron_start, count: 1, strand: 1, flag: JUNC_ANNO },
+            ]],
+        };
+
+        let opt = MapOptions::default();
+        // Baseline state before jump_split: stopped short at pos 98 (98 matches, MD: "98")
+        let mut r = make_aln_result(0, "98M", "98", 0, 98, 0, 98, 98, 98, 0.0);
+
+        let out = OutputConfig {
+            do_cigar: true, do_cs: true, cs_long: false, do_md: true, do_ds: false,
+            eqx: false, output_sam: true, rg_id: None, split_mode: false,
+        };
+        jump_split(&index, &opt, &out, query.len(), &query, &mut r, &jump_db);
+
+        // Expected state after growing through C->A mismatch and splicing 10bp exon 2:
+        let expected_divergence = 1.0 - (109.0 / 110.0);
+
+        assert_eq!(r.cigar_str, format!("{}M{}N{}M", exon1.len(), intron.len(), exon2.len()));
+        assert_eq!(r.matches, 109);
+        assert_eq!(r.edit_distance, 1);
+        assert_eq!(r.md_str, "98C11");
+        assert_eq!(r.cs_str, format!(":98*ca:1~{}{}{}:10",
+            std::str::from_utf8(&intron[..2]).unwrap().to_ascii_lowercase(), intron.len(),
+            std::str::from_utf8(&intron[intron.len() - 2..]).unwrap().to_ascii_lowercase()));
+        assert!((r.divergence - expected_divergence).abs() < 1e-9);
+    }
+
+    fn db(offs: &[i32]) -> JumpDb {
+        let juncs = offs.iter()
+            .map(|&o| JumpJunc { left_pos: o, right_pos: o + 500, count: 0, strand: 1, flag: JUNC_ANNO })
+            .collect();
+        JumpDb { junctions: vec![juncs] }
+    }
+
+    fn lefts(js: &[JumpJunc]) -> Vec<i32> { js.iter().map(|j| j.left_pos).collect() }
+
+    #[test]
+    fn test_get_window_starting_before_first_junction() {
+        let d = db(&[100, 600]);
+        assert_eq!(lefts(d.get(0, 96, 104)), vec![100]);
+        assert_eq!(lefts(d.get(0, 0, 700)), vec![100, 600]);
+        assert!(d.get(0, 0, 99).is_empty());
+    }
+
+    #[test]
+    fn test_get_window_interior() {
+        let d = db(&[100, 200, 300, 400]);
+        assert_eq!(lefts(d.get(0, 150, 350)), vec![200, 300]);
+        assert_eq!(lefts(d.get(0, 200, 300)), vec![300]);
+        assert!(d.get(0, 210, 290).is_empty());
+        assert!(d.get(1, 0, 1000).is_empty());
+    }
 }
