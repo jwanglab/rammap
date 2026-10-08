@@ -1739,7 +1739,7 @@ fn map_one_part_split(
                 let is_splice = opt.flags.contains(AlignFlags::SPLICE);
                 if is_splice {
                     for r in pq.results.iter_mut() {
-                        rammap::align::jump::jump_split(mi, opt, qseq.len(), &qseq, r, jdb);
+                        rammap::align::jump::jump_split(mi, opt, out_cfg, qseq.len(), &qseq, r, jdb);
                     }
                 }
             }

@@ -113,6 +113,7 @@ pub struct MapOpts {
 
 /// A single alignment result.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Mapping {
     /// Target sequence name (shared via Arc to reduce allocation when many
     /// alignments reference the same target).
@@ -135,8 +136,20 @@ pub struct Mapping {
     pub mapq: i32,
     /// Whether this is a primary alignment.
     pub is_primary: bool,
-    /// Whether this is a supplementary alignment.
+    /// Whether this mapping would receive SAM FLAG 0x800 (supplementary) if written out.
+    /// `false` for secondary mappings (`!is_primary`) and for the first non-secondary mapping
+    /// of a read (which is SAM-primary, FLAG 0); `true` for every subsequent non-secondary
+    /// mapping. This is the real primary/supplementary determination minimap2 and rammap's own
+    /// SAM writer use (`align/pipeline.rs`'s `sam_pri`). Always `false` on the paired-end path,
+    /// which only sees formatted text with no per-mate boundaries.
     pub is_supplementary: bool,
+    /// Whether this mapping was rescued by a z-drop chain split (`split != 0`): the alignment
+    /// score collapsed mid-extension, so the aligner split the chain and re-seeded the
+    /// leftover query for this mapping separately. Independent of SAM FLAG assignment — a
+    /// chimeric read whose segments were found by independent chaining from the start (never
+    /// one continuous chain) is not z-drop-rescued on either side, yet can still be
+    /// SAM-supplementary on one of them; see [`Mapping::is_supplementary`] for that.
+    pub is_zdrop_rescued: bool,
     /// Whether this alignment contains splice junctions (N_SKIP operations).
     pub is_spliced: bool,
     /// Transcript strand for splice alignments: None=unknown, Some(Forward)=+, Some(Reverse)=-.
@@ -193,6 +206,9 @@ pub struct Aligner {
     /// Optional known-junction database (minimap2 `--junc-bed` equivalent),
     /// biasing splice scoring toward annotated junctions when set.
     junc_db: Option<JunctionDb>,
+    /// Optional jump-splice database (minimap2 `-j`). Post-alignment step (see [`Aligner::load_jump_bed`])
+    /// that extends clipped ends across annotated junctions missed during chaining.
+    jump_db: Option<crate::align::jump::JumpDb>,
 }
 
 /// Largest supported k-mer size.
@@ -384,7 +400,7 @@ impl AlignerBuilder {
             do_cigar: self.cigar, do_cs: false, cs_long: false, do_md: false, do_ds: false,
             eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
-        Aligner { index, options: opt, out_cfg, junc_db: None }
+        Aligner { index, options: opt, out_cfg, junc_db: None, jump_db: None }
     }
 }
 
@@ -486,14 +502,25 @@ impl Aligner {
     }
 
     /// Align a single-end read with per-call options (CS/MD toggles).
+    ///
+    /// If a jump-splice database is loaded ([`Aligner::load_jump_bed`]) and `AlignFlags::SPLICE` is set,
+    /// results pass through [`crate::align::jump::jump_split`] before conversion to [`Mapping`].
+    ///
+    /// Single-end only; ignored by [`Aligner::map_pair_with`].
     pub fn map_seq_with(&self, name: &str, seq: &[u8], opts: MapOpts) -> MapResult {
         let mut ctx = AlignmentContext::new();
         let mut map_ctx = MapContext::new();
         let out = self.resolve_out_cfg(&opts);
-        let pq = pipeline::process_query(
+        let mut pq = pipeline::process_query(
             &self.options, &self.index, name, seq,
             &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
+        if let Some(jdb) = self.jump_db.as_ref().filter(|_| self.options.flags.contains(AlignFlags::SPLICE)) {
+            let qlen = seq.len();
+            for r in pq.results.iter_mut() {
+                crate::align::jump::jump_split(&self.index, &self.options, &out, qlen, seq, r, jdb);
+            }
+        }
         to_map_result(&pq, &self.index, &out, seq.len())
     }
 
@@ -514,6 +541,14 @@ impl Aligner {
             &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         parse_paf_to_map_result(&output, &self.index)
+    }
+
+    /// Loads a BED12 database to extend clipped alignment ends across missed junctions (`minimap2 -j`).
+    /// Distinct from [`Aligner::load_junctions_bed`], which only biases splice scoring. Must be called after index construction.
+    pub fn load_jump_bed(&mut self, path: &str) -> io::Result<()> {
+        let db = crate::align::jump::JumpDb::load(&self.index, path, 0x1, -1)?;
+        self.jump_db = Some(db);
+        Ok(())
     }
 
     /// Load known splice junctions from a BED file (BED6/BED12), enabling
@@ -628,7 +663,7 @@ fn to_map_result(
     // Cache Arc<str> per target to avoid cloning the name for each alignment
     let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
 
-    let mappings = pq.results.iter().zip(pq.mapqs.iter()).enumerate().map(|(idx, (r, &mapq))| {
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).zip(pq.sam_pri.iter()).enumerate().map(|(idx, ((r, &mapq), &sam_pri_i))| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
         let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
         let trans_strand = match r.trans_strand {
@@ -650,7 +685,8 @@ fn to_map_result(
             strand: if r.is_reverse { Strand::Reverse } else { Strand::Forward },
             mapq,
             is_primary: !r.is_secondary,
-            is_supplementary: r.split != 0,
+            is_supplementary: !r.is_secondary && !sam_pri_i,
+            is_zdrop_rescued: r.split != 0,
             is_spliced: r.is_spliced,
             trans_strand,
             matches: r.matches,
@@ -736,7 +772,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         mappings.push(Mapping {
             target_name, target_id, target_len, target_start, target_end,
             query_start, query_end, strand, mapq,
-            is_primary: !is_secondary, is_supplementary: false,
+            is_primary: !is_secondary, is_supplementary: false, is_zdrop_rescued: false,
             is_spliced, trans_strand: None,
             matches, block_len,
             edit_distance, cigar, cigar_ops, cs, md, score, divergence,
@@ -1501,6 +1537,66 @@ mod tests {
             "unannotated splice should be mis-placed (cigar {c0})");
     }
 
+    /// Behavioral test: a jump-splice BED must actually change the alignment output by
+    /// recovering clipped short exons. Build a two-exon reference with a second exon shorter
+    /// than the k-mer size. Without a jump BED, ordinary seed-chaining clips the unchainable exon;
+    /// loading the BED recovers the full-length spliced alignment — proving the jump DB reaches
+    /// the aligner output.
+    #[test]
+    fn test_jump_db_recovers_clipped_short_exon() {
+        let mut st = 0xC0FFEE_u64;
+        let exon1 = gen_dna(&mut st, 100);
+        let intron = gen_dna(&mut st, 500);
+        let exon2 = gen_dna(&mut st, 10);
+        let padding = gen_dna(&mut st, 30);
+        let reference: Vec<u8> = exon1.iter().chain(&intron).chain(&exon2).chain(&padding).copied().collect();
+        let query: Vec<u8> = exon1.iter().chain(&exon2).copied().collect();
+        let intron_start = exon1.len() as i32;
+        let intron_end = exon1.len() + intron.len();
+
+        // Baseline: no jump DB annotation.
+        let a0 = Aligner::from_seqs(vec![("chr1".to_string(), reference.clone())], Preset::SpliceSr);
+        let r0 = a0.map_seq("read", &query);
+        assert_eq!(r0.mappings.len(), 1, "expected one mapping without jump DB");
+        let m0 = &r0.mappings[0];
+        let c0 = m0.cigar.clone().expect("cigar present");
+
+        // Same alignment, with the true intron loaded via jump BED12.
+        let mut a1 = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::SpliceSr);
+        let mut path = std::env::temp_dir();
+        path.push(format!("rammap_jumpdb_behavior_{}.bed", std::process::id()));
+        // The target junction twice (two different transcripts sharing the same intron, as
+        // real annotations routinely do) to verify that JumpDb::load is deduping these junctions.
+        std::fs::write(
+            &path,
+            format!(
+                "chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n\
+                 chr1\t0\t{}\t.\t0\t+\t0\t{}\t0\t2\t{},{}\t0,{}\n",
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len(), exon2.len(), intron_end,
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len() + intron.len() + exon2.len(),
+                exon1.len(), exon2.len(), intron_end,
+            ),
+        ).expect("write test BED");
+        a1.load_jump_bed(path.to_str().unwrap()).expect("load_jump_bed");
+        let _ = std::fs::remove_file(&path);
+        let r1 = a1.map_seq("read", &query);
+        assert_eq!(r1.mappings.len(), 1, "expected one mapping with jump DB");
+        let m1 = &r1.mappings[0];
+        let c1 = m1.cigar.clone().expect("cigar present");
+
+        // The jump annotation changed the alignment and recovered the clipped exon.
+        assert_ne!(c0, c1, "jump BED should change the CIGAR (both = {c0})");
+        assert!(!m0.is_spliced && m1.is_spliced, "jump BED should recover splice (c0={c0}, c1={c1})");
+        assert_eq!(m1.query_end, query.len(), "jump BED should extend to cover the full query (cigar {c1})");
+        // With the annotation the intron snaps exactly to the annotated donor;
+        // without it, the second exon remains unaligned.
+        assert_eq!(intron_donor_offset(&c1), Some(intron_start),
+            "annotated splice should sit at the junction (cigar {c1})");
+    }
+
     #[test]
     fn test_preset_as_str_roundtrip() {
         let presets = [
@@ -1527,6 +1623,63 @@ mod tests {
     fn test_map_result_empty() {
         let result = MapResult { mappings: Vec::new() };
         assert!(result.mappings.is_empty());
+    }
+
+    /// Deterministic pseudo-random ACGT sequence, no homopolymer runs (LCG, same
+    /// construction as `test_hpc_chain_start_clamps_at_target_start`).
+    fn random_seq(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed;
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < len {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = b"ACGT"[(x >> 33) as usize % 4];
+            if seq.last() != Some(&b) { seq.push(b); }
+        }
+        seq
+    }
+
+    /// A read whose two halves independently chain to two different, unrelated contigs
+    /// (not a z-drop chain split) is a genuine chimeric alignment: both mappings should be
+    /// SAM-primary/-supplementary (FLAG 0 / 0x800) per `is_supplementary`, even though neither
+    /// one is `is_zdrop_rescued` (that field only covers z-drop-rescued splits, see its doc
+    /// comment) — this is exactly the case that was previously indistinguishable from a
+    /// non-chimeric read under the old (pre-fix) `is_supplementary` semantics.
+    #[test]
+    fn test_independent_chimeric_read_sets_is_supplementary_not_is_zdrop_rescued() {
+        let contig_a = random_seq(11, 1000);
+        let contig_b = random_seq(22, 1000);
+        let seqs = vec![
+            ("contigA".to_string(), contig_a.clone()),
+            ("contigB".to_string(), contig_b.clone()),
+        ];
+        // Query = last 400bp of contig A + first 400bp of contig B: two unrelated loci,
+        // not a continuous chain that could z-drop-split into these same two pieces.
+        let mut query = contig_a[600..1000].to_vec();
+        query.extend_from_slice(&contig_b[0..400]);
+
+        let aligner = Aligner::builder(Preset::MapOnt)
+            .from_seqs(seqs)
+            .unwrap();
+        let result = aligner.map_seq("chimeric_query", &query);
+
+        let non_secondary: Vec<&Mapping> = result.mappings.iter().filter(|m| m.is_primary).collect();
+        assert_eq!(
+            non_secondary.len(), 2,
+            "expected exactly 2 non-secondary mappings (one per locus), got {}: {:?}",
+            non_secondary.len(), result.mappings,
+        );
+
+        assert!(
+            !non_secondary[0].is_supplementary,
+            "first non-secondary mapping should be SAM-primary (FLAG 0)"
+        );
+        assert!(
+            non_secondary[1].is_supplementary,
+            "second non-secondary mapping should be SAM-supplementary (FLAG 0x800)"
+        );
+        // Neither came from a z-drop split — this is genuine independent-chaining chimerism.
+        assert!(!non_secondary[0].is_zdrop_rescued);
+        assert!(!non_secondary[1].is_zdrop_rescued);
     }
 
     #[test]
@@ -1624,16 +1777,22 @@ mod tests {
         assert_eq!(encoded, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
     }
 
-    /// Deterministic pseudo-random ACGT sequence, no homopolymer runs (LCG).
-    fn random_seq(seed: u64, len: usize) -> Vec<u8> {
-        let mut x = seed;
-        let mut seq: Vec<u8> = Vec::new();
-        while seq.len() < len {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let b = b"ACGT"[(x >> 33) as usize % 4];
-            if seq.last() != Some(&b) { seq.push(b); }
-        }
-        seq
+    /// A normal read pair whose mates both map cleanly: each mate's alignment is SAM-primary, so
+    /// neither is supplementary. (`map_pair` only sees formatted PAF text, which has no mate
+    /// boundaries, so `is_supplementary` must not be derived from line order there.)
+    #[test]
+    fn test_paired_end_mates_are_not_supplementary() {
+        let reference = random_seq(7, 2000);
+        let read1 = reference[100..250].to_vec();
+        let read2 = crate::align::extend::rev_comp(&reference[400..550]);
+        let aligner = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::Sr);
+
+        let result = aligner.map_pair("pair", &read1, &read2);
+        assert_eq!(result.mappings.len(), 2, "expected one mapping per mate: {:?}", result.mappings);
+        assert!(
+            result.mappings.iter().all(|m| m.is_primary && !m.is_supplementary),
+            "neither mate of a clean pair is supplementary: {:?}", result.mappings,
+        );
     }
 
     /// A chimeric read (mapping to two different loci) gets a correct `sa_tag` on each

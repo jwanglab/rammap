@@ -2115,7 +2115,7 @@ pub fn align_and_format_query(
         if is_splice {
             let qlen = qseq.len();
             for r in pq.results.iter_mut() {
-                crate::align::jump::jump_split(mi, opt, qlen, qseq, r, jdb);
+                crate::align::jump::jump_split(mi, opt, out, qlen, qseq, r, jdb);
             }
         }
     }
