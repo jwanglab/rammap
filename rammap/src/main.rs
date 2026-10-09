@@ -1163,6 +1163,78 @@ struct RunConfig<'a> {
 
 /// Map all queries against one index part. Re-opens query files for each part.
 /// Returns (stats, n_reads_processed).
+type FastxRecords = rammap::fasta::reader::RecordIter<Box<dyn std::io::BufRead + Send>>;
+type SeData = (String, Vec<u8>, Option<String>, Option<String>);
+
+fn next_ok_record(it: &mut FastxRecords) -> Option<rammap::fasta::Record> {
+    loop {
+        match it.next() {
+            Some(Ok(r)) => return Some(r),
+            Some(Err(e)) => eprintln!("Warning: Error reading record: {}", e),
+            None => return None,
+        }
+    }
+}
+
+/// Next fragment of paired-end input: a pair of reads, or a lone read.
+/// Two-file input pairs the i-th record of each file. Single-file input pairs
+/// consecutive records only when their names match (ignoring a /1 or /2 suffix),
+/// so a read without a mate is mapped on its own and doesn't shift later pairs.
+fn next_fragment(
+    it1: &mut FastxRecords,
+    it2: Option<&mut FastxRecords>,
+    pending: &mut Option<rammap::fasta::Record>,
+) -> Option<(rammap::fasta::Record, Option<rammap::fasta::Record>)> {
+    if let Some(it2) = it2 {
+        loop {
+            match (it1.next(), it2.next()) {
+                (Some(Ok(r1)), Some(Ok(r2))) => return Some((r1, Some(r2))),
+                (None, None) => return None,
+                (None, _) | (_, None) => {
+                    eprintln!("Warning: query files have different number of records; extra records skipped");
+                    return None;
+                }
+                (Some(Err(e)), _) | (_, Some(Err(e))) => eprintln!("Warning: Error reading record: {}", e),
+            }
+        }
+    }
+    let r1 = match pending.take() {
+        Some(r) => r,
+        None => next_ok_record(it1)?,
+    };
+    match next_ok_record(it1) {
+        Some(r2) if rammap::align::pipeline::qname_same(r1.name(), r2.name()) => Some((r1, Some(r2))),
+        next => {
+            *pending = next;
+            Some((r1, None))
+        }
+    }
+}
+
+/// Map one paired-end-mode fragment: a read pair, or a lone read as single-end.
+#[allow(clippy::too_many_arguments)]
+fn align_fragment(
+    opt: &MapOptions,
+    mi: &Index,
+    frag: &(SeData, Option<SeData>),
+    ctx: &mut rammap::align::extend::AlignmentContext,
+    map_ctx: &mut rammap::align::map::MapContext,
+    junc_db: Option<&JunctionDb>,
+    jump_db: Option<&JumpDb>,
+    out_cfg: &OutputConfig,
+) -> (String, AlignmentStats) {
+    let (qname1, qseq1, qual1, comment1) = &frag.0;
+    let r1 = ReadInfo { qname: qname1, qseq: qseq1, qual: qual1.as_deref(), comment: comment1.as_deref(), n_seg: 1, seg_idx: 0 };
+    match &frag.1 {
+        Some((qname2, qseq2, qual2, comment2)) => {
+            let r1 = ReadInfo { n_seg: 2, ..r1 };
+            let r2 = ReadInfo { qname: qname2, qseq: qseq2, qual: qual2.as_deref(), comment: comment2.as_deref(), n_seg: 2, seg_idx: 1 };
+            rammap::align::pipeline::align_and_format_pair(opt, mi, &r1, &r2, ctx, map_ctx, junc_db, out_cfg)
+        }
+        None => rammap::align::pipeline::align_and_format_query(opt, mi, &r1, ctx, map_ctx, junc_db, jump_db, out_cfg),
+    }
+}
+
 fn map_one_part(
     mi: &Index,
     opt: &mut MapOptions,
@@ -1273,7 +1345,13 @@ fn map_one_part(
     let mut record_iter2 = reader2.map(|r| r.records());
 
     if pe_mode {
-        type PairData = (String, Vec<u8>, Option<String>, Option<String>, String, Vec<u8>, Option<String>, Option<String>);
+        type PairData = (SeData, Option<SeData>);
+        let to_se = |r: rammap::fasta::Record| -> SeData {
+            let q = r.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
+            let c = if copy_comment { r.description().map(|s| s.to_string()) } else { None };
+            (r.name().to_string(), r.sequence().to_vec(), q, c)
+        };
+        let mut pending: Option<rammap::fasta::Record> = None;
 
         // Three-stage pipeline: reader thread → worker pool → writer thread.
         // sync_channel(1) gives reader 1 chunk lookahead. The writer thread
@@ -1290,36 +1368,12 @@ fn map_one_part(
                         let mut chunk_data: Vec<PairData> = Vec::new();
                         let mut chunk_bases: u64 = 0;
                         loop {
-                            let r1 = record_iter.next();
-                            let rec1 = match r1 {
-                                Some(Ok(r)) => r,
-                                Some(Err(e)) => { eprintln!("Warning: Error reading record: {}", e); continue; },
+                            let (rec1, rec2) = match next_fragment(&mut record_iter, record_iter2.as_mut(), &mut pending) {
+                                Some(f) => f,
                                 None => break,
                             };
-
-                            let r2 = if two_file_pe {
-                                record_iter2.as_mut().unwrap().next()
-                            } else {
-                                record_iter.next()
-                            };
-                            let rec2 = match r2 {
-                                Some(Ok(r)) => r,
-                                Some(Err(e)) => { eprintln!("Warning: Error reading R2 record: {}", e); continue; },
-                                None => {
-                                    eprintln!("Warning: Odd number of reads in PE mode, last read ignored");
-                                    break;
-                                }
-                            };
-
-                            let q1 = rec1.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
-                            let c1 = if copy_comment { rec1.description().map(|s| s.to_string()) } else { None };
-                            let q2 = rec2.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
-                            let c2 = if copy_comment { rec2.description().map(|s| s.to_string()) } else { None };
-                            chunk_bases += (rec1.sequence().len() + rec2.sequence().len()) as u64;
-                            chunk_data.push((
-                                rec1.name().to_string(), rec1.sequence().to_vec(), q1, c1,
-                                rec2.name().to_string(), rec2.sequence().to_vec(), q2, c2,
-                            ));
+                            chunk_bases += (rec1.sequence().len() + rec2.as_ref().map_or(0, |r| r.sequence().len())) as u64;
+                            chunk_data.push((to_se(rec1), rec2.map(to_se)));
                             if chunk_bases >= mini_batch_size { break; }
                         }
                         let done = chunk_data.is_empty();
@@ -1346,18 +1400,16 @@ fn map_one_part(
 
                     let results: Vec<(String, AlignmentStats)> = chunk_data.par_iter().map_init(
                         || (rammap::align::extend::AlignmentContext::new(), rammap::align::map::MapContext::new()),
-                        |(ctx, map_ctx), (qname1, qseq1, qual1, comment1, qname2, qseq2, qual2, comment2)| {
-                            let r1 = ReadInfo { qname: qname1, qseq: qseq1, qual: qual1.as_deref(), comment: comment1.as_deref(), n_seg: 2, seg_idx: 0 };
-                            let r2 = ReadInfo { qname: qname2, qseq: qseq2, qual: qual2.as_deref(), comment: comment2.as_deref(), n_seg: 2, seg_idx: 1 };
+                        |(ctx, map_ctx), frag| {
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                rammap::align::pipeline::align_and_format_pair(
-                                    opt, mi, &r1, &r2,
-                                    ctx, map_ctx, junc_db.as_ref(), out_cfg,
-                                )
+                                align_fragment(opt, mi, frag, ctx, map_ctx, junc_db.as_ref(), jump_db.as_ref(), out_cfg)
                             })) {
                                 Ok(result) => result,
                                 Err(_) => {
-                                    eprintln!("[WARNING] alignment panicked for pair: {}/{}", qname1, qname2);
+                                    match &frag.1 {
+                                        Some(r2) => eprintln!("[WARNING] alignment panicked for pair: {}/{}", frag.0.0, r2.0),
+                                        None => eprintln!("[WARNING] alignment panicked for read: {}", frag.0.0),
+                                    }
                                     (String::new(), AlignmentStats::default())
                                 }
                             }
@@ -1377,40 +1429,12 @@ fn map_one_part(
                 let mut chunk_data: Vec<PairData> = Vec::new();
                 let mut chunk_bases: u64 = 0;
                 loop {
-                    let r1 = if two_file_pe {
-                        record_iter.next()
-                    } else {
-                        record_iter.next()
-                    };
-                    let rec1 = match r1 {
-                        Some(Ok(r)) => r,
-                        Some(Err(e)) => { eprintln!("Warning: Error reading record: {}", e); continue; },
+                    let (rec1, rec2) = match next_fragment(&mut record_iter, record_iter2.as_mut(), &mut pending) {
+                        Some(f) => f,
                         None => break,
                     };
-
-                    let r2 = if two_file_pe {
-                        record_iter2.as_mut().unwrap().next()
-                    } else {
-                        record_iter.next()
-                    };
-                    let rec2 = match r2 {
-                        Some(Ok(r)) => r,
-                        Some(Err(e)) => { eprintln!("Warning: Error reading R2 record: {}", e); continue; },
-                        None => {
-                            eprintln!("Warning: Odd number of reads in PE mode, last read ignored");
-                            break;
-                        }
-                    };
-
-                    let q1 = rec1.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
-                    let c1 = if copy_comment { rec1.description().map(|s| s.to_string()) } else { None };
-                    let q2 = rec2.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
-                    let c2 = if copy_comment { rec2.description().map(|s| s.to_string()) } else { None };
-                    chunk_bases += (rec1.sequence().len() + rec2.sequence().len()) as u64;
-                    chunk_data.push((
-                        rec1.name().to_string(), rec1.sequence().to_vec(), q1, c1,
-                        rec2.name().to_string(), rec2.sequence().to_vec(), q2, c2,
-                    ));
+                    chunk_bases += (rec1.sequence().len() + rec2.as_ref().map_or(0, |r| r.sequence().len())) as u64;
+                    chunk_data.push((to_se(rec1), rec2.map(to_se)));
                     if chunk_bases >= mini_batch_size { break; }
                 }
 
@@ -1419,13 +1443,8 @@ fn map_one_part(
                 let results: Vec<(String, AlignmentStats)> = {
                     let mut ctx = rammap::align::extend::AlignmentContext::new();
                     let mut map_ctx = rammap::align::map::MapContext::new();
-                    chunk_data.iter().map(|(qname1, qseq1, qual1, comment1, qname2, qseq2, qual2, comment2)| {
-                        let r1 = ReadInfo { qname: qname1, qseq: qseq1, qual: qual1.as_deref(), comment: comment1.as_deref(), n_seg: 2, seg_idx: 0 };
-                        let r2 = ReadInfo { qname: qname2, qseq: qseq2, qual: qual2.as_deref(), comment: comment2.as_deref(), n_seg: 2, seg_idx: 1 };
-                        rammap::align::pipeline::align_and_format_pair(
-                            opt, mi, &r1, &r2,
-                            &mut ctx, &mut map_ctx, junc_db.as_ref(), out_cfg,
-                        )
+                    chunk_data.iter().map(|frag| {
+                        align_fragment(opt, mi, frag, &mut ctx, &mut map_ctx, junc_db.as_ref(), jump_db.as_ref(), out_cfg)
                     }).collect()
                 };
 
@@ -1441,7 +1460,6 @@ fn map_one_part(
         // through chunk transitions.
         #[cfg(feature = "parallel")]
         {
-            type SeData = (String, Vec<u8>, Option<String>, Option<String>);
             let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<SeData>>(1);
             let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Vec<(String, AlignmentStats)>>(2);
 
