@@ -11,6 +11,10 @@ use super::common::simd_compat::*;
 
 use super::common::*;
 
+// ============================================================================
+// NEON Implementation - Single-Affine Alignment
+// ============================================================================
+
 #[cfg(target_arch = "aarch64")]
 pub(super) unsafe fn extend_single_affine_neon_impl(
     qseq: &[u8],
@@ -27,9 +31,8 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
 ) { unsafe {
     let query_len = qseq.len();
     let target_len = tseq.len();
-    let approx_max = (flags & APPROX_MAX) != 0;
-    
-    if alphabet_size <= 0 {
+
+    if alphabet_size <= 0 || query_len == 0 || target_len == 0 {
         return;
     }
     
@@ -43,6 +46,9 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     let flag16_ = vdupq_n_u8(0x10);
     
     let _m1_ = vdupq_n_u8((alphabet_size - 1) as u8);
+    let max_sc_ = vdupq_n_u8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as u8);
+    let right_align = (flags & RIGHT_ALIGN) != 0;
+    let zero_s = vdupq_n_s8(0);
 
     // Scoring constants for NEON SIMD scoring loop (unsigned u8 for vbslq_u8)
     let sc_mis_v = vdupq_n_u8(score_matrix[1] as u8);
@@ -130,13 +136,18 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
     // Copy target to sf
     std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
+    init_dp_result_full(result);
+    // Skip alignment when a mismatch could never beat two gaps
+    {
+        let n = alphabet_size as usize * alphabet_size as usize;
+        let min_sc = score_matrix[1..n].iter().fold(score_matrix[1], |a, &b| a.min(b)) as i32;
+        if -min_sc > 2 * (gap_open as i32 + gap_extend as i32) { return; }
+    }
+
     let mut last_st = -1;
     let mut last_en = -1;
     let valid_range = (query_len + target_len - 1) as i32;
-    
-    // Scoring variables
-    let mut h0: i32 = 0;
-    let mut last_h0_t: i32 = 0;
+    let mut track = SingleAffineTrack::new(flags, query_len, target_len, gap_open as i32, gap_extend as i32, z_drop);
     
     for r in 0..valid_range {
         let mut st = 0;
@@ -213,6 +224,11 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
         let st_ = st as usize / 16;
         let en_ = en as usize / 16;
 
+        if with_cigar {
+            *band_offset_ptr.add(r as usize) = st;
+            *band_offset_end_ptr.add(r as usize) = en;
+        }
+
         for ti in st_..=en_ {
              // Load score + bias, shift x and v for diagonal access
              let mut z = vaddq_u8(vld1q_u8((s as *const u8).add(ti*16)), qe2_);
@@ -241,149 +257,59 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
              let yt = vld1q_u8((y as *const u8).add(ti*16));
              let mut b = vaddq_u8(yt, ut);
              
-             let b_final_s8 = vreinterpretq_s8_u8(b);
-             let b_s8 = b_final_s8;
-             let z_s8 = vreinterpretq_s8_u8(z);
              let a_s8 = vreinterpretq_s8_u8(a);
-             
-             if with_cigar {
-                 let offset = (r as usize * _n_col_) as isize - st_ as isize;
-                 let pr_ptr = p_ptr.add((offset + ti as isize) as usize * 16);
-                 
-                 if ti == st_ {
-                     *band_offset_ptr.add(r as usize) = st;
-                     *band_offset_end_ptr.add(r as usize) = en;
-                 }
-                 
-                 // z = max(z, a) (Signed)
-                 let z_s8_new = vmaxq_s8(z_s8, a_s8);
-                 z = vreinterpretq_u8_s8(z_s8_new);
-                 
-                 let mask_z_gt_a = vcgtq_s8(z_s8, a_s8); // Signed compare
-                 let mut d = vbicq_u8(flag1_, mask_z_gt_a); // d = z > a ? 0 : 1
-                 
-                 let z_s8_curr = vreinterpretq_s8_u8(z);
-                 
-                 // mask = z > b (Signed)
-                 let mask_z_gt_b = vcgtq_s8(z_s8_curr, b_s8);
-                 d = vbslq_u8(mask_z_gt_b, d, flag2_);
-                 
-                 // z = max(z, b) (Signed)
-                 let z_s8_final = vmaxq_s8(z_s8_curr, b_s8);
-                 z = vreinterpretq_u8_s8(z_s8_final);
-
-                 vst1q_u8((u as *mut u8).add(ti*16), vsubq_u8(z, vt1));
-                 vst1q_u8((v as *mut u8).add(ti*16), vsubq_u8(z, ut));
-                 z = vsubq_u8(z, q_);
-                 a = vsubq_u8(a, z);
-                 b = vsubq_u8(b, z);
-                 
-                 // Update u, v, x, y from z
-                 let a_final_s8 = vreinterpretq_s8_u8(a);
-                 let x_res = vmaxq_s8(a_final_s8, vreinterpretq_s8_u8(zero_));
-                 vst1q_u8((x as *mut u8).add(ti*16), vreinterpretq_u8_s8(x_res));
-                 
-                 // d |= (a > 0 ? 0x08 : 0)
-                 let mask_a = vcgtq_s8(a_final_s8, vreinterpretq_s8_u8(zero_));
-                 let val_flag8 = vandq_u8(flag8_, mask_a);
-                 d = vorrq_u8(d, val_flag8);
-                 
-                 let b_final_s8 = vreinterpretq_s8_u8(b);
-                 let y_res = vmaxq_s8(b_final_s8, vreinterpretq_s8_u8(zero_));
-                 vst1q_u8((y as *mut u8).add(ti*16), vreinterpretq_u8_s8(y_res));
-                 
-                 // d |= (b > 0 ? 0x10 : 0)
-                 let mask_b = vcgtq_s8(b_final_s8, vreinterpretq_s8_u8(zero_));
-                 let val_flag16 = vandq_u8(flag16_, mask_b); // mask_b is uint8x16 (result of vcgt)
-                 d = vorrq_u8(d, val_flag16);
-                 
-                 vst1q_u8(pr_ptr, d);
+             let b_s8 = vreinterpretq_s8_u8(b);
+             let mut zs = vreinterpretq_s8_u8(z);
+             let mut d = zero_;
+             if with_cigar && !right_align {
+                 // gap left-alignment: a gap wins only if strictly greater
+                 d = vandq_u8(vcgtq_s8(a_s8, zs), flag1_);        // d = a > z? 1 : 0
+                 zs = vmaxq_s8(zs, a_s8);
+                 d = vbslq_u8(vcgtq_s8(b_s8, zs), flag2_, d);     // d = b > z? 2 : d
+             } else if with_cigar {
+                 // gap right-alignment: a gap wins on ties
+                 d = vbicq_u8(flag1_, vcgtq_s8(zs, a_s8));        // d = z > a? 0 : 1
+                 zs = vmaxq_s8(zs, a_s8);
+                 d = vbslq_u8(vcgtq_s8(zs, b_s8), d, flag2_);     // d = z > b? d : 2
              } else {
-                 // score only
-                 // z = max(z, a) (Signed)
-                 let z_s8_new = vmaxq_s8(z_s8, a_s8);
-                 // z = max(z, b) (Signed)
-                 let z_s8_final = vmaxq_s8(z_s8_new, b_s8);
-                 z = vreinterpretq_u8_s8(z_s8_final);
-                 
-                 vst1q_u8((u as *mut u8).add(ti*16), vsubq_u8(z, vt1));
-                 vst1q_u8((v as *mut u8).add(ti*16), vsubq_u8(z, ut));
-                 z = vsubq_u8(z, q_);
-                 a = vsubq_u8(a, z);
-                 b = vsubq_u8(b, z);
-                 
-                 let a_final_s8 = vreinterpretq_s8_u8(a);
-                 let x_res = vmaxq_s8(a_final_s8, vreinterpretq_s8_u8(zero_));
-                 vst1q_u8((x as *mut u8).add(ti*16), vreinterpretq_u8_s8(x_res));
-                 
-                 let b_final_s8 = vreinterpretq_s8_u8(b);
-                 let y_res = vmaxq_s8(b_final_s8, vreinterpretq_s8_u8(zero_));
-                 vst1q_u8((y as *mut u8).add(ti*16), vreinterpretq_u8_s8(y_res));
+                 zs = vmaxq_s8(zs, a_s8);
+             }
+
+             z = vmaxq_u8(vreinterpretq_u8_s8(zs), b); // both non-negative
+             z = vminq_u8(z, max_sc_);
+             vst1q_u8((u as *mut u8).add(ti*16), vsubq_u8(z, vt1));
+             vst1q_u8((v as *mut u8).add(ti*16), vsubq_u8(z, ut));
+             z = vsubq_u8(z, q_);
+             a = vsubq_u8(a, z);
+             b = vsubq_u8(b, z);
+             let a_s8 = vreinterpretq_s8_u8(a);
+             let b_s8 = vreinterpretq_s8_u8(b);
+
+             if with_cigar && right_align {
+                 let tmp = vcgtq_s8(zero_s, a_s8);
+                 vst1q_u8((x as *mut u8).add(ti*16), vbicq_u8(a, tmp));
+                 d = vorrq_u8(d, vbicq_u8(flag8_, tmp));          // d = 0 > a? 0 : 0x08
+                 let tmp = vcgtq_s8(zero_s, b_s8);
+                 vst1q_u8((y as *mut u8).add(ti*16), vbicq_u8(b, tmp));
+                 d = vorrq_u8(d, vbicq_u8(flag16_, tmp));         // d = 0 > b? 0 : 0x10
+             } else {
+                 let tmp = vcgtq_s8(a_s8, zero_s);
+                 vst1q_u8((x as *mut u8).add(ti*16), vandq_u8(a, tmp));
+                 d = vorrq_u8(d, vandq_u8(flag8_, tmp));          // d = a > 0? 0x08 : 0
+                 let tmp = vcgtq_s8(b_s8, zero_s);
+                 vst1q_u8((y as *mut u8).add(ti*16), vandq_u8(b, tmp));
+                 d = vorrq_u8(d, vandq_u8(flag16_, tmp));         // d = b > 0? 0x10 : 0
+             }
+             if with_cigar {
+                 vst1q_u8(p_ptr.add((r as usize * _n_col_ + ti - st_) * 16), d);
              }
         }
-        
-        // Score and max tracking
-        if approx_max {
-            if r > 0 {
-                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                    let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                    let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
-                    let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
-                    let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
 
-                    if d0 > d1 {
-                        h0 += d0;
-                    } else {
-                        h0 += d1;
-                        last_h0_t += 1;
-                    }
-                } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                    let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                    h0 += d0_val - (gap_open as i32 + gap_extend as i32);
-                } else {
-                    last_h0_t += 1;
-                    let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
-                    h0 += d1_val - (gap_open as i32 + gap_extend as i32);
-                }
+        // Score and max tracking (exact H[] unless APPROX_MAX)
+        let u8s = std::slice::from_raw_parts(u8_ptr as *const u8, target_len);
+        let v8s = std::slice::from_raw_parts(v8_ptr as *const u8, target_len);
+        if track.update(result, u8s, v8s, r, st0, en0) { break; }
 
-                // Track max when not in pure APPROX_MAX mode (i.e. either exact-equivalent approx_max=false,or APPROX_DROP also set).
-                // z-drop check only under APPROX_DROP.
-                if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
-                    if h0 > result.max {
-                        result.max = h0;
-                        result.max_score_target_pos = last_h0_t;
-                        result.max_score_query_pos = r - last_h0_t;
-                    } else if (flags & APPROX_DROP) != 0
-                        && last_h0_t >= result.max_score_target_pos
-                        && (r - last_h0_t) >= result.max_score_query_pos {
-                        let tl = last_h0_t - result.max_score_target_pos;
-                        let ql = (r - last_h0_t) - result.max_score_query_pos;
-                        let l = if tl > ql { tl - ql } else { ql - tl };
-                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                            result.zdropped = 1;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                // r == 0
-                let v0 = *v8_ptr.add(0) as i8 as i32;
-                h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
-                last_h0_t = 0;
-                if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
-                    result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
-                }
-            }
-        }
-        
-        // Final score update
-        if r == valid_range - 1 /* query_len+target_len-2 */ {
-            // Check if en0 reached end
-             if en0 == target_len as i32 - 1 {
-                 result.score = h0;
-             }
-        }
-        
         last_st = st;
         last_en = en;
     }
@@ -392,6 +318,7 @@ pub(super) unsafe fn extend_single_affine_neon_impl(
             traceback_single_affine(result, query_len, target_len, end_bonus, flags, _n_col_, 16, p_ptr, band_offset_ptr, band_offset_end_ptr);
         }
     }}
+
 
 // ============================================================================
 // SSE2/SSE4.1 Unified Implementation - Single-Affine Alignment
@@ -449,6 +376,8 @@ macro_rules! extend_single_affine_impl {
             };
 
             let _m1_ = _mm_set1_epi8((alphabet_size - 1) as i8);
+            let max_sc_ = _mm_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
+            let right_align = (flags & RIGHT_ALIGN) != 0;
 
             // Dimension calculations
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -513,13 +442,18 @@ macro_rules! extend_single_affine_impl {
             // Copy target
             std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-            init_dp_result(result);
+            init_dp_result_full(result);
+            // Skip alignment when a mismatch could never beat two gaps
+            {
+                let n = alphabet_size as usize * alphabet_size as usize;
+                let min_sc = score_matrix[1..n].iter().fold(score_matrix[1], |a, &b| a.min(b)) as i32;
+                if -min_sc > 2 * (gap_open as i32 + gap_extend as i32) { return; }
+            }
 
             let mut last_st: i32 = -1;
             let mut last_en: i32 = -1;
             let valid_range = (query_len + target_len - 1) as i32;
-            let mut h0: i32 = 0;
-            let mut last_h0_t: i32 = 0;
+            let mut track = SingleAffineTrack::new(flags, query_len, target_len, gap_open as i32, gap_extend as i32, z_drop);
 
             for r in 0..valid_range {
                 let mut st = 0i32;
@@ -605,157 +539,75 @@ macro_rules! extend_single_affine_impl {
                 let st_ = st as usize / 16;
                 let en_ = en as usize / 16;
 
+                if with_cigar {
+                    *band_offset_ptr.add(r as usize) = st;
+                    *band_offset_end_ptr.add(r as usize) = en;
+                }
+
                 for ti in st_..=en_ {
-                    // Load score + bias
+                    // __dp_code_block1
                     let mut z = _mm_add_epi8(_mm_loadu_si128(s.add(ti)), qe2_);
-
-                    // Shift x for diagonal access
                     let xt_val = _mm_loadu_si128(x.add(ti));
-                    let mut xt1 = xt_val;
-                    let tmp = _mm_srli_si128(xt1, 15);
-                    xt1 = _mm_or_si128(_mm_slli_si128(xt1, 1), x1_);
-                    x1_ = tmp;
-
-                    // Shift v for diagonal access
+                    let xt1 = _mm_or_si128(_mm_slli_si128(xt_val, 1), x1_);
+                    x1_ = _mm_srli_si128(xt_val, 15);
                     let vt_val = _mm_loadu_si128(v.add(ti));
-                    let mut vt1 = vt_val;
-                    let tmp_v = _mm_srli_si128(vt1, 15);
-                    vt1 = _mm_or_si128(_mm_slli_si128(vt1, 1), v1_);
-                    v1_ = tmp_v;
-
-                    // a = x[t-1] + v[t-1]
+                    let vt1 = _mm_or_si128(_mm_slli_si128(vt_val, 1), v1_);
+                    v1_ = _mm_srli_si128(vt_val, 15);
                     let mut a = _mm_add_epi8(xt1, vt1);
-
-                    // b = y[t] + u[t]
                     let ut = _mm_loadu_si128(u.add(ti));
-                    let yt = _mm_loadu_si128(y.add(ti));
-                    let mut b = _mm_add_epi8(yt, ut);
+                    let mut b = _mm_add_epi8(_mm_loadu_si128(y.add(ti)), ut);
 
-                    if with_cigar {
-                        let offset = (r as usize * _n_col_) as isize - st_ as isize;
-                        let pr_ptr = p_ptr.add((offset + ti as isize) as usize * 16);
-
-                        if ti == st_ {
-                            *band_offset_ptr.add(r as usize) = st;
-                            *band_offset_end_ptr.add(r as usize) = en;
-                        }
-
-                        // z = max(z, a)
-                        let z_new = $max_epi8(z, a);
-                        let mask_z_gt_a = _mm_cmpgt_epi8(z, a);
-                        let mut d = _mm_andnot_si128(mask_z_gt_a, flag1_);
-
-                        z = z_new;
-
-                        // z = max(z, b), track state
-                        let mask_z_gt_b = _mm_cmpgt_epi8(z, b);
-                        d = if $is_sse41 {
-                            _mm_blendv_epi8(flag2_, d, mask_z_gt_b)
-                        } else {
-                            _mm_or_si128(_mm_and_si128(mask_z_gt_b, d), _mm_andnot_si128(mask_z_gt_b, flag2_))
-                        };
-
-                        z = $max_epi8(z, b);
-
-                        // Update u, v
-                        _mm_storeu_si128(u.add(ti), _mm_sub_epi8(z, vt1));
-                        _mm_storeu_si128(v.add(ti), _mm_sub_epi8(z, ut));
-                        z = _mm_sub_epi8(z, q_);
-                        a = _mm_sub_epi8(a, z);
-                        b = _mm_sub_epi8(b, z);
-
-                        // x = max(a, 0)
-                        let x_res = $max_epi8(a, zero_);
-                        _mm_storeu_si128(x.add(ti), x_res);
-
-                        // d |= (a > 0 ? 0x08 : 0)
-                        let mask_a = _mm_cmpgt_epi8(a, zero_);
-                        d = _mm_or_si128(d, _mm_and_si128(flag8_, mask_a));
-
-                        // y = max(b, 0)
-                        let y_res = $max_epi8(b, zero_);
-                        _mm_storeu_si128(y.add(ti), y_res);
-
-                        // d |= (b > 0 ? 0x10 : 0)
-                        let mask_b = _mm_cmpgt_epi8(b, zero_);
-                        d = _mm_or_si128(d, _mm_and_si128(flag16_, mask_b));
-
-                        _mm_storeu_si128(pr_ptr as *mut __m128i, d);
-                    } else {
-                        // Score only
+                    let mut d = zero_;
+                    if with_cigar && !right_align {
+                        // gap left-alignment: a gap wins only if strictly greater
+                        d = _mm_and_si128(_mm_cmpgt_epi8(a, z), flag1_);                       // d = a > z? 1 : 0
                         z = $max_epi8(z, a);
-                        z = $max_epi8(z, b);
-
-                        _mm_storeu_si128(u.add(ti), _mm_sub_epi8(z, vt1));
-                        _mm_storeu_si128(v.add(ti), _mm_sub_epi8(z, ut));
-                        z = _mm_sub_epi8(z, q_);
-                        a = _mm_sub_epi8(a, z);
-                        b = _mm_sub_epi8(b, z);
-
-                        let x_res = $max_epi8(a, zero_);
-                        _mm_storeu_si128(x.add(ti), x_res);
-
-                        let y_res = $max_epi8(b, zero_);
-                        _mm_storeu_si128(y.add(ti), y_res);
-                    }
-                }
-
-                // Score and max tracking
-                {
-                    if r > 0 {
-                        if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
-                            let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
-                            let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
-
-                            if d0 > d1 {
-                                h0 += d0;
-                            } else {
-                                h0 += d1;
-                                last_h0_t += 1;
-                            }
-                        } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d0_val - (gap_open as i32 + gap_extend as i32);
-                        } else {
-                            last_h0_t += 1;
-                            let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d1_val - (gap_open as i32 + gap_extend as i32);
-                        }
-
-                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
-                            if h0 > result.max {
-                                result.max = h0;
-                                result.max_score_target_pos = last_h0_t;
-                                result.max_score_query_pos = r - last_h0_t;
-                            } else if (flags & APPROX_DROP) != 0
-                                && last_h0_t >= result.max_score_target_pos
-                                && (r - last_h0_t) >= result.max_score_query_pos {
-                                let tl = last_h0_t - result.max_score_target_pos;
-                                let ql = (r - last_h0_t) - result.max_score_query_pos;
-                                let l = if tl > ql { tl - ql } else { ql - tl };
-                                if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                                    result.zdropped = 1;
-                                    break;
-                                }
-                            }
-                        }
+                        let tmp = _mm_cmpgt_epi8(b, z);
+                        d = _mm_or_si128(_mm_andnot_si128(tmp, d), _mm_and_si128(tmp, flag2_)); // d = b > z? 2 : d
+                    } else if with_cigar {
+                        // gap right-alignment: a gap wins on ties
+                        d = _mm_andnot_si128(_mm_cmpgt_epi8(z, a), flag1_);                    // d = z > a? 0 : 1
+                        z = $max_epi8(z, a);
+                        let tmp = _mm_cmpgt_epi8(z, b);
+                        d = _mm_or_si128(_mm_andnot_si128(tmp, flag2_), _mm_and_si128(tmp, d)); // d = z > b? d : 2
                     } else {
-                        // r == 0
-                        let v0 = *v8_ptr.add(0) as i8 as i32;
-                        h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
-                        last_h0_t = 0;
-                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
-                            result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
-                        }
+                        z = $max_epi8(z, a);
+                    }
+
+                    // __dp_code_block2
+                    z = _mm_max_epu8(z, b); // both non-negative
+                    z = _mm_min_epu8(z, max_sc_);
+                    _mm_storeu_si128(u.add(ti), _mm_sub_epi8(z, vt1));
+                    _mm_storeu_si128(v.add(ti), _mm_sub_epi8(z, ut));
+                    z = _mm_sub_epi8(z, q_);
+                    a = _mm_sub_epi8(a, z);
+                    b = _mm_sub_epi8(b, z);
+
+                    if with_cigar && right_align {
+                        let tmp = _mm_cmpgt_epi8(zero_, a);
+                        _mm_storeu_si128(x.add(ti), _mm_andnot_si128(tmp, a));
+                        d = _mm_or_si128(d, _mm_andnot_si128(tmp, flag8_));  // d = 0 > a? 0 : 0x08
+                        let tmp = _mm_cmpgt_epi8(zero_, b);
+                        _mm_storeu_si128(y.add(ti), _mm_andnot_si128(tmp, b));
+                        d = _mm_or_si128(d, _mm_andnot_si128(tmp, flag16_)); // d = 0 > b? 0 : 0x10
+                    } else {
+                        let tmp = _mm_cmpgt_epi8(a, zero_);
+                        _mm_storeu_si128(x.add(ti), _mm_and_si128(tmp, a));
+                        d = _mm_or_si128(d, _mm_and_si128(tmp, flag8_));     // d = a > 0? 0x08 : 0
+                        let tmp = _mm_cmpgt_epi8(b, zero_);
+                        _mm_storeu_si128(y.add(ti), _mm_and_si128(tmp, b));
+                        d = _mm_or_si128(d, _mm_and_si128(tmp, flag16_));    // d = b > 0? 0x10 : 0
+                    }
+                    if with_cigar {
+                        let pr_ptr = p_ptr.add((r as usize * _n_col_ + ti - st_) * 16);
+                        _mm_storeu_si128(pr_ptr as *mut __m128i, d);
                     }
                 }
 
-                // Final score update
-                if r == valid_range - 1 && en0 == target_len as i32 - 1 {
-                    result.score = h0;
-                }
+                // Score and max tracking (exact H[] unless APPROX_MAX)
+                let u8s = std::slice::from_raw_parts(u8_ptr as *const u8, target_len);
+                let v8s = std::slice::from_raw_parts(v8_ptr as *const u8, target_len);
+                if track.update(result, u8s, v8s, r, st0, en0) { break; }
 
                 last_st = st;
                 last_en = en;
@@ -821,6 +673,8 @@ macro_rules! extend_single_affine_avx2_impl {
             };
 
             let _m1_ = _mm256_set1_epi8((alphabet_size - 1) as i8);
+            let max_sc_ = _mm256_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
+            let right_align = (flags & RIGHT_ALIGN) != 0;
 
             // Dimension calculations (width=32)
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -884,14 +738,18 @@ macro_rules! extend_single_affine_avx2_impl {
             // Copy target
             std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-            // Initialize result
-            init_dp_result(result);
+            init_dp_result_full(result);
+            // Skip alignment when a mismatch could never beat two gaps
+            {
+                let n = alphabet_size as usize * alphabet_size as usize;
+                let min_sc = score_matrix[1..n].iter().fold(score_matrix[1], |a, &b| a.min(b)) as i32;
+                if -min_sc > 2 * (gap_open as i32 + gap_extend as i32) { return; }
+            }
 
             let mut last_st: i32 = -1;
             let mut last_en: i32 = -1;
             let valid_range = (query_len + target_len - 1) as i32;
-            let mut h0: i32 = 0;
-            let mut last_h0_t: i32 = 0;
+            let mut track = SingleAffineTrack::new(flags, query_len, target_len, gap_open as i32, gap_extend as i32, z_drop);
 
             for r in 0..valid_range {
                 let mut st = 0i32;
@@ -900,8 +758,6 @@ macro_rules! extend_single_affine_avx2_impl {
                 let v1: i8;
 
                 let qrr = qr.offset(query_len as isize - 1 - r as isize);
-                let u8_ptr = u as *mut u8;
-                let v8_ptr = v as *mut u8;
 
                 // Find boundaries
                 if st < (r - query_len as i32 + 1) { st = r - query_len as i32 + 1; }
@@ -975,7 +831,11 @@ macro_rules! extend_single_affine_avx2_impl {
                 let st_usize = st as usize;
                 let stride_bytes = _n_col_ * 32;
                 let mut bp = st_usize;
-                let mut bp_first = true;
+
+                if with_cigar {
+                    *band_offset_ptr.add(r as usize) = st;
+                    *band_offset_end_ptr.add(r as usize) = en;
+                }
 
                 while bp <= en_usize {
                     // Save excess bytes on last partial iteration
@@ -1010,65 +870,48 @@ macro_rules! extend_single_affine_avx2_impl {
                     let ut = _mm256_loadu_si256(u_b.add(bp) as *const __m256i);
                     let mut b = _mm256_add_epi8(_mm256_loadu_si256(y_b.add(bp) as *const __m256i), ut);
 
-                    if !with_cigar {
-                        // Score only
+                    let mut d = zero_;
+                    if with_cigar && !right_align {
+                        // gap left-alignment: a gap wins only if strictly greater
+                        d = _mm256_and_si256(_mm256_cmpgt_epi8(a, z), flag1_);          // d = a > z? 1 : 0
                         z = _mm256_max_epi8(z, a);
-                        z = _mm256_max_epi8(z, b);
-
-                        _mm256_storeu_si256(u_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, vt1));
-                        _mm256_storeu_si256(v_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, ut));
-                        z = _mm256_sub_epi8(z, q_);
-                        a = _mm256_sub_epi8(a, z);
-                        b = _mm256_sub_epi8(b, z);
-
-                        let x_res = _mm256_max_epi8(a, zero_);
-                        _mm256_storeu_si256(x_b.add(bp) as *mut __m256i, x_res);
-
-                        let y_res = _mm256_max_epi8(b, zero_);
-                        _mm256_storeu_si256(y_b.add(bp) as *mut __m256i, y_res);
+                        let tmp = _mm256_cmpgt_epi8(b, z);
+                        d = _mm256_blendv_epi8(d, flag2_, tmp);                          // d = b > z? 2 : d
+                    } else if with_cigar {
+                        // gap right-alignment: a gap wins on ties
+                        d = _mm256_andnot_si256(_mm256_cmpgt_epi8(z, a), flag1_);       // d = z > a? 0 : 1
+                        z = _mm256_max_epi8(z, a);
+                        let tmp = _mm256_cmpgt_epi8(z, b);
+                        d = _mm256_blendv_epi8(flag2_, d, tmp);                          // d = z > b? d : 2
                     } else {
-                        // With CIGAR — byte-addressed traceback
-                        let pr_byte_off = r as usize * stride_bytes + (bp - st_usize);
-                        let pr_ptr_local = p_ptr.add(pr_byte_off);
-                        if bp_first {
-                            *band_offset_ptr.add(r as usize) = st;
-                            *band_offset_end_ptr.add(r as usize) = en;
-                        }
+                        z = _mm256_max_epi8(z, a);
+                    }
 
-                        // z = max(z, a)
-                        let z_new = _mm256_max_epi8(z, a);
-                        let mask_z_gt_a = _mm256_cmpgt_epi8(z, a);
-                        let mut d = _mm256_andnot_si256(mask_z_gt_a, flag1_);
-                        z = z_new;
+                    z = _mm256_max_epu8(z, b); // both non-negative
+                    z = _mm256_min_epu8(z, max_sc_);
+                    _mm256_storeu_si256(u_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, vt1));
+                    _mm256_storeu_si256(v_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, ut));
+                    z = _mm256_sub_epi8(z, q_);
+                    a = _mm256_sub_epi8(a, z);
+                    b = _mm256_sub_epi8(b, z);
 
-                        // z = max(z, b), track state
-                        let mask_z_gt_b = _mm256_cmpgt_epi8(z, b);
-                        d = _mm256_blendv_epi8(flag2_, d, mask_z_gt_b);
-                        z = _mm256_max_epi8(z, b);
-
-                        // Update u, v
-                        _mm256_storeu_si256(u_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, vt1));
-                        _mm256_storeu_si256(v_b.add(bp) as *mut __m256i, _mm256_sub_epi8(z, ut));
-                        z = _mm256_sub_epi8(z, q_);
-                        a = _mm256_sub_epi8(a, z);
-                        b = _mm256_sub_epi8(b, z);
-
-                        // x = max(a, 0)
-                        let x_res = _mm256_max_epi8(a, zero_);
-                        _mm256_storeu_si256(x_b.add(bp) as *mut __m256i, x_res);
-
-                        // d |= (a > 0 ? 0x08 : 0)
-                        let mask_a = _mm256_cmpgt_epi8(a, zero_);
-                        d = _mm256_or_si256(d, _mm256_and_si256(flag8_, mask_a));
-
-                        // y = max(b, 0)
-                        let y_res = _mm256_max_epi8(b, zero_);
-                        _mm256_storeu_si256(y_b.add(bp) as *mut __m256i, y_res);
-
-                        // d |= (b > 0 ? 0x10 : 0)
-                        let mask_b = _mm256_cmpgt_epi8(b, zero_);
-                        d = _mm256_or_si256(d, _mm256_and_si256(flag16_, mask_b));
-
+                    if with_cigar && right_align {
+                        let tmp = _mm256_cmpgt_epi8(zero_, a);
+                        _mm256_storeu_si256(x_b.add(bp) as *mut __m256i, _mm256_andnot_si256(tmp, a));
+                        d = _mm256_or_si256(d, _mm256_andnot_si256(tmp, flag8_));    // d = 0 > a? 0 : 0x08
+                        let tmp = _mm256_cmpgt_epi8(zero_, b);
+                        _mm256_storeu_si256(y_b.add(bp) as *mut __m256i, _mm256_andnot_si256(tmp, b));
+                        d = _mm256_or_si256(d, _mm256_andnot_si256(tmp, flag16_));   // d = 0 > b? 0 : 0x10
+                    } else {
+                        let tmp = _mm256_cmpgt_epi8(a, zero_);
+                        _mm256_storeu_si256(x_b.add(bp) as *mut __m256i, _mm256_and_si256(tmp, a));
+                        d = _mm256_or_si256(d, _mm256_and_si256(tmp, flag8_));       // d = a > 0? 0x08 : 0
+                        let tmp = _mm256_cmpgt_epi8(b, zero_);
+                        _mm256_storeu_si256(y_b.add(bp) as *mut __m256i, _mm256_and_si256(tmp, b));
+                        d = _mm256_or_si256(d, _mm256_and_si256(tmp, flag16_));      // d = b > 0? 0x10 : 0
+                    }
+                    if with_cigar {
+                        let pr_ptr_local = p_ptr.add(r as usize * stride_bytes + (bp - st_usize));
                         _mm256_storeu_si256(pr_ptr_local as *mut __m256i, d);
                     }
 
@@ -1081,65 +924,13 @@ macro_rules! extend_single_affine_avx2_impl {
                         std::ptr::copy_nonoverlapping(save_y.as_ptr(), y_b.add(es), excess);
                     }
 
-                    bp_first = false;
                     bp += 32;
                 }
 
-                // Score and max tracking (scalar — identical to SSE version)
-                {
-                    if r > 0 {
-                        if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
-                            let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
-                            let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
-
-                            if d0 > d1 {
-                                h0 += d0;
-                            } else {
-                                h0 += d1;
-                                last_h0_t += 1;
-                            }
-                        } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d0_val - (gap_open as i32 + gap_extend as i32);
-                        } else {
-                            last_h0_t += 1;
-                            let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d1_val - (gap_open as i32 + gap_extend as i32);
-                        }
-
-                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
-                            if h0 > result.max {
-                                result.max = h0;
-                                result.max_score_target_pos = last_h0_t;
-                                result.max_score_query_pos = r - last_h0_t;
-                            } else if (flags & APPROX_DROP) != 0
-                                && last_h0_t >= result.max_score_target_pos
-                                && (r - last_h0_t) >= result.max_score_query_pos {
-                                let tl = last_h0_t - result.max_score_target_pos;
-                                let ql = (r - last_h0_t) - result.max_score_query_pos;
-                                let l = if tl > ql { tl - ql } else { ql - tl };
-                                if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                                    result.zdropped = 1;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        let v0 = *v8_ptr.add(0) as i8 as i32;
-                        h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
-                        last_h0_t = 0;
-                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
-                            result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
-                        }
-                    }
-                }
-
-                // Final score update
-                if r == valid_range - 1 && en0 == target_len as i32 - 1 {
-                    result.score = h0;
-                }
+                // Score and max tracking (exact H[] unless APPROX_MAX)
+                let u8s = std::slice::from_raw_parts(u_b as *const u8, target_len);
+                let v8s = std::slice::from_raw_parts(v_b as *const u8, target_len);
+                if track.update(result, u8s, v8s, r, st0, en0) { break; }
 
                 last_st = st;
                 last_en = en;
@@ -1201,6 +992,8 @@ macro_rules! extend_single_affine_avx512_impl {
             };
 
             let _m1_ = _mm512_set1_epi8((alphabet_size - 1) as i8);
+            let max_sc_ = _mm512_set1_epi8((score_matrix[0] as i32 + (gap_open as i32 + gap_extend as i32) * 2) as i8);
+            let right_align = (flags & RIGHT_ALIGN) != 0;
 
             // Dimension calculations (width=64)
             let bandwidth = if bandwidth < 0 { if target_len > query_len { target_len as i32 } else { query_len as i32 } } else { bandwidth };
@@ -1264,13 +1057,18 @@ macro_rules! extend_single_affine_avx512_impl {
             // Copy target
             std::ptr::copy_nonoverlapping(tseq.as_ptr(), sf, target_len);
 
-            init_dp_result(result);
+            init_dp_result_full(result);
+            // Skip alignment when a mismatch could never beat two gaps
+            {
+                let n = alphabet_size as usize * alphabet_size as usize;
+                let min_sc = score_matrix[1..n].iter().fold(score_matrix[1], |a, &b| a.min(b)) as i32;
+                if -min_sc > 2 * (gap_open as i32 + gap_extend as i32) { return; }
+            }
 
             let mut last_st: i32 = -1;
             let mut last_en: i32 = -1;
             let valid_range = (query_len + target_len - 1) as i32;
-            let mut h0: i32 = 0;
-            let mut last_h0_t: i32 = 0;
+            let mut track = SingleAffineTrack::new(flags, query_len, target_len, gap_open as i32, gap_extend as i32, z_drop);
 
             for r in 0..valid_range {
                 let mut st = 0i32;
@@ -1279,8 +1077,6 @@ macro_rules! extend_single_affine_avx512_impl {
                 let v1: i8;
 
                 let qrr = qr.offset(query_len as isize - 1 - r as isize);
-                let u8_ptr = u as *mut u8;
-                let v8_ptr = v as *mut u8;
 
                 // Find boundaries
                 if st < (r - query_len as i32 + 1) { st = r - query_len as i32 + 1; }
@@ -1362,7 +1158,11 @@ macro_rules! extend_single_affine_avx512_impl {
                 let st_usize = st as usize;
                 let stride_bytes = _n_col_ * 64;
                 let mut bp = st_usize;
-                let mut bp_first = true;
+
+                if with_cigar {
+                    *band_offset_ptr.add(r as usize) = st;
+                    *band_offset_end_ptr.add(r as usize) = en;
+                }
 
                 while bp <= en_usize {
                     let excess = if bp + 63 > en_usize {
@@ -1395,55 +1195,46 @@ macro_rules! extend_single_affine_avx512_impl {
                     let ut = _mm512_loadu_si512(u_b.add(bp) as *const __m512i);
                     let mut b = _mm512_add_epi8(_mm512_loadu_si512(y_b.add(bp) as *const __m512i), ut);
 
-                    if !with_cigar {
+                    let mut d = zero_;
+                    if with_cigar && !right_align {
+                        // gap left-alignment: a gap wins only if strictly greater
+                        d = _mm512_maskz_mov_epi8(_mm512_cmpgt_epi8_mask(a, z), flag1_);   // d = a > z? 1 : 0
                         z = _mm512_max_epi8(z, a);
-                        z = _mm512_max_epi8(z, b);
-
-                        _mm512_storeu_si512(u_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, vt1));
-                        _mm512_storeu_si512(v_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, ut));
-                        z = _mm512_sub_epi8(z, q_);
-                        a = _mm512_sub_epi8(a, z);
-                        b = _mm512_sub_epi8(b, z);
-
-                        let x_res = _mm512_max_epi8(a, zero_);
-                        _mm512_storeu_si512(x_b.add(bp) as *mut __m512i, x_res);
-
-                        let y_res = _mm512_max_epi8(b, zero_);
-                        _mm512_storeu_si512(y_b.add(bp) as *mut __m512i, y_res);
+                        d = _mm512_mask_blend_epi8(_mm512_cmpgt_epi8_mask(b, z), d, flag2_); // d = b > z? 2 : d
+                    } else if with_cigar {
+                        // gap right-alignment: a gap wins on ties
+                        d = _mm512_maskz_mov_epi8(!_mm512_cmpgt_epi8_mask(z, a), flag1_);  // d = z > a? 0 : 1
+                        z = _mm512_max_epi8(z, a);
+                        d = _mm512_mask_blend_epi8(_mm512_cmpgt_epi8_mask(z, b), flag2_, d); // d = z > b? d : 2
                     } else {
-                        let pr_byte_off = r as usize * stride_bytes + (bp - st_usize);
-                        let pr_ptr_local = p_ptr.add(pr_byte_off);
-                        if bp_first {
-                            *band_offset_ptr.add(r as usize) = st;
-                            *band_offset_end_ptr.add(r as usize) = en;
-                        }
-
-                        let mask_a_gt_z: __mmask64 = _mm512_cmpgt_epi8_mask(a, z);
-                        let mut d = _mm512_maskz_mov_epi8(mask_a_gt_z, flag1_);
                         z = _mm512_max_epi8(z, a);
+                    }
 
-                        let mask_b_gt_z: __mmask64 = _mm512_cmpgt_epi8_mask(b, z);
-                        d = _mm512_mask_blend_epi8(mask_b_gt_z, d, flag2_);
-                        z = _mm512_max_epi8(z, b);
+                    z = _mm512_max_epu8(z, b); // both non-negative
+                    z = _mm512_min_epu8(z, max_sc_);
+                    _mm512_storeu_si512(u_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, vt1));
+                    _mm512_storeu_si512(v_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, ut));
+                    z = _mm512_sub_epi8(z, q_);
+                    a = _mm512_sub_epi8(a, z);
+                    b = _mm512_sub_epi8(b, z);
 
-                        _mm512_storeu_si512(u_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, vt1));
-                        _mm512_storeu_si512(v_b.add(bp) as *mut __m512i, _mm512_sub_epi8(z, ut));
-                        z = _mm512_sub_epi8(z, q_);
-                        a = _mm512_sub_epi8(a, z);
-                        b = _mm512_sub_epi8(b, z);
-
-                        let x_res = _mm512_max_epi8(a, zero_);
-                        _mm512_storeu_si512(x_b.add(bp) as *mut __m512i, x_res);
-
-                        let mask_a: __mmask64 = _mm512_cmpgt_epi8_mask(a, zero_);
-                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(mask_a, flag8_));
-
-                        let y_res = _mm512_max_epi8(b, zero_);
-                        _mm512_storeu_si512(y_b.add(bp) as *mut __m512i, y_res);
-
-                        let mask_b: __mmask64 = _mm512_cmpgt_epi8_mask(b, zero_);
-                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(mask_b, flag16_));
-
+                    if with_cigar && right_align {
+                        let keep = !_mm512_cmpgt_epi8_mask(zero_, a);
+                        _mm512_storeu_si512(x_b.add(bp) as *mut __m512i, _mm512_maskz_mov_epi8(keep, a));
+                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(keep, flag8_));   // d = 0 > a? 0 : 0x08
+                        let keep = !_mm512_cmpgt_epi8_mask(zero_, b);
+                        _mm512_storeu_si512(y_b.add(bp) as *mut __m512i, _mm512_maskz_mov_epi8(keep, b));
+                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(keep, flag16_));  // d = 0 > b? 0 : 0x10
+                    } else {
+                        let keep = _mm512_cmpgt_epi8_mask(a, zero_);
+                        _mm512_storeu_si512(x_b.add(bp) as *mut __m512i, _mm512_maskz_mov_epi8(keep, a));
+                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(keep, flag8_));   // d = a > 0? 0x08 : 0
+                        let keep = _mm512_cmpgt_epi8_mask(b, zero_);
+                        _mm512_storeu_si512(y_b.add(bp) as *mut __m512i, _mm512_maskz_mov_epi8(keep, b));
+                        d = _mm512_or_si512(d, _mm512_maskz_mov_epi8(keep, flag16_));  // d = b > 0? 0x10 : 0
+                    }
+                    if with_cigar {
+                        let pr_ptr_local = p_ptr.add(r as usize * stride_bytes + (bp - st_usize));
                         _mm512_storeu_si512(pr_ptr_local as *mut __m512i, d);
                     }
 
@@ -1455,65 +1246,13 @@ macro_rules! extend_single_affine_avx512_impl {
                         std::ptr::copy_nonoverlapping(save_y.as_ptr(), y_b.add(es), excess);
                     }
 
-                    bp_first = false;
                     bp += 64;
                 }
 
-                // Score and max tracking (scalar — identical to SSE/AVX2 version)
-                {
-                    if r > 0 {
-                        if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            let d1_val = *u8_ptr.add((last_h0_t + 1) as usize) as i8 as i32;
-                            let d0 = d0_val - (gap_open as i32 + gap_extend as i32);
-                            let d1 = d1_val - (gap_open as i32 + gap_extend as i32);
-
-                            if d0 > d1 {
-                                h0 += d0;
-                            } else {
-                                h0 += d1;
-                                last_h0_t += 1;
-                            }
-                        } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                            let d0_val = *v8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d0_val - (gap_open as i32 + gap_extend as i32);
-                        } else {
-                            last_h0_t += 1;
-                            let d1_val = *u8_ptr.add(last_h0_t as usize) as i8 as i32;
-                            h0 += d1_val - (gap_open as i32 + gap_extend as i32);
-                        }
-
-                        if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
-                            if h0 > result.max {
-                                result.max = h0;
-                                result.max_score_target_pos = last_h0_t;
-                                result.max_score_query_pos = r - last_h0_t;
-                            } else if (flags & APPROX_DROP) != 0
-                                && last_h0_t >= result.max_score_target_pos
-                                && (r - last_h0_t) >= result.max_score_query_pos {
-                                let tl = last_h0_t - result.max_score_target_pos;
-                                let ql = (r - last_h0_t) - result.max_score_query_pos;
-                                let l = if tl > ql { tl - ql } else { ql - tl };
-                                if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend as i32) {
-                                    result.zdropped = 1;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        let v0 = *v8_ptr.add(0) as i8 as i32;
-                        h0 = v0 - (gap_open as i32 + gap_extend as i32) * 2;
-                        last_h0_t = 0;
-                        if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
-                            result.max = h0; result.max_score_target_pos = 0; result.max_score_query_pos = 0;
-                        }
-                    }
-                }
-
-                // Final score update
-                if r == valid_range - 1 && en0 == target_len as i32 - 1 {
-                    result.score = h0;
-                }
+                // Score and max tracking (exact H[] unless APPROX_MAX)
+                let u8s = std::slice::from_raw_parts(u_b as *const u8, target_len);
+                let v8s = std::slice::from_raw_parts(v_b as *const u8, target_len);
+                if track.update(result, u8s, v8s, r, st0, en0) { break; }
 
                 last_st = st;
                 last_en = en;
@@ -1536,7 +1275,8 @@ extend_single_affine_avx512_impl!(extend_single_affine_avx512_fn);
 /// Single-affine gap penalty extension alignment
 ///
 /// Performs semi-global alignment with single-affine gap penalties.
-/// Uses NEON SIMD on ARM, with scalar fallback on other architectures.
+/// AVX-512/AVX2/SSE on x86_64, NEON on aarch64, SIMD128 on wasm32, the scalar kernel
+/// elsewhere; all produce identical results.
 ///
 /// # Arguments
 /// * `qseq` - Query sequence (encoded as 0-3 for ACGT, 4 for N)
@@ -1569,6 +1309,7 @@ pub fn extend_single_affine(
         return;
     }
 
+
     #[cfg(target_arch = "aarch64")]
     unsafe {
         extend_single_affine_neon_impl(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, bandwidth, z_drop, end_bonus, flags, result);
@@ -1598,14 +1339,17 @@ pub fn extend_single_affine(
     }
 }
 
-/// Scalar single-affine extension alignment
+/// Scalar single-affine extension alignment.
 ///
-/// Delegates to `extend_dual_affine_scalar` with identical penalties for both gap models.
-/// Scalar single-affine extension alignment (extz2 formulation).
+/// A safe, lane-by-lane version of the SSE kernel: each 128-bit register is a `[i8; 16]`
+/// and every load/store is a bounds-checked copy into one buffer laid out like the SIMD
+/// allocation (u, v, x, y, s, sf, qr), so block rounding, leftover scores outside the
+/// band and the score-store overrun into `sf` all match. Score bookkeeping goes through
+/// [`SingleAffineTrack`].
 ///
-/// Uses the same Suzuki-Kasahara anti-diagonal sweep and 3-state traceback
-/// as the SIMD implementations, producing identical results. This is the
-/// fallback for non-SIMD architectures and for `RAMMAP_FORCE_SCALAR=1`.
+/// This is the reference the SIMD kernels are tested against, the fallback for targets
+/// without a verified SIMD kernel, and the path for `RAMMAP_FORCE_SCALAR=1`.
+#[allow(clippy::too_many_arguments)]
 pub fn extend_single_affine_scalar(
     qseq: &[u8],
     tseq: &[u8],
@@ -1619,228 +1363,186 @@ pub fn extend_single_affine_scalar(
     flags: i32,
     result: &mut DpResult,
 ) {
+    type V = [i8; 16];
+    fn ld(buf: &[u8], at: usize) -> V { std::array::from_fn(|k| buf[at + k] as i8) }
+    fn st16(buf: &mut [u8], at: usize, v: V) { for k in 0..16 { buf[at + k] = v[k] as u8; } }
+    fn add(a: V, b: V) -> V { std::array::from_fn(|k| a[k].wrapping_add(b[k])) }
+    fn sub(a: V, b: V) -> V { std::array::from_fn(|k| a[k].wrapping_sub(b[k])) }
+    fn max_s(a: V, b: V) -> V { std::array::from_fn(|k| a[k].max(b[k])) }
+    fn max_u(a: V, b: V) -> V { std::array::from_fn(|k| (a[k] as u8).max(b[k] as u8) as i8) }
+    fn min_u(a: V, b: V) -> V { std::array::from_fn(|k| (a[k] as u8).min(b[k] as u8) as i8) }
+    /// `(v << 1 byte) | carry`, returning the shifted vector and the new carry (`v >> 15 bytes`)
+    fn shift_in(v: V, carry: i8) -> (V, i8) { (std::array::from_fn(|k| if k == 0 { carry } else { v[k - 1] }), v[15]) }
+
+    init_dp_result_full(result);
     let query_len = qseq.len();
     let target_len = tseq.len();
+    if alphabet_size <= 0 || query_len == 0 || target_len == 0 {
+        return;
+    }
+    let m = alphabet_size as usize;
+    let (q, e) = (gap_open as i8, gap_extend as i8);
+    let qe = gap_open + gap_extend;
+
+    // Skip alignment when a mismatch could never beat two gaps
+    let min_sc = score_matrix[1..m * m].iter().fold(score_matrix[1], |a, &b| a.min(b)) as i32;
+    if -min_sc > 2 * qe { return; }
+
+    let q_: V = [q; 16];
+    let qe2_: V = [(qe * 2) as i8; 16];
+    let max_sc_: V = [(score_matrix[0] as i32 + qe * 2) as i8; 16];
+    let (sc_mch, sc_mis) = (score_matrix[0], score_matrix[1]);
+    let sc_n = if score_matrix[m * m - 1] == 0 { -e } else { score_matrix[m * m - 1] };
+    let m1 = alphabet_size - 1;
+
+    let w = if bandwidth < 0 { target_len.max(query_len) as i32 } else { bandwidth };
+    let tlen_ = target_len.div_ceil(16);
+    let n_col_ = query_len.min(target_len).min((w + 1) as usize).div_ceil(16) + 1;
     let with_cigar = (flags & SCORE_ONLY) == 0;
     let right_align = (flags & RIGHT_ALIGN) != 0;
 
-    if query_len == 0 || target_len == 0 { return; }
+    // One zeroed buffer with the SIMD layout: u, v, x, y, s, then sf, then qr
+    let qlen_ = query_len.div_ceil(16);
+    let (u, v, x, y, s) = (0, tlen_ * 16, 2 * tlen_ * 16, 3 * tlen_ * 16, 4 * tlen_ * 16);
+    let sf = 5 * tlen_ * 16;
+    let qr = sf + tlen_ * 16;
+    let mut mem = vec![0u8; qr + (qlen_ + 1) * 16];
+    for t in 0..query_len {
+        mem[qr + t] = qseq[query_len - 1 - t];
+    }
+    mem[sf..sf + target_len].copy_from_slice(tseq);
 
-    let q = gap_open as i8;
-    let qe2 = ((gap_open + gap_extend) * 2) as i8;
-    let qe_i32 = gap_open + gap_extend;
-    let m = alphabet_size as usize;
+    let valid_range = query_len + target_len - 1;
+    let mut p: Vec<u8> = if with_cigar { vec![0u8; valid_range * n_col_ * 16] } else { Vec::new() };
+    let mut band_off: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
+    let mut band_off_end: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
+    let mut track = SingleAffineTrack::new(flags, query_len, target_len, gap_open, gap_extend, z_drop);
 
-    // Anti-diagonal band
-    let wl = if bandwidth > 0 { bandwidth } else { std::cmp::max(query_len, target_len) as i32 };
-    let valid_range = (query_len + target_len - 1) as i32;
-
-    // DP arrays (Suzuki-Kasahara state: u, v, x, y per cell)
-    let arr_len = target_len + 16;
-    let mut u_arr = vec![0i8; arr_len];
-    let mut v_arr = vec![0i8; arr_len];
-    let mut x_arr = vec![0i8; arr_len];
-    let mut y_arr = vec![0i8; arr_len];
-    let mut s_arr = vec![0i8; arr_len];
-
-    // Reversed query
-    let mut qr = vec![0u8; query_len];
-    for i in 0..query_len { qr[i] = qseq[query_len - 1 - i]; }
-
-    // Traceback storage
-    let n_col_ = std::cmp::min(query_len as i32, 2 * wl + 1) as usize;
-    let stride = n_col_;
-    let mut p_arr: Vec<u8> = if with_cigar { vec![0; valid_range as usize * stride] } else { Vec::new() };
-    let mut band_off = vec![0i32; valid_range as usize];
-    let mut band_off_end = vec![0i32; valid_range as usize];
-
-    // h0 tracking
-    let mut h0 = 0i32;
-    let mut last_h0_t = 0i32;
-    let mut last_st = -1i32;
-    let mut last_en = -1i32;
-
-    result.score = NEG_INF;
-    result.max = NEG_INF;
-
-    for r in 0..valid_range {
+    let mut last_st: i32 = -1;
+    let mut last_en: i32 = -1;
+    for r in 0..valid_range as i32 {
         let mut st = 0i32;
         let mut en = target_len as i32 - 1;
+        // qrr = qr + (qlen - 1 - r); qrr[t] is only read for t >= st0 >= r - qlen + 1
+        let qrr = qr as isize + query_len as isize - 1 - r as isize;
+
         if st < r - query_len as i32 + 1 { st = r - query_len as i32 + 1; }
         if en > r { en = r; }
-        if st < ((r - wl + 1) >> 1) { st = (r - wl + 1) >> 1; }
-        if en > ((r + wl) >> 1) { en = (r + wl) >> 1; }
-        if st > en { result.zdropped = 1; break; }
-
-        let st0 = st;
-        let en0 = en;
+        if st < (r - w + 1) >> 1 { st = (r - w + 1) >> 1; }
+        if en > (r + w) >> 1 { en = (r + w) >> 1; }
+        if st > en {
+            result.zdropped = 1;
+            break;
+        }
+        let (st0, en0) = (st, en);
+        st = st / 16 * 16;
+        en = (en + 16) / 16 * 16 - 1;
 
         // Boundary conditions
-        let mut x1: i8;
-        let v1: i8;
-        if st > 0 {
-            if st > last_st && st - 1 <= last_en {
-                x1 = x_arr[(st - 1) as usize];
-                v1 = v_arr[(st - 1) as usize];
-            } else {
-                x1 = 0; v1 = 0;
+        let (x1, v1): (i8, i8) = if st > 0 {
+            if st - 1 >= last_st && st - 1 <= last_en {
+                (mem[x + (st - 1) as usize] as i8, mem[v + (st - 1) as usize] as i8)
+            } else { (0, 0) }
+        } else { (0, if r > 0 { q } else { 0 }) };
+        if en >= r {
+            mem[y + r as usize] = 0;
+            mem[u + r as usize] = if r > 0 { q as u8 } else { 0 };
+        }
+
+        // Set scores in 16-cell chunks from st0 (the last chunk may run past en0)
+        if (flags & GENERIC_SCORING) == 0 {
+            let mut t = st0 as usize;
+            while t as i32 <= en0 {
+                let sq = ld(&mem, sf + t);
+                let sv = ld(&mem, (qrr + t as isize) as usize);
+                let sc: V = std::array::from_fn(|k| {
+                    if sq[k] == m1 || sv[k] == m1 { sc_n } else if sq[k] == sv[k] { sc_mch } else { sc_mis }
+                });
+                st16(&mut mem, s + t, sc);
+                t += 16;
             }
         } else {
-            x1 = 0;
-            v1 = if r == 0 { 0 } else { q };
-        }
-        if en >= r {
-            y_arr[r as usize] = 0;
-            u_arr[r as usize] = if r == 0 { 0 } else { q };
+            for t in st0 as usize..=en0 as usize {
+                mem[s + t] = score_matrix[mem[sf + t] as usize * m + mem[(qrr + t as isize) as usize] as usize] as u8;
+            }
         }
 
-        // Score computation
-        let use_generic = (flags & GENERIC_SCORING) != 0;
-        for t in st0..=en0 {
-            let ti = t as usize;
-            let qi = (t + query_len as i32 - 1 - r) as usize;
-            s_arr[ti] = if use_generic {
-                score_matrix[tseq[ti] as usize * m + qr[qi] as usize]
-            } else if tseq[ti] >= 4 || qr[qi] >= 4 {
-                score_matrix[4 * m] // ambig penalty
-            } else if tseq[ti] == qr[qi] {
-                score_matrix[0] // match
+        // Core DP over whole 16-cell blocks
+        let (mut x1_, mut v1_) = (x1, v1);
+        let (st_, en_) = (st as usize / 16, en as usize / 16);
+        if with_cigar {
+            band_off[r as usize] = st;
+            band_off_end[r as usize] = en;
+        }
+        for ti in st_..=en_ {
+            let o = ti * 16;
+            // __dp_code_block1
+            let mut z = add(ld(&mem, s + o), qe2_);
+            let (xt1, vt1);
+            (xt1, x1_) = shift_in(ld(&mem, x + o), x1_);
+            (vt1, v1_) = shift_in(ld(&mem, v + o), v1_);
+            let mut a = add(xt1, vt1);
+            let ut = ld(&mem, u + o);
+            let mut b = add(ld(&mem, y + o), ut);
+
+            let mut d: V = [0; 16];
+            if with_cigar && !right_align {
+                for k in 0..16 { if a[k] > z[k] { d[k] = 1; } }     // d = a > z? 1 : 0
+                z = max_s(z, a);
+                for k in 0..16 { if b[k] > z[k] { d[k] = 2; } }     // d = b > z? 2 : d
+            } else if with_cigar {
+                for k in 0..16 { d[k] = if z[k] > a[k] { 0 } else { 1 }; } // d = z > a? 0 : 1
+                z = max_s(z, a);
+                for k in 0..16 { if !(z[k] > b[k]) { d[k] = 2; } }  // d = z > b? d : 2
             } else {
-                score_matrix[1] // mismatch
-            };
-        }
-
-        // DP inner loop
-        let mut v1_cur = v1;
-        for t in st0..=en0 {
-            let ti = t as usize;
-            let z_score = s_arr[ti].wrapping_add(qe2);
-            let a_val = x1.wrapping_add(v1_cur);
-            let b_val = y_arr[ti].wrapping_add(u_arr[ti]);
-
-            let vt1 = v1_cur;
-            let ut = u_arr[ti];
-
-            let (z, d) = if !with_cigar {
-                // Score only
-                let mut z = z_score;
-                if a_val > z { z = a_val; }
-                if b_val > z { z = b_val; }
-                (z, 0u8)
-            } else if !right_align {
-                // Left-align with traceback
-                let mut d: u8 = 0;
-                let mut z = z_score;
-                if a_val > z { d = 1; z = a_val; }
-                if b_val > z { d = 2; z = b_val; }
-                (z, d)
-            } else {
-                // Right-align with traceback
-                let mut z = z_score;
-                let mut d: u8;
-                if z > a_val { d = 0; } else { d = 1; z = a_val; }
-                if z <= b_val { d = 2; z = b_val; }
-                (z, d)
-            };
-
-            u_arr[ti] = z.wrapping_sub(vt1);
-            let old_v = v_arr[ti];
-            v_arr[ti] = z.wrapping_sub(ut);
-            let z2 = z.wrapping_sub(q);
-            let a_new = a_val.wrapping_sub(z2);
-            let b_new = b_val.wrapping_sub(z2);
-
-            x1 = x_arr[ti]; // save for next iteration
-            x_arr[ti] = if a_new > 0 { a_new } else { 0 };
-            y_arr[ti] = if b_new > 0 { b_new } else { 0 };
-
-            if with_cigar {
-                let mut d_final = d;
-                if a_new > 0 { d_final |= 0x08; }
-                if b_new > 0 { d_final |= 0x10; }
-
-                if t == st0 {
-                    band_off[r as usize] = st0;
-                    band_off_end[r as usize] = en0;
-                }
-                let p_idx = r as usize * stride + (t - st0) as usize;
-                p_arr[p_idx] = d_final;
+                z = max_s(z, a);
             }
 
-            // v1 for next t = old v[t] (before overwrite)
-            v1_cur = old_v;
-        }
+            // __dp_code_block2
+            z = max_u(z, b);
+            z = min_u(z, max_sc_);
+            st16(&mut mem, u + o, sub(z, vt1));
+            st16(&mut mem, v + o, sub(z, ut));
+            z = sub(z, q_);
+            a = sub(a, z);
+            b = sub(b, z);
 
-        // h0 score tracking (same as SIMD paths)
-        {
-            if r > 0 {
-                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                    let d0 = v_arr[last_h0_t as usize] as i32 - qe_i32;
-                    let d1 = u_arr[(last_h0_t + 1) as usize] as i32 - qe_i32;
-                    if d0 > d1 { h0 += d0; } else { h0 += d1; last_h0_t += 1; }
-                } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                    h0 += v_arr[last_h0_t as usize] as i32 - qe_i32;
-                } else {
-                    last_h0_t += 1;
-                    h0 += u_arr[last_h0_t as usize] as i32 - qe_i32;
+            let (xa, yb): (V, V);
+            if with_cigar && right_align {
+                xa = std::array::from_fn(|k| if 0 > a[k] { 0 } else { a[k] });
+                yb = std::array::from_fn(|k| if 0 > b[k] { 0 } else { b[k] });
+                for k in 0..16 {
+                    if !(0 > a[k]) { d[k] |= 0x08; }
+                    if !(0 > b[k]) { d[k] |= 0x10; }
                 }
-                if (flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0 {
-                    if h0 > result.max {
-                        result.max = h0;
-                        result.max_score_target_pos = last_h0_t;
-                        result.max_score_query_pos = r - last_h0_t;
-                    } else if (flags & APPROX_DROP) != 0
-                        && last_h0_t >= result.max_score_target_pos
-                        && (r - last_h0_t) >= result.max_score_query_pos {
-                        let tl = last_h0_t - result.max_score_target_pos;
-                        let ql = (r - last_h0_t) - result.max_score_query_pos;
-                        let l = if tl > ql { tl - ql } else { ql - tl };
-                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend) {
-                            result.zdropped = 1;
-                            break;
-                        }
+            } else {
+                xa = std::array::from_fn(|k| if a[k] > 0 { a[k] } else { 0 });
+                yb = std::array::from_fn(|k| if b[k] > 0 { b[k] } else { 0 });
+                if with_cigar {
+                    for k in 0..16 {
+                        if a[k] > 0 { d[k] |= 0x08; }
+                        if b[k] > 0 { d[k] |= 0x10; }
                     }
                 }
-            } else {
-                h0 = v_arr[0] as i32 - qe_i32 - qe_i32;
-                last_h0_t = 0;
-                if ((flags & APPROX_MAX) == 0 || (flags & APPROX_DROP) != 0) && h0 > result.max {
-                    result.max = h0;
-                    result.max_score_target_pos = 0;
-                    result.max_score_query_pos = 0;
-                }
+            }
+            st16(&mut mem, x + o, xa);
+            st16(&mut mem, y + o, yb);
+            if with_cigar {
+                let pr = (r as usize * n_col_ + ti - st_) * 16;
+                for k in 0..16 { p[pr + k] = d[k] as u8; }
             }
         }
 
-        // Track endpoint scores. h0 equals H[last_h0_t], so the right-boundary
-        // score H[en0] is available exactly when the diagonal has reached en0.
-        if en0 == target_len as i32 - 1
-            && last_h0_t == en0
-            && h0 > result.max_target_end_score
-        {
-            result.max_target_end_score = h0;
-            result.max_target_end_query_pos = r - en0;
-        }
-        if r - st0 == query_len as i32 - 1 && last_h0_t == st0
-            && h0 > result.max_query_end_score {
-                result.max_query_end_score = h0;
-                result.max_query_end_target_pos = st0;
-            }
-
-        // Final score
-        if r == valid_range - 1 && en0 == target_len as i32 - 1 {
-            result.score = h0;
-        }
-
-        last_st = st0;
-        last_en = en0;
+        if track.update(result, &mem[u..u + target_len], &mem[v..v + target_len], r, st0, en0) { break; }
+        last_st = st;
+        last_en = en;
     }
 
-    // Traceback (safe — bounds-checked slice indexing, no raw pointers)
     if with_cigar {
         traceback_single_affine_safe(
-            result, query_len, target_len, end_bonus, flags,
-            stride, &p_arr, &band_off, &band_off_end,
+            result, query_len, target_len, end_bonus, flags, n_col_ * 16,
+            &p, &band_off, &band_off_end,
         );
     }
 }
+

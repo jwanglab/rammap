@@ -164,7 +164,7 @@ mod tests {
     use super::*;
     // Also import internal SIMD functions needed by concordance tests
     #[cfg(target_arch = "x86_64")]
-    use super::single::{extend_single_affine41_impl, extend_single_affine_avx512_fn};
+    use super::single::{extend_single_affine2_impl, extend_single_affine41_impl, extend_single_affine_avx2_fn, extend_single_affine_avx512_fn};
     #[cfg(target_arch = "x86_64")]
     use super::dual::{extend_dual_affine2_impl, extend_dual_affine41_impl, extend_dual_affine_avx2_fn, extend_dual_affine_avx512_fn};
     #[cfg(target_arch = "aarch64")]
@@ -938,27 +938,28 @@ mod tests {
         qseq[30] = 3; qseq[60] = 3; qseq[90] = 3; qseq[150] = 3;
         tseq[35] = 3; tseq[70] = 3; tseq[100] = 3; tseq[180] = 3;
 
-        // --- Single-affine ---
-        let mut sse_sa = DpResult::default();
+        // --- Single-affine: SSE2, SSE4.1 and AVX-512 must agree ---
+        let mut sse2_sa = DpResult::default();
+        let mut sse41_sa = DpResult::default();
         let mut avx512_sa = DpResult::default();
         unsafe {
-            extend_single_affine41_impl(
-                &qseq, &tseq, alphabet_size, &score_matrix,
-                4, 2, -1, 400, 0, 0, &mut sse_sa,
-            );
             extend_single_affine_avx512_fn(
                 &qseq, &tseq, alphabet_size, &score_matrix,
                 4, 2, -1, 400, 0, 0, &mut avx512_sa,
             );
+            extend_single_affine2_impl(
+                &qseq, &tseq, alphabet_size, &score_matrix,
+                4, 2, -1, 400, 0, 0, &mut sse2_sa,
+            );
+            extend_single_affine41_impl(
+                &qseq, &tseq, alphabet_size, &score_matrix,
+                4, 2, -1, 400, 0, 0, &mut sse41_sa,
+            );
         }
-        assert_eq!(sse_sa.score, avx512_sa.score, "single-affine score mismatch");
-        assert_eq!(sse_sa.max, avx512_sa.max, "single-affine max mismatch");
-        // CIGARs may differ between SIMD widths at low scores (tie-breaking
-        // depends on lane processing order). Verify consumed lengths match.
-        let (sq, st) = cigar_consumed(&sse_sa.cigar);
-        let (aq, at) = cigar_consumed(&avx512_sa.cigar);
-        assert_eq!((sq, st), (aq, at), "single-affine CIGAR consumed lengths differ: SSE={} AVX512={}",
-            cigar_to_string(&sse_sa.cigar), cigar_to_string(&avx512_sa.cigar));
+        assert_eq!(dp_fields(&sse2_sa), dp_fields(&sse41_sa), "single-affine SSE2/SSE4.1 mismatch");
+        assert_eq!(sse2_sa.cigar, sse41_sa.cigar, "single-affine SSE2/SSE4.1 CIGAR mismatch");
+        assert_eq!(dp_fields(&sse41_sa), dp_fields(&avx512_sa), "single-affine SSE4.1/AVX-512 mismatch");
+        assert_eq!(sse41_sa.cigar, avx512_sa.cigar, "single-affine SSE4.1/AVX-512 CIGAR mismatch");
 
         // --- Dual-affine ---
         let mut sse_da = DpResult::default();
@@ -1130,6 +1131,72 @@ mod tests {
             extend_splice_scalar(&q, &t, 5, &mat, 2, 1, 32, 9, zdrop, end_bonus, 0, 0, flags, None, &mut scalar);
             let ctx = format!("case {case} qlen={} tlen={} flags={flags:#x} zdrop={zdrop} eb={end_bonus}", q.len(), t.len());
             mismatches.check(&ctx, &scalar, &simd);
+        }
+        mismatches.finish(n);
+    }
+
+    /// Run each single-affine SIMD kernel available on this CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn single_affine_kernels(q: &[u8], t: &[u8], mat: &[i8], go: i8, ge: i8, bw: i32, zdrop: i32, end_bonus: i32, flags: i32) -> Vec<(&'static str, DpResult)> {
+        let mut out = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mut r = DpResult::default();
+            extend_single_affine2_impl(q, t, 5, mat, go, ge, bw, zdrop, end_bonus, flags, &mut r);
+            out.push(("sse2", r));
+            if is_x86_feature_detected!("sse4.1") {
+                let mut r = DpResult::default();
+                extend_single_affine41_impl(q, t, 5, mat, go, ge, bw, zdrop, end_bonus, flags, &mut r);
+                out.push(("sse4.1", r));
+            }
+            if is_x86_feature_detected!("avx2") {
+                let mut r = DpResult::default();
+                extend_single_affine_avx2_fn(q, t, 5, mat, go, ge, bw, zdrop, end_bonus, flags, &mut r);
+                out.push(("avx2", r));
+            }
+            if is_x86_feature_detected!("avx512bw") {
+                let mut r = DpResult::default();
+                extend_single_affine_avx512_fn(q, t, 5, mat, go, ge, bw, zdrop, end_bonus, flags, &mut r);
+                out.push(("avx512", r));
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut r = DpResult::default();
+            extend_single_affine(q, t, 5, mat, go, ge, bw, zdrop, end_bonus, flags, &mut r);
+            out.push(("simd", r));
+        }
+        out
+    }
+
+    #[test]
+    fn test_scalar_single_affine_matches_simd_randomized() {
+        let mut rng = Lcg(0x5119_1e00);
+        let mat = ont_matrix(2, 4);
+        let flag_sets = [
+            0, APPROX_MAX, RIGHT_ALIGN, EXTENSION_ONLY, EXTENSION_ONLY | REV_CIGAR, SCORE_ONLY | APPROX_MAX,
+            GENERIC_SCORING, RIGHT_ALIGN | EXTENSION_ONLY, APPROX_MAX | APPROX_DROP, SCORE_ONLY,
+        ];
+        let mut mismatches = Mismatches::default();
+        let n = 3000;
+        for case in 0..n {
+            let (mut q, mut t) = mutated_pair(&mut rng, case % 3 == 0);
+            if case % 10 == 0 {
+                for _ in 0..1 + rng.below(8) { let (q2, t2) = mutated_pair(&mut rng, false); q.extend(q2); t.extend(t2); }
+            }
+            if case % 4 == 1 { let l = (t.len() / 16).max(1) * 16; t.resize(l, 0); }
+            let flags = flag_sets[case % flag_sets.len()];
+            let bw = match case % 5 { 0 => -1, 1 => 200 + rng.below(400) as i32, _ => 10 + rng.below(200) as i32 };
+            let zdrop = if case % 5 == 0 { -1 } else { 100 + rng.below(300) as i32 };
+            let end_bonus = if case % 7 == 0 { 50 } else { -1 };
+            let (go, ge) = if case % 2 == 0 { (4, 2) } else { (6, 1) };
+            let mut scalar = DpResult::default();
+            extend_single_affine_scalar(&q, &t, 5, &mat, go, ge, bw, zdrop, end_bonus, flags, &mut scalar);
+            let ctx = format!("case {case} qlen={} tlen={} flags={flags:#x} bw={bw} zdrop={zdrop} eb={end_bonus} gap={go},{ge}", q.len(), t.len());
+            // Every kernel this CPU can run, not just the one the dispatcher picks
+            for (name, simd) in single_affine_kernels(&q, &t, &mat, go as i8, ge as i8, bw, zdrop, end_bonus, flags) {
+                mismatches.check(&format!("{name} {ctx}"), &scalar, &simd);
+            }
         }
         mismatches.finish(n);
     }

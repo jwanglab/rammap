@@ -572,14 +572,15 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if let Some(v) = cli.scor_a { opt.scoring.match_score = v; }
     if let Some(v) = cli.scor_b { opt.scoring.mismatch_penalty = v; }
 
+    // A single -O/-E value sets both the first and second gap penalty
     if let Some(s) = &cli.scor_o {
         let parts: Vec<&str> = s.split(',').collect();
-        if let Ok(v) = parts[0].parse() { opt.scoring.gap_open = v; }
+        if let Ok(v) = parts[0].parse() { opt.scoring.gap_open = v; opt.scoring.gap_open2 = v; }
         if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.scoring.gap_open2 = v; }
     }
     if let Some(s) = &cli.scor_e {
         let parts: Vec<&str> = s.split(',').collect();
-        if let Ok(v) = parts[0].parse() { opt.scoring.gap_extend = v; }
+        if let Ok(v) = parts[0].parse() { opt.scoring.gap_extend = v; opt.scoring.gap_extend2 = v; }
         if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.scoring.gap_extend2 = v; }
     }
     if let Some(v) = cli.best_n { opt.filtering.best_n = v; }
@@ -754,6 +755,20 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         }
     };
     let pe_mode = two_file_pe || frag_mode;
+    // Gap-penalty checks; the DP kernels rely on them
+    {
+        let sc = &opt.scoring;
+        let (q, e, q2, e2) = (sc.gap_open, sc.gap_extend, sc.gap_open2, sc.gap_extend2);
+        if e <= 0 || q <= 0 {
+            anyhow::bail!("-O and -E must be positive");
+        }
+        if (q != q2 || e != e2) && !(e > e2 && q + e < q2 + e2) {
+            anyhow::bail!("dual gap penalties violating E1>E2 and O1+E1<O2+E2");
+        }
+        if (q + e) + (q2 + e2) > 127 {
+            anyhow::bail!("scoring system violating ({{-O}}+{{-E}})+({{-O2}}+{{-E2}}) <= 127");
+        }
+    }
     if cli.eqx && (cli.junc_jump.is_some() || cli.pass1.is_some())
         && opt.flags.contains(AlignFlags::SPLICE) && !pe_mode {
         anyhow::bail!("--eqx is incompatible with jump splice extension (-j/--pass1)");

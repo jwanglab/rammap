@@ -500,6 +500,135 @@ pub(super) fn alloc_h_array(approx_max: bool, tlen_: usize, simd_width: usize) -
     }
 }
 
+/// Per-anti-diagonal score bookkeeping shared by every single-affine kernel, so they
+/// all produce the same scores and end positions.
+///
+/// Without `APPROX_MAX` this keeps the exact 32-bit `H[]` row (with the SSE 4-lane max
+/// reduction), records `mqe`/`mte` and applies z-drop to the true row max. With
+/// `APPROX_MAX` it follows the single `H0` path, and only touches `max`/z-drop under
+/// `APPROX_DROP`. The u/v difference bytes are read unsigned.
+pub(super) struct SingleAffineTrack {
+    h: Vec<i32>,
+    h0: i32,
+    last_h0_t: i32,
+    approx_max: bool,
+    approx_drop: bool,
+    qe: i32,
+    gap_extend: i32,
+    z_drop: i32,
+    query_len: i32,
+    target_len: i32,
+}
+
+impl SingleAffineTrack {
+    pub(super) fn new(flags: i32, query_len: usize, target_len: usize, gap_open: i32, gap_extend: i32, z_drop: i32) -> Self {
+        let approx_max = (flags & APPROX_MAX) != 0;
+        SingleAffineTrack {
+            h: if approx_max { Vec::new() } else { vec![NEG_INF; target_len] },
+            h0: 0,
+            last_h0_t: 0,
+            approx_max,
+            approx_drop: (flags & APPROX_DROP) != 0,
+            qe: gap_open + gap_extend,
+            gap_extend,
+            z_drop,
+            query_len: query_len as i32,
+            target_len: target_len as i32,
+        }
+    }
+
+    /// Update the max with `h` at (r, t) and apply z-drop; returns true when Z-dropped.
+    fn apply_zdrop(&self, result: &mut DpResult, h: i32, r: i32, t: i32) -> bool {
+        if h > result.max {
+            result.max = h;
+            result.max_score_target_pos = t;
+            result.max_score_query_pos = r - t;
+        } else if t >= result.max_score_target_pos && r - t >= result.max_score_query_pos {
+            let tl = t - result.max_score_target_pos;
+            let ql = (r - t) - result.max_score_query_pos;
+            let l = if tl > ql { tl - ql } else { ql - tl };
+            if self.z_drop >= 0 && result.max - h > self.z_drop + l * self.gap_extend {
+                result.zdropped = 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update after anti-diagonal `r` (cells `st0..=en0`). `u8s`/`v8s` are the u/v arrays.
+    /// Returns true when the alignment Z-drops; the caller must stop the DP loop.
+    pub(super) fn update(&mut self, result: &mut DpResult, u8s: &[u8], v8s: &[u8], r: i32, st0: i32, en0: i32) -> bool {
+        let qe = self.qe;
+        let at = |s: &[u8], t: i32| s[t as usize] as i32;
+        let last_diag = r == self.query_len + self.target_len - 2 && en0 == self.target_len - 1;
+        if !self.approx_max {
+            let h = &mut self.h;
+            let (mut max_h, mut max_t);
+            if r > 0 {
+                h[en0 as usize] = if en0 > 0 { h[en0 as usize - 1] + at(u8s, en0) - qe } else { h[en0 as usize] + at(v8s, en0) - qe };
+                max_h = h[en0 as usize];
+                max_t = en0;
+                // H[t] += v8[t] - qe over [st0, en1) in 4 lanes, then the SSE lane reduction
+                let en1 = st0 + (en0 - st0) / 4 * 4;
+                let mut hh = [max_h; 4];
+                let mut tt = [max_t; 4];
+                let mut t = st0;
+                while t < en1 {
+                    for i in 0..4 {
+                        let k = (t + i as i32) as usize;
+                        h[k] += at(v8s, t + i as i32) - qe;
+                        if h[k] > hh[i] { hh[i] = h[k]; tt[i] = t; }
+                    }
+                    t += 4;
+                }
+                for i in 0..4 {
+                    if max_h < hh[i] { max_h = hh[i]; max_t = tt[i] + i as i32; }
+                }
+                while t < en0 {
+                    h[t as usize] += at(v8s, t) - qe;
+                    if h[t as usize] > max_h { max_h = h[t as usize]; max_t = t; }
+                    t += 1;
+                }
+            } else {
+                h[0] = at(v8s, 0) - qe - qe;
+                max_h = h[0];
+                max_t = 0;
+            }
+            let (h_en0, h_st0) = (h[en0 as usize], h[st0 as usize]);
+            if en0 == self.target_len - 1 && h_en0 > result.max_target_end_score {
+                result.max_target_end_score = h_en0;
+                result.max_target_end_query_pos = r - en0;
+            }
+            if r - st0 == self.query_len - 1 && h_st0 > result.max_query_end_score {
+                result.max_query_end_score = h_st0;
+                result.max_query_end_target_pos = st0;
+            }
+            if self.apply_zdrop(result, max_h, r, max_t) { return true; }
+            if last_diag { result.score = self.h[self.target_len as usize - 1]; }
+        } else {
+            if r > 0 {
+                let t0 = self.last_h0_t;
+                if t0 >= st0 && t0 <= en0 && t0 + 1 >= st0 && t0 < en0 {
+                    let d0 = at(v8s, t0) - qe;
+                    let d1 = at(u8s, t0 + 1) - qe;
+                    if d0 > d1 { self.h0 += d0; } else { self.h0 += d1; self.last_h0_t += 1; }
+                } else if t0 >= st0 && t0 <= en0 {
+                    self.h0 += at(v8s, t0) - qe;
+                } else {
+                    self.last_h0_t += 1;
+                    self.h0 += at(u8s, self.last_h0_t) - qe;
+                }
+                if self.approx_drop && self.apply_zdrop(result, self.h0, r, self.last_h0_t) { return true; }
+            } else {
+                self.h0 = at(v8s, 0) - qe - qe;
+                self.last_h0_t = 0;
+            }
+            if last_diag { result.score = self.h0; }
+        }
+        false
+    }
+}
+
 /// Compute the traceback starting position (i, j) from the result state.
 ///
 /// Returns (i, j) where i is the target position and j is the query position
@@ -608,7 +737,7 @@ pub(super) unsafe fn traceback_dual_affine(
     result.cigar = cigar;
 }}
 
-/// Traceback for single-affine (extz2) alignment — shared across SSE2/SSE4.1/NEON.
+/// Traceback for single-affine alignment — used by the SIMD kernels.
 ///
 /// Walks back through the traceback matrix to reconstruct the CIGAR string.
 /// Single-affine has 3 states: 0=M, 1=D, 2=I.
@@ -618,6 +747,7 @@ pub(super) unsafe fn traceback_dual_affine(
 /// # Safety
 /// p_ptr, band_offset_ptr, band_offset_end_ptr must point to valid memory
 /// from the DP traceback allocation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32"))]
 #[inline(always)]
 pub(super) unsafe fn traceback_single_affine(
     result: &mut DpResult,
@@ -691,7 +821,7 @@ pub(super) unsafe fn traceback_single_affine(
 /// Safe traceback for single-affine alignment using slice indexing.
 ///
 /// Equivalent to [`traceback_single_affine`] but uses bounds-checked slice access
-/// instead of raw pointer arithmetic. Used by the scalar extz2 implementation
+/// instead of raw pointer arithmetic. Used by the scalar single-affine kernel
 /// to provide a fully-safe code path on non-SIMD targets.
 pub(super) fn traceback_single_affine_safe(
     result: &mut DpResult,
