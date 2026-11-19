@@ -5,19 +5,31 @@ use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 use std::io::{self, BufWriter, BufReader, Read, Write, Seek, SeekFrom};
 
-/// Read a Vec<u32> from a binary stream (little-endian, safe).
-fn read_u32_vec<R: Read>(reader: &mut R, n: usize) -> io::Result<Vec<u32>> {
-    let mut buf = vec![0u8; n * 4];
-    reader.read_exact(&mut buf)?;
-    Ok(buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+/// Read `n` little-endian words from a binary stream into `out` (replacing its
+/// contents), converting through a small fixed buffer so a large array is never
+/// held twice.
+fn read_le_into<R: Read, T, const W: usize>(reader: &mut R, n: usize, out: &mut Vec<T>, from_le: fn([u8; W]) -> T) -> io::Result<()> {
+    out.clear();
+    out.reserve(n);
+    let mut buf = [0u8; 1 << 16];
+    let mut left = n;
+    while left > 0 {
+        let m = left.min(buf.len() / W);
+        let bytes = &mut buf[..m * W];
+        reader.read_exact(bytes)?;
+        out.extend(bytes.chunks_exact(W).map(|c| from_le(c.try_into().unwrap())));
+        left -= m;
+    }
+    Ok(())
 }
 
-/// Read a Vec<u64> from a binary stream (little-endian, safe).
-fn read_u64_vec<R: Read>(reader: &mut R, n: usize) -> io::Result<Vec<u64>> {
-    let mut buf = vec![0u8; n * 8];
-    reader.read_exact(&mut buf)?;
-    Ok(buf.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
+/// Read a Vec<u32> from a binary stream (little-endian, safe).
+fn read_u32_vec<R: Read>(reader: &mut R, n: usize) -> io::Result<Vec<u32>> {
+    let mut out = Vec::new();
+    read_le_into(reader, n, &mut out, u32::from_le_bytes)?;
+    Ok(out)
 }
+
 use std::fs::File;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,16 +41,71 @@ pub struct TargetSequence {
     pub is_alt: bool,
 }
 
-/// Magic bytes for multi-part index format
-const RMMI_MAGIC: &[u8; 4] = b"RMMI";
+/// Magic bytes for multi-part index format. `RMI2` stores single-occurrence
+/// positions inline in the hash table; `RMMI` (v1) indices are upgraded on load.
+const RMMI_MAGIC: &[u8; 4] = b"RMI2";
+const RMMI_V1_MAGIC: &[u8; 4] = b"RMMI";
+
+/// Reference hits for one minimizer: either a single position stored inline,
+/// or an (offset, count) range into the lookup's shared positions array.
+/// Positions are `rid << 32 | pos << 1 | strand`, so bit 63 is free to mark ranges.
+/// A range packs a 35-bit offset above a 28-bit count. A count of 0 means the
+/// true count did not fit and is stored in the positions slot at the offset,
+/// with the hits following it; the lookup resolves this, so use its `hits`
+/// rather than the raw count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedHits(u64);
+
+impl SeedHits {
+    const RANGE_FLAG: u64 = 1 << 63;
+    pub(crate) const COUNT_BITS: u32 = 28;
+    const COUNT_MASK: u64 = (1 << Self::COUNT_BITS) - 1;
+    /// Positions-array offsets must stay below this (2^35 per index part).
+    pub(crate) const MAX_OFFSET: u64 = 1 << (63 - Self::COUNT_BITS);
+
+    #[inline]
+    pub(crate) fn single(pos: u64) -> Self {
+        debug_assert!(pos & Self::RANGE_FLAG == 0);
+        SeedHits(pos)
+    }
+
+    /// `count` is the raw count field: the hit count, or 0 if stored out of line.
+    #[inline]
+    pub(crate) fn range(offset: u64, count: u64) -> Self {
+        assert!(offset < Self::MAX_OFFSET, "index has too many multi-occurrence positions for one part");
+        debug_assert!(count <= Self::COUNT_MASK);
+        SeedHits(Self::RANGE_FLAG | offset << Self::COUNT_BITS | count)
+    }
+
+    #[inline]
+    pub(crate) fn from_raw(raw: u64) -> Self { SeedHits(raw) }
+
+    #[inline]
+    pub(crate) fn raw(self) -> u64 { self.0 }
+
+    /// The inline singleton position, by reference (only meaningful when `as_range` is None).
+    #[inline]
+    pub(crate) fn pos_ref(&self) -> &u64 { &self.0 }
+
+    /// The (offset, raw count) range into the positions array, or None for an
+    /// inline singleton. A raw count of 0 means the count is stored out of line.
+    #[inline]
+    pub(crate) fn as_range(self) -> Option<(usize, usize)> {
+        if self.0 & Self::RANGE_FLAG != 0 {
+            Some((((self.0 & !Self::RANGE_FLAG) >> Self::COUNT_BITS) as usize, (self.0 & Self::COUNT_MASK) as usize))
+        } else {
+            None
+        }
+    }
+}
 
 // ─── Seed lookup trait + backends ───
 
 /// Trait for seed lookup backends.
 pub trait SeedLookup {
     fn get(&self, hash: u64) -> Option<&[u64]>;
-    fn get_range(&self, hash: u64) -> Option<(u32, u32)>;
-    fn get_by_range(&self, range: (u32, u32)) -> &[u64];
+    fn get_hits(&self, hash: u64) -> Option<SeedHits>;
+    fn hits<'a>(&'a self, hits: &'a SeedHits) -> &'a [u64];
     /// Iterator over occurrence counts for each unique hash (for cal_mid_occ).
     fn occurrence_counts(&self) -> Box<dyn Iterator<Item = u32> + '_>;
     fn is_empty(&self) -> bool;
@@ -58,12 +125,12 @@ impl SeedLookup for LookupBackend {
         match self { LookupBackend::BucketHash(b) => b.get(hash) }
     }
     #[inline]
-    fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
-        match self { LookupBackend::BucketHash(b) => b.get_range(hash) }
+    fn get_hits(&self, hash: u64) -> Option<SeedHits> {
+        match self { LookupBackend::BucketHash(b) => b.get_hits(hash) }
     }
     #[inline]
-    fn get_by_range(&self, range: (u32, u32)) -> &[u64] {
-        match self { LookupBackend::BucketHash(b) => b.get_by_range(range) }
+    fn hits<'a>(&'a self, hits: &'a SeedHits) -> &'a [u64] {
+        match self { LookupBackend::BucketHash(b) => b.hits(hits) }
     }
     fn occurrence_counts(&self) -> Box<dyn Iterator<Item = u32> + '_> {
         match self { LookupBackend::BucketHash(b) => b.occurrence_counts() }
@@ -407,7 +474,7 @@ impl Index {
         if f.read_exact(&mut magic).is_err() {
             return false;
         }
-        &magic == RMMI_MAGIC || &magic == Self::MINIMAP2_INDEX_MAGIC
+        &magic == RMMI_MAGIC || &magic == RMMI_V1_MAGIC || &magic == Self::MINIMAP2_INDEX_MAGIC
     }
 
     /// Load the next index part from a reader. Returns None on EOF.
@@ -421,8 +488,10 @@ impl Index {
             Err(e) => return Err(e),
         }
 
-        let idx: Self = if &magic == RMMI_MAGIC {
+        let mut idx: Self = if &magic == RMMI_MAGIC {
             // rammap format: magic already consumed, deserialize the rest
+            return Ok(Some(bincode::deserialize_from(reader).map_err(io::Error::other)?));
+        } else if &magic == RMMI_V1_MAGIC {
             bincode::deserialize_from(reader)
                 .map_err(io::Error::other)?
         } else if &magic == Self::MINIMAP2_INDEX_MAGIC {
@@ -434,6 +503,9 @@ impl Index {
             bincode::deserialize_from(reader)
                 .map_err(io::Error::other)?
         };
+        // v1 and no-magic indices store every hash as a range; inline the singletons.
+        let LookupBackend::BucketHash(b) = &mut idx.backend;
+        b.upgrade_v1();
         Ok(Some(idx))
     }
 
@@ -483,11 +555,17 @@ impl Index {
             sum_len += len as u64;
         }
 
-        // Read per-bucket hash tables directly into BucketHashLookup.
+        // Convert each per-bucket hash table as it's read, so only one source
+        // bucket is held alongside the growing lookup.
         // .mmi format stores per-bucket: n positions (p[]), then hash entries.
         let n_buckets = 1usize << b;
-        let mut bucket_data: Vec<(Vec<u64>, Vec<(u64, u64)>)> = Vec::with_capacity(n_buckets);
+        let mut lookup = super::index_bucket::BucketHashLookup::with_bucket_bits(b as u32);
 
+        // One pair of read buffers reused for every bucket: allocating and
+        // freeing fresh ones per bucket leaves holes between the hash tables
+        // that the allocator never returns, hundreds of MB on a human genome.
+        let mut p: Vec<u64> = Vec::new();
+        let mut hash_kv: Vec<u64> = Vec::new();
         for _ in 0..n_buckets {
             // Read n (i32) — size of positions array
             let mut n_buf = [0u8; 4];
@@ -495,26 +573,19 @@ impl Index {
             let n = i32::from_le_bytes(n_buf) as usize;
 
             // Read p[0..n] (u64 array) — multi-occurrence positions
-            let p = if n > 0 { read_u64_vec(reader, n)? } else { Vec::new() };
+            read_le_into(reader, n, &mut p, u64::from_le_bytes)?;
 
             // Read hash_size (u32)
             let mut size_buf = [0u8; 4];
             reader.read_exact(&mut size_buf)?;
             let hash_size = u32::from_le_bytes(size_buf) as usize;
 
-            let hash_entries = if hash_size > 0 {
-                let hash_buf = read_u64_vec(reader, hash_size * 2)?;
-                (0..hash_size).map(|i| (hash_buf[i * 2], hash_buf[i * 2 + 1])).collect()
-            } else {
-                Vec::new()
-            };
+            read_le_into(reader, hash_size * 2, &mut hash_kv, u64::from_le_bytes)?;
 
-            bucket_data.push((p, hash_entries));
+            lookup.push_mmi_bucket(&p, &hash_kv);
         }
 
-        let backend = LookupBackend::BucketHash(
-            super::index_bucket::BucketHashLookup::from_minimap2_buckets(b as u32, bucket_data)
-        );
+        let backend = LookupBackend::BucketHash(lookup);
 
         // Read packed 4-bit sequences if present
         let packed_seqs = if !no_seq {
@@ -698,20 +769,20 @@ impl Index {
         self.backend.get(hash)
     }
 
-    /// Returns the (start, end) range for a hash, for deferred retrieval via `get_by_range`.
+    /// Returns a handle to a hash's hits, for deferred retrieval via `hits`.
     #[inline]
-    pub fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
-        self.backend.get_range(hash)
+    pub fn get_hits(&self, hash: u64) -> Option<SeedHits> {
+        self.backend.get_hits(hash)
     }
 
-    /// Retrieve a slice of positions from a previously computed range.
+    /// Retrieve the positions behind a previously looked-up handle.
     #[inline]
-    pub fn get_by_range(&self, range: (u32, u32)) -> &[u64] {
-        self.backend.get_by_range(range)
+    pub fn hits<'a>(&'a self, hits: &'a SeedHits) -> &'a [u64] {
+        self.backend.hits(hits)
     }
 
     /// Prefetch the hash table bucket for a hash value into L1 cache.
-    /// Call a few iterations ahead of the actual `get_range` for that hash.
+    /// Call a few iterations ahead of the actual `get_hits` for that hash.
     #[inline]
     pub fn prefetch(&self, hash: u64) {
         match &self.backend {
@@ -719,11 +790,11 @@ impl Index {
         }
     }
 
-    /// Prefetch a positions range into L1 cache.
+    /// Prefetch a handle's positions into L1 cache (no-op for an inline singleton).
     #[inline]
-    pub fn prefetch_positions(&self, range: (u32, u32)) {
+    pub fn prefetch_hits(&self, hits: SeedHits) {
         match &self.backend {
-            LookupBackend::BucketHash(b) => b.prefetch_positions(range),
+            LookupBackend::BucketHash(b) => b.prefetch_hits(hits),
         }
     }
 
@@ -733,17 +804,8 @@ impl Index {
         if frac <= 0.0 { return usize::MAX; }
         if self.backend.is_empty() { return min_mid; }
 
-        let mut counts: Vec<u32> = self.backend.occurrence_counts().collect();
-
-        let n = counts.len();
-        if n == 0 { return min_mid; }
-
-        counts.sort_unstable();
-
-        let k = ((1.0f64 - frac as f64) * n as f64) as usize;
-        let k = k.min(n - 1);
-
-        let mut threshold = counts[k] as usize + 1;
+        let Some(kth) = quantile_count(self.backend.occurrence_counts(), frac) else { return min_mid };
+        let mut threshold = kth as usize + 1;
 
         // Clamp to [min_mid_occ, max_mid_occ] (matching mm_mapopt_update)
         if threshold < min_mid { threshold = min_mid; }
@@ -753,6 +815,35 @@ impl Index {
 
         threshold
     }
+}
+
+/// The count at rank `(1 - frac) * n` among `n` per-minimizer occurrence
+/// counts, or None if there are none.
+///
+/// Uses a histogram rather than a sorted copy of every count (one u32 per
+/// distinct minimizer, gigabytes on a large genome). Counts too large for the
+/// dense table are few and kept aside.
+fn quantile_count(counts: impl Iterator<Item = u32>, frac: f32) -> Option<u32> {
+    const DENSE: usize = 1 << 16;
+    let mut hist = vec![0usize; DENSE];
+    let mut large: Vec<u32> = Vec::new();
+    for c in counts {
+        match hist.get_mut(c as usize) {
+            Some(h) => *h += 1,
+            None => large.push(c),
+        }
+    }
+    let n = hist.iter().sum::<usize>() + large.len();
+    if n == 0 { return None; }
+    let k = (((1.0f64 - frac as f64) * n as f64) as usize).min(n - 1);
+
+    let mut seen = 0usize;
+    for (c, &h) in hist.iter().enumerate() {
+        seen += h;
+        if seen > k { return Some(c as u32); }
+    }
+    large.sort_unstable();
+    Some(large[k - seen])
 }
 
 #[cfg(test)]
@@ -770,6 +861,37 @@ mod tests {
         assert_eq!(positions.unwrap()[0], 624);
         assert_eq!(idx.seqs.len(), 1);
     }
+
+    #[test]
+    fn test_seed_hits_range_offsets_past_32_bits() {
+        // A 1M-read ava-ont part holds ~2.3G multi-occurrence positions; a full
+        // -I 16G part can exceed 2^32.
+        for &(offset, count) in &[(0u64, 2u64), ((1 << 31) + 5, 7), ((1 << 32) + 1, 0), (SeedHits::MAX_OFFSET - 1, SeedHits::COUNT_MASK)] {
+            assert_eq!(SeedHits::range(offset, count).as_range(), Some((offset as usize, count as usize)));
+        }
+        // Largest real singleton (rid < 2^31) is not mistaken for a range.
+        let pos = (((1u64 << 31) - 1) << 32) | 0xFFFF_FFFF;
+        assert_eq!(SeedHits::single(pos).as_range(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "too many multi-occurrence positions")]
+    fn test_seed_hits_range_offset_overflow_panics() {
+        SeedHits::range(SeedHits::MAX_OFFSET, 2);
+    }
+
+    #[test]
+    fn test_quantile_count_matches_sorted() {
+        let counts: Vec<u32> = (0..5000u32).map(|i| match i % 7 { 0 => 70_000 + i, 1 => 1 << 16, _ => i % 300 + 1 }).collect();
+        let mut sorted = counts.clone();
+        sorted.sort_unstable();
+        for frac in [0.0f32, 0.0002, 0.01, 0.1, 0.2, 0.25, 0.5, 0.9, 1.0] {
+            let k = (((1.0f64 - frac as f64) * sorted.len() as f64) as usize).min(sorted.len() - 1);
+            assert_eq!(quantile_count(counts.iter().copied(), frac), Some(sorted[k]), "frac {frac}");
+        }
+        assert_eq!(quantile_count(std::iter::empty(), 0.5), None);
+    }
+
     #[test]
     fn test_cal_mid_occ() {
         let mut seqs = Vec::new();

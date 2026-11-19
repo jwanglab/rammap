@@ -17,7 +17,7 @@
 //! (repetitive length) for mapping quality estimation.
 
 use crate::align::sketch::Minimizer;
-use crate::align::index::Index;
+use crate::align::index::{Index, SeedHits};
 use crate::align::map::{MapOptions, AlignFlags};
 use crate::align::sketch::{SEED_SEG_SHIFT, SEED_SELF};
 
@@ -71,7 +71,7 @@ struct SeedInfo {
     is_tandem: bool,
     is_filtered: bool,      // true = filtered out
     mi_idx: usize,  // index into q_minimizers
-    entry_range: (u32, u32), // absolute range into Index.entries
+    hits: SeedHits,         // index hits handle
 }
 
 /// Select seeds by frequency threshold
@@ -165,7 +165,7 @@ struct MatchedSeed {
     is_tandem: bool,
     mi_idx: usize,  // index into q_minimizers
     seg_id: u64,    // segment index (from minimizer rid field, for multi-segment)
-    entry_range: (u32, u32), // absolute range into Index.entries, avoids re-lookup
+    hits: SeedHits, // index hits handle, avoids re-lookup
 }
 
 /// Reusable scratch buffers for the seed-collection path.
@@ -226,7 +226,7 @@ fn collect_anchor_matches(
     }
 
     // Phase 1: Collect seed info (like mm_seed_collect_all)
-    // Use get_range to capture the entry range so we can skip the binary search later.
+    // Capture each hit handle so later passes skip the hash lookup.
     // Software prefetch: issue prefetch for upcoming hash table bucket while
     // processing the current one, hiding memory latency.
     const PREFETCH_AHEAD: usize = 8;
@@ -248,11 +248,11 @@ fn collect_anchor_matches(
         let hash = m.x >> 8;
         let q_span = (m.x & 0xFF) as u32;
         let q_pos = m.y as u32; // includes strand bit
-        let range = match mi.get_range(hash) {
-            Some(r) => r,
+        let hits = match mi.get_hits(hash) {
+            Some(h) => h,
             None => continue,
         };
-        let n = (range.1 - range.0) as usize;
+        let n = mi.hits(&hits).len();
         seeds.push(SeedInfo {
             query_pos: q_pos,
             q_span,
@@ -260,7 +260,7 @@ fn collect_anchor_matches(
             is_tandem: is_tandem[mi_idx],
             is_filtered: false,
             mi_idx,
-            entry_range: range,
+            hits,
         });
     }
 
@@ -303,7 +303,7 @@ fn collect_anchor_matches(
             is_tandem: seed.is_tandem,
             mi_idx: seed.mi_idx,
             seg_id: (q_minimizers[seed.mi_idx].y >> 32),
-            entry_range: seed.entry_range,
+            hits: seed.hits,
         });
     }
 
@@ -349,7 +349,7 @@ pub(crate) fn collect_seed_hits_with_occ(
     for (si, seed) in matched_seeds.iter().enumerate() {
         // Prefetch positions for the next seed
         if si + 1 < matched_seeds.len() {
-            mi.prefetch_positions(matched_seeds[si + 1].entry_range);
+            mi.prefetch_hits(matched_seeds[si + 1].hits);
         }
 
         let m = &q_minimizers[seed.mi_idx];
@@ -358,7 +358,7 @@ pub(crate) fn collect_seed_hits_with_occ(
         let tandem = seed.is_tandem;
 
         {
-            let hits = mi.get_by_range(seed.entry_range);
+            let hits = mi.hits(&seed.hits);
             for &r_packed in hits {
                 // skip_seed logic
                 let mut is_self = false;
@@ -502,7 +502,7 @@ pub fn collect_seed_hits_heap(
     heap.clear();
     heap.reserve(matched_seeds.len());
     for (i, seed) in matched_seeds.iter().enumerate() {
-        let h = mi.get_by_range(seed.entry_range);
+        let h = mi.hits(&seed.hits);
         if !h.is_empty() {
             heap.push((h[0], (i as u64) << 32)); // h[0] = r_packed
         }
@@ -575,7 +575,7 @@ pub fn collect_seed_hits_heap(
         }
 
         // Update heap: advance to next hit or remove seed
-        let hits = mi.get_by_range(seed.entry_range);
+        let hits = mi.hits(&seed.hits);
         let hs = heap.len();
         if hit_idx < hits.len() - 1 {
             let next_r = hits[hit_idx + 1];
