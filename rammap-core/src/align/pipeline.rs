@@ -1875,8 +1875,16 @@ pub fn refilter_merged_results(
     // 1. update_dp_max
     let is_sr = opt.flags.intersects(AlignFlags::SHORT_READ | AlignFlags::SR_RNA);
     if do_cigar && !is_sr && qlen >= 500 {
+        // Gap stats from the CIGAR; mlen/blen/n_ambi from the stored alignment stats, since
+        // an M-only CIGAR can't tell matches from mismatches.
         let recalc_infos: Vec<DpRecalcInfo> = results.iter()
-            .map(|r| DpRecalcInfo::from_cigar_str(&r.cigar_str))
+            .map(|r| {
+                let mut ri = DpRecalcInfo::from_cigar_str(&r.cigar_str);
+                ri.match_len = r.matches as i32;
+                ri.block_len = r.block_len as i32;
+                ri.num_ambiguous = r.num_ambiguous as i32;
+                ri
+            })
             .collect();
         let mut dp_max_vals: Vec<i32> = results.iter().map(|r| r.dp_score).collect();
         let qs_vals: Vec<usize> = results.iter().map(|r| r.query_start).collect();
@@ -1939,9 +1947,8 @@ pub fn refilter_merged_results(
 
             let sub_diff = opt.scoring.match_score * 2 + opt.scoring.mismatch_penalty;
             let mut dp_max2 = vec![0i32; results.len()];
-            let mut subsc_vec: Vec<i32> = results.iter()
-                .map(|r| r.s2_score.unwrap_or(0))
-                .collect();
+            // Sub-scores restart at 0, so only the merged hits contribute
+            let mut subsc_vec = vec![0i32; results.len()];
             let mut n_sub_post = vec![0i32; results.len()];
             // In merge, n_sub_post[0] starts at 0 (reset above), NOT pre_num_suboptimal
             let alt_drop = opt.filtering.alt_drop;

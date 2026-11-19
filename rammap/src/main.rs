@@ -930,13 +930,26 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
                         }
                     }
 
-                    for qf in &query_files {
-                        let part_stats = map_one_part(
-                            &mi, &mut opt, &run_cfg,
-                            qf, 1, &mut sam_header_written,
-                            &mut handle,
-                        )?;
-                        total_stats = total_stats + part_stats;
+                    if let Some(ref prefix) = split_prefix {
+                        // Write temp files and merge even for a single part, so the output matches multi-part runs
+                        let mut split_writer = split::split_init(prefix, 0, &mi)
+                            .map_err(|e| anyhow::anyhow!("Failed to init split temp file: {}", e))?;
+                        for qf in &query_files {
+                            let part_stats = map_one_part_split(
+                                &mi, &mut opt, &run_cfg,
+                                qf, 1, &mut split_writer,
+                            )?;
+                            total_stats = total_stats + part_stats;
+                        }
+                    } else {
+                        for qf in &query_files {
+                            let part_stats = map_one_part(
+                                &mi, &mut opt, &run_cfg,
+                                qf, 1, &mut sam_header_written,
+                                &mut handle,
+                            )?;
+                            total_stats = total_stats + part_stats;
+                        }
                     }
                 } else {
                     // ─── Multi-part from mmap: split all_seqs into batches ───
