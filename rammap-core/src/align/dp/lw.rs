@@ -76,16 +76,25 @@ pub fn lightweight_profile_init(qlen: i32, query: &[u8], alphabet_size: i32, sco
 /// Returns (score, query_end, target_end). query_end/target_end are -1 if no alignment found.
 #[cfg(target_arch = "x86_64")]
 pub fn lightweight_align_i16(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
+    if *crate::align::env_flags::FORCE_SCALAR {
+        return lightweight_align_i16_scalar(qp, target_len, target, gap_open, gap_extend);
+    }
     unsafe { lightweight_align_i16_sse2(qp, target_len, target, gap_open, gap_extend) }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub fn lightweight_align_i16(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
+    if *crate::align::env_flags::FORCE_SCALAR {
+        return lightweight_align_i16_scalar(qp, target_len, target, gap_open, gap_extend);
+    }
     unsafe { lightweight_align_i16_neon(qp, target_len, target, gap_open, gap_extend) }
 }
 
 #[cfg(target_arch = "wasm32")]
 pub fn lightweight_align_i16(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
+    if *crate::align::env_flags::FORCE_SCALAR {
+        return lightweight_align_i16_scalar(qp, target_len, target, gap_open, gap_extend);
+    }
     unsafe { lightweight_align_i16_wasm(qp, target_len, target, gap_open, gap_extend) }
 }
 
@@ -405,68 +414,92 @@ unsafe fn lightweight_align_i16_wasm(qp: &mut LightweightProfile, target_len: i3
     (gmax, query_end, target_end)
 }
 
-/// Scalar fallback for lightweight_align_i16
+/// Scalar `lightweight_align_i16`: the SSE2 striped kernel with each
+/// 128-bit vector held as `[i16; 8]`, so scores, end positions and their ties match
+/// the SIMD versions exactly. Used on non-SIMD targets and for `RAMMAP_FORCE_SCALAR=1`.
 pub fn lightweight_align_i16_scalar(qp: &mut LightweightProfile, target_len: i32, target: &[u8], gap_open: i32, gap_extend: i32) -> (i32, i32, i32) {
-    // Simple scalar Smith-Waterman for non-SIMD platforms
-    let qlen = qp.qlen as usize;
-    let target_len = target_len as usize;
-    let _m = 5usize; // alphabet size
+    type V = [i16; 8];
+    // _mm_adds_epi16 / _mm_max_epi16 / _mm_subs_epu16 / _mm_slli_si128(v, 2)
+    fn adds(a: V, b: V) -> V { std::array::from_fn(|k| a[k].saturating_add(b[k])) }
+    fn max(a: V, b: V) -> V { std::array::from_fn(|k| a[k].max(b[k])) }
+    fn subs_u(a: V, b: V) -> V { std::array::from_fn(|k| (a[k] as u16).saturating_sub(b[k] as u16) as i16) }
+    fn shl1(a: V) -> V { std::array::from_fn(|k| if k == 0 { 0 } else { a[k - 1] }) }
+    fn load(s: &[i16], at: usize) -> V { s[at..at + 8].try_into().unwrap() }
 
-    // Reconstruct scoring from query profile
-    // qp.query_profile is segmented; we need to unsegment to get mat scores
     let slen = qp.segment_len as usize;
-    let p = 8usize;
-
-    let mut h_prev = vec![0i32; qlen + 1];
-    let mut h_curr = vec![0i32; qlen + 1];
-    let mut e_arr = vec![0i32; qlen + 1];
     let mut gmax: i32 = 0;
+    let qlen8 = slen * 8;
     let mut query_end: i32 = -1;
     let mut target_end: i32 = -1;
 
-    for (i, &t_base) in target[..target_len].iter().enumerate() {
-        let tc = t_base as usize;
-        let mut f: i32 = 0;
-        for j in 1..=qlen {
-            // Get score from query profile: unsegment index
-            // segmented index for query position (j-1): seg = (j-1) % slen, lane = (j-1) / slen
-            // offset in qp.query_profile: tc * slen * p + seg * p + lane
-            let seg = (j - 1) % slen;
-            let lane = (j - 1) / slen;
-            let score = if lane < p {
-                qp.query_profile[tc * slen * p + seg * p + lane] as i32
-            } else {
-                0
-            };
+    let gapoe: V = [(gap_open + gap_extend) as i16; 8];
+    let gape_v: V = [gap_extend as i16; 8];
 
-            let mut h = h_prev[j - 1] + score;
-            if h < 0 { h = 0; }
+    qp.e.fill(0);
+    qp.h0.fill(0);
+    qp.hmax.fill(0);
 
-            e_arr[j] = std::cmp::max(e_arr[j].saturating_sub(gap_extend), h_curr.get(j).copied().unwrap_or(0).saturating_sub(gap_open + gap_extend));
-            // Wait, this is wrong - we need unsigned saturation semantics
-            // Let's just do it simply
-            let e_val = std::cmp::max(
-                (e_arr[j] as i64 - gap_extend as i64).max(0) as i32,
-                (h as i64 - (gap_open + gap_extend) as i64).max(0) as i32,
-            );
-            e_arr[j] = e_val;
+    for i in 0..target_len {
+        let mut f: V = [0; 8];
+        let mut mx: V = [0; 8];
+        let s_offset = target[i as usize] as usize * slen * 8;
 
-            f = std::cmp::max(
-                (f as i64 - gap_extend as i64).max(0) as i32,
-                (h as i64 - (gap_open + gap_extend) as i64).max(0) as i32,
-            );
+        let mut h = shl1(load(&qp.h0, (slen - 1) * 8));
 
-            h = std::cmp::max(h, std::cmp::max(e_arr[j], f));
-            h_curr[j] = h;
+        for j in 0..slen {
+            h = adds(h, load(&qp.query_profile, s_offset + j * 8));
+            let e = load(&qp.e, j * 8);
+            h = max(h, e);
+            h = max(h, f);
+            mx = max(mx, h);
+            qp.h1[j * 8..j * 8 + 8].copy_from_slice(&h);
+            let h_sub = subs_u(h, gapoe);
+            qp.e[j * 8..j * 8 + 8].copy_from_slice(&max(subs_u(e, gape_v), h_sub));
+            f = max(subs_u(f, gape_v), h_sub);
+            h = load(&qp.h0, j * 8);
+        }
 
-            if h >= gmax {
-                gmax = h;
-                target_end = i as i32;
-                query_end = (j - 1) as i32;
+        // F-wave propagation
+        'fwave: for _k in 0..8 {
+            f = shl1(f);
+            for j in 0..slen {
+                let h1 = max(load(&qp.h1, j * 8), f);
+                qp.h1[j * 8..j * 8 + 8].copy_from_slice(&h1);
+                let h1_sub = subs_u(h1, gapoe);
+                f = subs_u(f, gape_v);
+                if (0..8).all(|k| f[k] <= h1_sub[k]) {
+                    break 'fwave;
+                }
             }
         }
-        std::mem::swap(&mut h_prev, &mut h_curr);
-        for v in h_curr.iter_mut() { *v = 0; }
+
+        let imax = *mx.iter().max().unwrap() as i32;
+        if imax >= gmax {
+            gmax = imax;
+            target_end = i;
+            qp.hmax.copy_from_slice(&qp.h1);
+        }
+
+        std::mem::swap(&mut qp.h0, &mut qp.h1);
+    }
+
+    // Same query_end selection as the SIMD kernels
+    for i in 0..qlen8 {
+        if qp.hmax[i] as i32 == gmax {
+            let pos = (i / 8 + (i % 8) * slen) as i32;
+            if pos < qp.qlen { query_end = pos; }
+        }
+    }
+    if query_end < 0 {
+        let mut best_val: i32 = i32::MIN;
+        for i in 0..qlen8 {
+            let val = qp.hmax[i] as i32;
+            let pos = (i / 8 + (i % 8) * slen) as i32;
+            if pos < qp.qlen && val > best_val {
+                best_val = val;
+                query_end = pos;
+            }
+        }
     }
 
     (gmax, query_end, target_end)

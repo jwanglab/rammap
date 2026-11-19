@@ -995,4 +995,184 @@ mod tests {
         assert_eq!(sse_so.score, avx512_so.score, "score-only score mismatch");
         assert_eq!(sse_so.max, avx512_so.max, "score-only max mismatch");
     }
+
+    // --- Randomized scalar-vs-SIMD concordance (the scalar kernels back RAMMAP_FORCE_SCALAR) ---
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 { self.next() % n }
+    }
+
+    /// Random target plus a query derived from it with substitutions, small indels,
+    /// occasional N bases and (if `long_del`) one long deletion flanked by GT..AG.
+    fn mutated_pair(rng: &mut Lcg, long_del: bool) -> (Vec<u8>, Vec<u8>) {
+        let tlen = 20 + rng.below(600) as usize;
+        let mut t: Vec<u8> = (0..tlen).map(|_| rng.below(4) as u8).collect();
+        if rng.below(10) == 0 { let k = rng.below(tlen as u32) as usize; t[k] = 4; }
+        let mut q = Vec::with_capacity(tlen);
+        let (del_at, del_len) = if long_del && tlen > 200 {
+            let at = 40 + rng.below(tlen as u32 - 160) as usize;
+            let len = 30 + rng.below(80) as usize;
+            if at + len + 2 < tlen {
+                t[at] = 2; t[at + 1] = 3; // GT
+                t[at + len - 2] = 0; t[at + len - 1] = 2; // AG
+            }
+            (at, len)
+        } else { (usize::MAX, 0) };
+        let mut i = 0;
+        while i < tlen {
+            if i == del_at { i += del_len; continue; }
+            match rng.below(100) {
+                0..=5 => q.push(rng.below(4) as u8),                           // substitution
+                6..=7 => { for _ in 0..1 + rng.below(6) { q.push(rng.below(4) as u8); } q.push(t[i]); } // insertion
+                8..=9 => { i += rng.below(6) as usize; }                         // deletion
+                _ => q.push(t[i]),
+            }
+            i += 1;
+        }
+        if q.is_empty() { q.push(0); }
+        (q, t)
+    }
+
+    /// (score, max, max_q, max_t, mqe, mqe_t, mte, mte_q, reach_end, zdropped)
+    fn dp_fields(r: &DpResult) -> [i32; 10] {
+        [r.score, r.max, r.max_score_query_pos, r.max_score_target_pos,
+         r.max_query_end_score, r.max_query_end_target_pos, r.max_target_end_score,
+         r.max_target_end_query_pos, r.reach_end, r.zdropped]
+    }
+
+    /// Collects scalar-vs-SIMD mismatches so a failing run reports all of them, not just the first.
+    #[derive(Default)]
+    struct Mismatches(Vec<String>);
+    impl Mismatches {
+        fn check(&mut self, ctx: &str, scalar: &DpResult, simd: &DpResult) {
+            let (fs, fv) = (dp_fields(scalar), dp_fields(simd));
+            let (cs, cv) = (cigar_to_string(&scalar.cigar), cigar_to_string(&simd.cigar));
+            if fs != fv || cs != cv {
+                self.0.push(format!("{ctx}\n  scalar {fs:?} cigar_eq={}\n  simd   {fv:?}", cs == cv));
+            }
+        }
+        fn finish(self, n: usize) {
+            assert!(self.0.is_empty(), "{} of {n} cases differ:\n{}", self.0.len(), self.0.join("\n"));
+        }
+    }
+
+    fn ont_matrix(a: i8, b: i8) -> [i8; 25] {
+        let mut m = [0i8; 25];
+        for i in 0..4 { for j in 0..4 { m[i * 5 + j] = if i == j { a } else { -b }; } }
+        for k in 0..5 { m[k * 5 + 4] = -1; m[4 * 5 + k] = -1; }
+        m
+    }
+
+    #[test]
+    fn test_scalar_dual_affine_matches_simd_randomized() {
+        let mut rng = Lcg(0x5eed_d0a1);
+        let mat = ont_matrix(2, 4);
+        let flag_sets = [
+            0, APPROX_MAX, RIGHT_ALIGN, EXTENSION_ONLY, EXTENSION_ONLY | REV_CIGAR, SCORE_ONLY | APPROX_MAX,
+            GENERIC_SCORING, RIGHT_ALIGN | EXTENSION_ONLY, APPROX_MAX | APPROX_DROP, SCORE_ONLY,
+            SCORE_ONLY | RIGHT_ALIGN,
+        ];
+        let mut mismatches = Mismatches::default();
+        let n = 3000;
+        for case in 0..n {
+            let (mut q, mut t) = mutated_pair(&mut rng, case % 3 == 0);
+            if case % 10 == 0 {
+                // multi-kb extension with a realistic band
+                for _ in 0..1 + rng.below(8) { let (q2, t2) = mutated_pair(&mut rng, false); q.extend(q2); t.extend(t2); }
+            }
+            if case % 4 == 1 {
+                // target length a multiple of 16: the last 16-byte score store runs past s into sf
+                let l = (t.len() / 16).max(1) * 16;
+                t.resize(l, 0);
+            }
+            let flags = flag_sets[case % flag_sets.len()];
+            let bw = match case % 5 { 0 => -1, 1 => 200 + rng.below(400) as i32, _ => 10 + rng.below(200) as i32 };
+            let zdrop = if case % 5 == 0 { -1 } else { 100 + rng.below(300) as i32 };
+            let end_bonus = if case % 7 == 0 { 50 } else { -1 };
+            let mut simd = DpResult::default();
+            extend_dual_affine(&q, &t, 5, &mat, 4, 2, 24, 1, bw, zdrop, end_bonus, flags, &mut simd);
+            let mut scalar = DpResult::default();
+            extend_dual_affine_scalar(&q, &t, 5, &mat, 4, 2, 24, 1, bw, zdrop, end_bonus, flags, &mut scalar);
+            let ctx = format!("case {case} qlen={} tlen={} flags={flags:#x} bw={bw} zdrop={zdrop} eb={end_bonus}", q.len(), t.len());
+            mismatches.check(&ctx, &scalar, &simd);
+        }
+        mismatches.finish(n);
+    }
+
+    #[test]
+    fn test_scalar_splice_matches_simd_randomized() {
+        let mut rng = Lcg(0x5911_ce00);
+        let mat = ont_matrix(1, 2);
+        let flag_sets = [
+            SPLICE_FORWARD, SPLICE_REVERSE,
+            SPLICE_FORWARD | SPLICE_FLANK, SPLICE_FORWARD | APPROX_MAX | EXTENSION_ONLY,
+            SPLICE_FORWARD | EXTENSION_ONLY | REV_CIGAR, SPLICE_FORWARD | SCORE_ONLY | APPROX_MAX,
+        ];
+        let mut mismatches = Mismatches::default();
+        let n = 2000;
+        for case in 0..n {
+            let (mut q, mut t) = mutated_pair(&mut rng, case % 2 == 0);
+            if case % 10 == 0 {
+                for _ in 0..1 + rng.below(6) { let (q2, t2) = mutated_pair(&mut rng, true); q.extend(q2); t.extend(t2); }
+            }
+            if case % 4 == 1 { let l = (t.len() / 16).max(1) * 16; t.resize(l, 0); }
+            let flags = flag_sets[case % flag_sets.len()];
+            let zdrop = if case % 5 == 0 { -1 } else { 100 + rng.below(300) as i32 };
+            let end_bonus = if case % 7 == 0 { 30 } else { -1 };
+            let mut simd = DpResult::default();
+            extend_splice(&q, &t, 5, &mat, 2, 1, 32, 9, zdrop, end_bonus, 0, 0, flags, None, &mut simd);
+            let mut scalar = DpResult::default();
+            extend_splice_scalar(&q, &t, 5, &mat, 2, 1, 32, 9, zdrop, end_bonus, 0, 0, flags, None, &mut scalar);
+            let ctx = format!("case {case} qlen={} tlen={} flags={flags:#x} zdrop={zdrop} eb={end_bonus}", q.len(), t.len());
+            mismatches.check(&ctx, &scalar, &simd);
+        }
+        mismatches.finish(n);
+    }
+
+    #[test]
+    fn test_scalar_lightweight_align_matches_simd_randomized() {
+        let mut rng = Lcg(0x11_9e7);
+        let mat = ont_matrix(2, 4);
+        for case in 0..2000 {
+            let (q, t) = mutated_pair(&mut rng, false);
+            // Inversion checks align a query slice against an unrelated-looking target, so mix
+            // related pairs, random pairs and tiny/homopolymer inputs that create score ties.
+            let (q, t) = match case % 4 {
+                0 => (q, t),
+                1 => (q, (0..t.len()).map(|_| rng.below(4) as u8).collect()),
+                2 => (vec![0u8; 1 + rng.below(40) as usize], vec![0u8; 1 + rng.below(40) as usize]),
+                _ => (q[..q.len().min(1 + rng.below(12) as usize)].to_vec(), t),
+            };
+            let (go, ge) = if case % 2 == 0 { (4, 2) } else { (24, 1) };
+            let mut qp_simd = lightweight_profile_init(q.len() as i32, &q, 5, &mat);
+            let mut qp_scalar = lightweight_profile_init(q.len() as i32, &q, 5, &mat);
+            let simd = lightweight_align_i16(&mut qp_simd, t.len() as i32, &t, go, ge);
+            let scalar = lightweight_align_i16_scalar(&mut qp_scalar, t.len() as i32, &t, go, ge);
+            assert_eq!(scalar, simd, "case {case} qlen={} tlen={} go={go} ge={ge}", q.len(), t.len());
+        }
+    }
+
+    #[test]
+    fn test_splice_both_strands_rejected_without_panic() {
+        let mat = ont_matrix(1, 2);
+        let q = vec![0u8, 1, 2, 3, 0, 1, 2, 3];
+        let flags = SPLICE_FORWARD | SPLICE_REVERSE;
+        for scalar in [false, true] {
+            let mut r = DpResult::default();
+            r.cigar.push(5 << 4);
+            if scalar {
+                extend_splice_scalar(&q, &q, 5, &mat, 2, 1, 32, 9, 200, -1, 0, 0, flags, None, &mut r);
+            } else {
+                extend_splice(&q, &q, 5, &mat, 2, 1, 32, 9, 200, -1, 0, 0, flags, None, &mut r);
+            }
+            assert_eq!(r.score, NEG_INF, "scalar={scalar}");
+            assert!(r.cigar.is_empty(), "scalar={scalar}");
+            assert_eq!(r.reach_end, 0, "scalar={scalar}");
+        }
+    }
 }

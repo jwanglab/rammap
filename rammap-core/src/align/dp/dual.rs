@@ -2587,16 +2587,18 @@ macro_rules! extend_dual_affine_avx512_impl {
 extend_dual_affine_avx512_impl!(extend_dual_affine_avx512_fn);
 
 
-/// Scalar implementation of dual-affine extension alignment
-///
-/// Full-featured fallback that handles bandwidth, z_drop, end_bonus, extension mode,
-/// reverse CIGAR, score-only mode, and right-align tie-breaking -- matching the SIMD
-/// implementations' API.
 /// Scalar dual-affine extension alignment.
 ///
-/// Anti-diagonal DP with difference-encoded state arrays (u, v, x, y, x2, y2),
-/// matching the SIMD implementation exactly but with scalar i8 operations.
+/// A safe, lane-by-lane transcription of the SSE2 kernel ([`extend_dual_affine_impl`]):
+/// each 128-bit register is a `[i8; 16]` and every load/store is a bounds-checked copy
+/// into one buffer laid out exactly like the SIMD allocation (u, v, x, y, x2, y2, s, sf,
+/// qr). That reproduces the SIMD kernel's behavior bit for bit, including the parts that
+/// depend on its block structure: anti-diagonals are computed over whole 16-cell blocks
+/// (`st/16*16 ..= (en+16)/16*16-1`) using leftover scores outside `[st0, en0]`, the band
+/// offsets use the rounded `st`, and the 16-byte score stores may run past `s` into `sf`.
+///
 /// Used as fallback on non-SIMD targets and for testing via `RAMMAP_FORCE_SCALAR=1`.
+#[allow(clippy::too_many_arguments)]
 pub fn extend_dual_affine_scalar(
     qseq: &[u8],
     tseq: &[u8],
@@ -2612,381 +2614,267 @@ pub fn extend_dual_affine_scalar(
     flags: i32,
     result: &mut DpResult,
 ) {
+    type V = [i8; 16];
+    fn ld(buf: &[u8], at: usize) -> V { std::array::from_fn(|k| buf[at + k] as i8) }
+    fn st16(buf: &mut [u8], at: usize, v: V) { for k in 0..16 { buf[at + k] = v[k] as u8; } }
+    fn add(a: V, b: V) -> V { std::array::from_fn(|k| a[k].wrapping_add(b[k])) }
+    fn sub(a: V, b: V) -> V { std::array::from_fn(|k| a[k].wrapping_sub(b[k])) }
+    fn max(a: V, b: V) -> V { std::array::from_fn(|k| a[k].max(b[k])) }
+    fn min(a: V, b: V) -> V { std::array::from_fn(|k| a[k].min(b[k])) }
+    /// `_mm_cmpgt_epi8` as a lane mask
+    fn gt(a: V, b: V) -> [bool; 16] { std::array::from_fn(|k| a[k] > b[k]) }
+    /// `(v << 1 byte) | carry`, returning the shifted vector and the new carry (`v >> 15 bytes`)
+    fn shift_in(v: V, carry: i8) -> (V, i8) { (std::array::from_fn(|k| if k == 0 { carry } else { v[k - 1] }), v[15]) }
+
     let query_len = qseq.len();
     let target_len = tseq.len();
     let approx_max = (flags & APPROX_MAX) != 0;
-    let with_cigar = (flags & SCORE_ONLY) == 0;
 
     if alphabet_size <= 1 || query_len == 0 || target_len == 0 {
         return;
     }
 
+    let (gap_open, gap_extend, gap_open2, gap_extend2) = (gap_open as i8, gap_extend as i8, gap_open2 as i8, gap_extend2 as i8);
+    // Ensure gap_open+gap_extend <= gap_open2+gap_extend2
+    let (gap_open, gap_extend, gap_open2, gap_extend2) = if (gap_open2 as i32 + gap_extend2 as i32) < (gap_open as i32 + gap_extend as i32) {
+        (gap_open2, gap_extend2, gap_open, gap_extend)
+    } else {
+        (gap_open, gap_extend, gap_open2, gap_extend2)
+    };
+
     // Compute long_thres and long_diff for dual-affine boundary conditions
     let mut long_thres: i32 = if gap_extend != gap_extend2 {
-        (gap_open2 - gap_open) / (gap_extend - gap_extend2) - 1
+        (gap_open2 as i32 - gap_open as i32) / (gap_extend as i32 - gap_extend2 as i32) - 1
     } else { 0 };
-    if (gap_open2 + gap_extend2 + long_thres * gap_extend2) > (gap_open + gap_extend + long_thres * gap_extend) {
+    if (gap_open2 as i32 + gap_extend2 as i32 + long_thres * gap_extend2 as i32) > (gap_open as i32 + gap_extend as i32 + long_thres * gap_extend as i32) {
         long_thres += 1;
     }
-    let long_diff: i8 = (long_thres * (gap_extend - gap_extend2) - (gap_open2 - gap_open) - gap_extend2) as i8;
+    let long_diff: i8 = (long_thres * (gap_extend as i32 - gap_extend2 as i32) - (gap_open2 as i32 - gap_open as i32) - gap_extend2 as i32) as i8;
 
-    // i8 constants matching SIMD
-    let gap_open_i8 = gap_open as i8;
-    let gap_extend_i8 = gap_extend as i8;
-    let gap_open2_i8 = gap_open2 as i8;
-    let gap_extend2_i8 = gap_extend2 as i8;
-    let qe = gap_open + gap_extend;
-    let qe2 = gap_open2 + gap_extend2;
-    let qe_i8 = qe as i8;
-    let qe2_i8 = qe2 as i8;
-    let neg_qe_i8 = (-qe) as i8;
-    let neg_qe2_i8 = (-qe2) as i8;
-
-    // Bandwidth
-    let wl = if bandwidth < 0 { query_len.max(target_len) as i32 } else { bandwidth };
-
-    // n_col_ for traceback (includes bandwidth factor)
-    let n_col_ = query_len.min(target_len).min((wl + 1) as usize).div_ceil(16) + 1;
-
-    init_dp_result(result);
-
-    // --- Anti-diagonal state arrays (difference-encoded, i8) ---
-    let mut u_arr = vec![neg_qe_i8; target_len];
-    let mut v_arr = vec![neg_qe_i8; target_len];
-    let mut x_arr = vec![neg_qe_i8; target_len];
-    let mut y_arr = vec![neg_qe_i8; target_len];
-    let mut x2_arr = vec![neg_qe2_i8; target_len];
-    let mut y2_arr = vec![neg_qe2_i8; target_len];
-
-    // H[] for exact max tracking (only when !approx_max)
-    let mut h_arr: Vec<i32> = if !approx_max { vec![0i32; target_len] } else { Vec::new() };
-
-    // Reversed query (matches SIMD qr layout)
-    let mut qr = vec![0u8; query_len];
-    for t in 0..query_len {
-        qr[t] = qseq[query_len - 1 - t];
-    }
-
-    // Traceback arrays
-    let valid_range = query_len + target_len - 1;
-    let stride = n_col_ * 16;
-    let mut p_arr: Vec<u8> = if with_cigar { vec![0u8; valid_range * stride] } else { Vec::new() };
-    let mut band_off: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
-    let mut band_off_end: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
-
-    // Scoring constants
+    let q_: V = [gap_open; 16];
+    let q2_: V = [gap_open2; 16];
+    let qe_: V = [(gap_open as i32 + gap_extend as i32) as i8; 16];
+    let qe2_: V = [(gap_open2 as i32 + gap_extend2 as i32) as i8; 16];
     let sc_mch = score_matrix[0];
     let sc_mis = score_matrix[1];
     let sc_n = if score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1] == 0 {
-        -gap_extend2_i8
+        -gap_extend2
     } else {
         score_matrix[(alphabet_size as usize * alphabet_size as usize) - 1]
     };
-    let m1 = (alphabet_size - 1) as u8;
-    let generic_scoring = (flags & GENERIC_SCORING) != 0;
-    let right_align = (flags & RIGHT_ALIGN) != 0;
+    let sc_mch_: V = [sc_mch; 16];
+    let m1 = alphabet_size - 1;
 
-    // --- Main anti-diagonal DP loop ---
+    let bandwidth = if bandwidth < 0 { target_len.max(query_len) as i32 } else { bandwidth };
+    let wl = bandwidth;
+
+    let tlen_ = target_len.div_ceil(16);
+    let n_col_ = query_len.min(target_len).min((bandwidth + 1) as usize).div_ceil(16) + 1;
+    let with_cigar = (flags & SCORE_ONLY) == 0;
+
+    // One buffer with the SIMD layout: u, v, x, y, x2, y2, s, then sf, then qr
+    let qlen_ = query_len.div_ceil(16);
+    let (u, v, x, y, x2, y2, s) = (0, tlen_ * 16, 2 * tlen_ * 16, 3 * tlen_ * 16, 4 * tlen_ * 16, 5 * tlen_ * 16, 6 * tlen_ * 16);
+    let sf = 7 * tlen_ * 16;
+    let qr = sf + tlen_ * 16;
+    let mut mem = vec![0u8; qr + (qlen_ + 1) * 16];
+
+    let neg_qe = (-(gap_open as i32) - gap_extend as i32) as u8;
+    let neg_q2e2 = (-(gap_open2 as i32) - gap_extend2 as i32) as u8;
+    mem[u..u + 4 * tlen_ * 16].fill(neg_qe);
+    mem[x2..x2 + 2 * tlen_ * 16].fill(neg_q2e2);
+    for t in 0..query_len {
+        mem[qr + t] = qseq[query_len - 1 - t];
+    }
+    mem[sf..sf + target_len].copy_from_slice(tseq);
+
+    let valid_range = query_len + target_len - 1;
+    let mut p: Vec<u8> = if with_cigar { vec![0u8; valid_range * n_col_ * 16] } else { Vec::new() };
+    let mut band_off: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
+    let mut band_off_end: Vec<i32> = if with_cigar { vec![0i32; valid_range] } else { Vec::new() };
+
+    // H[] array for exact max tracking (only when !approx_max)
+    let mut h: Vec<i32> = if !approx_max { vec![NEG_INF; tlen_ * 16] } else { Vec::new() };
+
+    init_dp_result(result);
+
+    let right_align = (flags & RIGHT_ALIGN) != 0;
     let mut last_st: i32 = -1;
     let mut last_en: i32 = -1;
     let mut h0: i32 = 0;
     let mut last_h0_t: i32 = 0;
 
     for r in 0..valid_range as i32 {
-        // Compute valid target range for this anti-diagonal
-        let mut st0 = 0i32;
-        let mut en0 = target_len as i32 - 1;
-        if st0 < r - query_len as i32 + 1 { st0 = r - query_len as i32 + 1; }
-        if en0 > r { en0 = r; }
+        let mut st = 0i32;
+        let mut en = target_len as i32 - 1;
 
-        // Apply bandwidth narrowing
-        if st0 < (r - wl + 1) >> 1 { st0 = (r - wl + 1) >> 1; }
-        if en0 > (r + wl) >> 1 { en0 = (r + wl) >> 1; }
+        // qrr = qr + (qlen - 1 - r); qrr[t] is only read for t >= st0 >= r - qlen + 1
+        let qrr = qr as isize + query_len as isize - 1 - r as isize;
 
-        if st0 > en0 {
+        // Find boundaries
+        if st < r - query_len as i32 + 1 { st = r - query_len as i32 + 1; }
+        if en > r { en = r; }
+        if st < (r - wl + 1) >> 1 { st = (r - wl + 1) >> 1; }
+        if en > (r + wl) >> 1 { en = (r + wl) >> 1; }
+
+        if st > en {
             result.zdropped = 1;
             break;
         }
 
-        // Boundary conditions for leftmost element
-        let x1: i8;
-        let x21: i8;
-        let v1: i8;
+        let st0 = st;
+        let en0 = en;
+        st = (st / 16) * 16;
+        en = ((en + 16) / 16) * 16 - 1;
 
-        if st0 > 0 {
-            if st0 > last_st && (st0 - 1) <= last_en {
-                x1 = x_arr[(st0 - 1) as usize];
-                x21 = x2_arr[(st0 - 1) as usize];
-                v1 = v_arr[(st0 - 1) as usize];
+        // Boundary conditions
+        let (x1, x21, v1): (i8, i8, i8) = if st > 0 {
+            if st > last_st && st - 1 <= last_en {
+                let k = (st - 1) as usize;
+                (mem[x + k] as i8, mem[x2 + k] as i8, mem[v + k] as i8)
             } else {
-                x1 = neg_qe_i8;
-                x21 = neg_qe2_i8;
-                v1 = neg_qe_i8;
+                (-gap_open - gap_extend, -gap_open2 - gap_extend2, -gap_open - gap_extend)
             }
         } else {
-            x1 = neg_qe_i8;
-            x21 = neg_qe2_i8;
-            v1 = if r == 0 {
-                neg_qe_i8
-            } else if r < long_thres {
-                -gap_extend_i8
-            } else if r == long_thres {
-                long_diff
-            } else {
-                -gap_extend2_i8
-            };
+            let v1 = if r == 0 { -gap_open - gap_extend } else if r < long_thres { -gap_extend } else if r == long_thres { long_diff } else { -gap_extend2 };
+            (-gap_open - gap_extend, -gap_open2 - gap_extend2, v1)
+        };
+
+        if en >= r {
+            let k = r as usize;
+            mem[y + k] = (-gap_open - gap_extend) as u8;
+            mem[y2 + k] = (-gap_open2 - gap_extend2) as u8;
+            mem[u + k] = (if r == 0 { -gap_open - gap_extend } else if r < long_thres { -gap_extend } else if r == long_thres { long_diff } else { -gap_extend2 }) as u8;
         }
 
-        // Initialize new diagonal entry
-        if en0 >= r {
-            y_arr[r as usize] = neg_qe_i8;
-            y2_arr[r as usize] = neg_qe2_i8;
-            u_arr[r as usize] = if r == 0 {
-                neg_qe_i8
-            } else if r < long_thres {
-                -gap_extend_i8
-            } else if r == long_thres {
-                long_diff
-            } else {
-                -gap_extend2_i8
-            };
-        }
-
-        // Core DP: process each element along the anti-diagonal
-        let qrr_base = (query_len as i32 - 1 - r) as isize;
-        let mut prev_x: i8 = x1;
-        let mut prev_x2: i8 = x21;
-        let mut prev_v: i8 = v1;
-
-        for t in st0..=en0 {
-            let tu = t as usize;
-
-            // Match/mismatch score
-            let sq = tseq[tu];
-            let st_val = qr[(qrr_base + t as isize) as usize];
-            let z_score: i8 = if !generic_scoring {
-                if sq == m1 || st_val == m1 { sc_n }
-                else if sq == st_val { sc_mch }
-                else { sc_mis }
-            } else {
-                score_matrix[sq as usize * alphabet_size as usize + st_val as usize]
-            };
-
-            // a = x[t-1] + v[t-1] (D1: gap from left on anti-diagonal)
-            let xt1 = prev_x;
-            let vt1 = prev_v;
-            let a = xt1.wrapping_add(vt1);
-
-            // b = y[t] + u[t] (I1: gap from above on anti-diagonal)
-            let ut = u_arr[tu];
-            let b = y_arr[tu].wrapping_add(ut);
-
-            // a2 = x2[t-1] + v[t-1] (D2: second penalty gap from left)
-            let x2t1 = prev_x2;
-            let a2 = x2t1.wrapping_add(vt1);
-
-            // b2 = y2[t] + u[t] (I2: second penalty gap from above)
-            let b2 = y2_arr[tu].wrapping_add(ut);
-
-            // Save old values before overwrite
-            prev_x = x_arr[tu];
-            prev_x2 = x2_arr[tu];
-            prev_v = v_arr[tu];
-
-            if !with_cigar {
-                // Score only: 5-way max + clamp
-                let mut z = z_score;
-                if a > z { z = a; }
-                if b > z { z = b; }
-                if a2 > z { z = a2; }
-                if b2 > z { z = b2; }
-                if z > sc_mch { z = sc_mch; } // clamp
-
-                u_arr[tu] = z.wrapping_sub(vt1);
-                v_arr[tu] = z.wrapping_sub(ut);
-                let tmp1 = z.wrapping_sub(gap_open_i8);
-                let a_new = a.wrapping_sub(tmp1);
-                let b_new = b.wrapping_sub(tmp1);
-                let tmp2 = z.wrapping_sub(gap_open2_i8);
-                let a2_new = a2.wrapping_sub(tmp2);
-                let b2_new = b2.wrapping_sub(tmp2);
-
-                x_arr[tu] = (if a_new > 0 { a_new } else { 0 }).wrapping_sub(qe_i8);
-                y_arr[tu] = (if b_new > 0 { b_new } else { 0 }).wrapping_sub(qe_i8);
-                x2_arr[tu] = (if a2_new > 0 { a2_new } else { 0 }).wrapping_sub(qe2_i8);
-                y2_arr[tu] = (if b2_new > 0 { b2_new } else { 0 }).wrapping_sub(qe2_i8);
-            } else if !right_align {
-                // Left-align with traceback
-                let p_idx = r as usize * stride + (t - st0) as usize;
-                if t == st0 {
-                    band_off[r as usize] = st0;
-                    band_off_end[r as usize] = en0;
-                }
-
-                let mut z = z_score;
-                let mut d: u8 = 0;
-                if a > z { d = 1; z = a; }
-                if b > z { d = 2; z = b; }
-                if a2 > z { d = 3; z = a2; }
-                if b2 > z { d = 4; z = b2; }
-                if z > sc_mch { z = sc_mch; } // clamp
-
-                u_arr[tu] = z.wrapping_sub(vt1);
-                v_arr[tu] = z.wrapping_sub(ut);
-                let tmp1 = z.wrapping_sub(gap_open_i8);
-                let a_new = a.wrapping_sub(tmp1);
-                let b_new = b.wrapping_sub(tmp1);
-                let tmp2 = z.wrapping_sub(gap_open2_i8);
-                let a2_new = a2.wrapping_sub(tmp2);
-                let b2_new = b2.wrapping_sub(tmp2);
-
-                if a_new > 0 {
-                    x_arr[tu] = a_new.wrapping_sub(qe_i8);
-                    d |= 0x08;
-                } else {
-                    x_arr[tu] = (0i8).wrapping_sub(qe_i8);
-                }
-                if b_new > 0 {
-                    y_arr[tu] = b_new.wrapping_sub(qe_i8);
-                    d |= 0x10;
-                } else {
-                    y_arr[tu] = (0i8).wrapping_sub(qe_i8);
-                }
-                if a2_new > 0 {
-                    x2_arr[tu] = a2_new.wrapping_sub(qe2_i8);
-                    d |= 0x20;
-                } else {
-                    x2_arr[tu] = (0i8).wrapping_sub(qe2_i8);
-                }
-                if b2_new > 0 {
-                    y2_arr[tu] = b2_new.wrapping_sub(qe2_i8);
-                    d |= 0x40;
-                } else {
-                    y2_arr[tu] = (0i8).wrapping_sub(qe2_i8);
-                }
-
-                p_arr[p_idx] = d;
-            } else {
-                // Right-align with traceback
-                let p_idx = r as usize * stride + (t - st0) as usize;
-                if t == st0 {
-                    band_off[r as usize] = st0;
-                    band_off_end[r as usize] = en0;
-                }
-
-                let mut z = z_score;
-                let mut d: u8;
-                if z > a { d = 0; } else { d = 1; z = a; }
-                if z <= b { d = 2; z = b; }
-                if z <= a2 { d = 3; z = a2; }
-                if z <= b2 { d = 4; z = b2; }
-                if z > sc_mch { z = sc_mch; } // clamp
-
-                u_arr[tu] = z.wrapping_sub(vt1);
-                v_arr[tu] = z.wrapping_sub(ut);
-                let tmp1 = z.wrapping_sub(gap_open_i8);
-                let a_new = a.wrapping_sub(tmp1);
-                let b_new = b.wrapping_sub(tmp1);
-                let tmp2 = z.wrapping_sub(gap_open2_i8);
-                let a2_new = a2.wrapping_sub(tmp2);
-                let b2_new = b2.wrapping_sub(tmp2);
-
-                if 0i8 <= a_new {
-                    x_arr[tu] = a_new.wrapping_sub(qe_i8);
-                    d |= 0x08;
-                } else {
-                    x_arr[tu] = (0i8).wrapping_sub(qe_i8);
-                }
-                if 0i8 <= b_new {
-                    y_arr[tu] = b_new.wrapping_sub(qe_i8);
-                    d |= 0x10;
-                } else {
-                    y_arr[tu] = (0i8).wrapping_sub(qe_i8);
-                }
-                if 0i8 <= a2_new {
-                    x2_arr[tu] = a2_new.wrapping_sub(qe2_i8);
-                    d |= 0x20;
-                } else {
-                    x2_arr[tu] = (0i8).wrapping_sub(qe2_i8);
-                }
-                if 0i8 <= b2_new {
-                    y2_arr[tu] = b2_new.wrapping_sub(qe2_i8);
-                    d |= 0x40;
-                } else {
-                    y2_arr[tu] = (0i8).wrapping_sub(qe2_i8);
-                }
-
-                p_arr[p_idx] = d;
+        // Set scores in 16-cell chunks from st0 (the last chunk may run past en0)
+        if (flags & GENERIC_SCORING) == 0 {
+            let mut t = st0 as usize;
+            while t as i32 <= en0 {
+                let sq = ld(&mem, sf + t);
+                let sv = ld(&mem, (qrr + t as isize) as usize);
+                let sc: V = std::array::from_fn(|k| {
+                    if sq[k] == m1 || sv[k] == m1 { sc_n } else if sq[k] == sv[k] { sc_mch } else { sc_mis }
+                });
+                st16(&mut mem, s + t, sc);
+                t += 16;
+            }
+        } else {
+            for t in st0 as usize..=(en0 as usize).min(st0 as usize + tlen_ * 16 - 1) {
+                let i = mem[sf + t] as usize * alphabet_size as usize + mem[(qrr + t as isize) as usize] as usize;
+                mem[s + t] = score_matrix[i] as u8;
             }
         }
 
-        // --- H tracking ---
-        let qe_scalar = gap_open + gap_extend;
+        // Core DP over whole 16-cell blocks
+        let (mut x1_, mut x21_, mut v1_) = (x1, x21, v1);
+        let st_ = st as usize / 16;
+        let en_ = en as usize / 16;
+        if with_cigar {
+            band_off[r as usize] = st;
+            band_off_end[r as usize] = en;
+        }
+
+        for ti in st_..=en_ {
+            let o = ti * 16;
+            let mut z = ld(&mem, s + o);
+            let xt1; let vt1; let x2t1;
+            (xt1, x1_) = shift_in(ld(&mem, x + o), x1_);
+            (vt1, v1_) = shift_in(ld(&mem, v + o), v1_);
+            let a = add(xt1, vt1);                       // I1 candidate
+            let ut = ld(&mem, u + o);
+            let b = add(ld(&mem, y + o), ut);            // D1 candidate
+            (x2t1, x21_) = shift_in(ld(&mem, x2 + o), x21_);
+            let a2 = add(x2t1, vt1);                     // I2 candidate
+            let b2 = add(ld(&mem, y2 + o), ut);          // D2 candidate
+
+            let mut d: V = [0; 16];
+            if !with_cigar {
+                z = max(max(max(max(z, a), b), a2), b2);
+            } else if !right_align {
+                // LEFT tie-breaking: a gap wins only if strictly greater
+                for (cand, flag) in [(a, 1i8), (b, 2), (a2, 3), (b2, 4)] {
+                    let m = gt(cand, z);
+                    for k in 0..16 { if m[k] { d[k] = flag; z[k] = cand[k]; } }
+                }
+            } else {
+                // RIGHT tie-breaking: a gap wins if >=
+                let m = gt(z, a);
+                for k in 0..16 { d[k] = if m[k] { 0 } else { 1 }; if !m[k] { z[k] = a[k]; } }
+                for (cand, flag) in [(b, 2i8), (a2, 3), (b2, 4)] {
+                    let m = gt(z, cand);
+                    for k in 0..16 { if !m[k] { d[k] = flag; z[k] = cand[k]; } }
+                }
+            }
+            z = min(z, sc_mch_);
+
+            st16(&mut mem, u + o, sub(z, vt1));
+            st16(&mut mem, v + o, sub(z, ut));
+            let tmp1 = sub(z, q_);
+            let tmp2 = sub(z, q2_);
+            let news = [(sub(a, tmp1), x, qe_, 0x08i8), (sub(b, tmp1), y, qe_, 0x10), (sub(a2, tmp2), x2, qe2_, 0x20), (sub(b2, tmp2), y2, qe2_, 0x40u8 as i8)];
+            for (nv, arr, qe, flag) in news {
+                // left: keep where nv > 0; right: keep where !(0 > nv)
+                let keep: [bool; 16] = std::array::from_fn(|k| if right_align && with_cigar { nv[k] >= 0 } else { nv[k] > 0 });
+                let kept: V = std::array::from_fn(|k| if keep[k] { nv[k] } else { 0 });
+                st16(&mut mem, arr + o, sub(kept, qe));
+                if with_cigar { for k in 0..16 { if keep[k] { d[k] |= flag; } } }
+            }
+
+            if with_cigar {
+                let pr = (r as usize * n_col_ + ti - st_) * 16;
+                for k in 0..16 { p[pr + k] = d[k] as u8; }
+            }
+        }
+
+        let qe_scalar = gap_open as i32 + gap_extend as i32;
+        let u8_at = |mem: &[u8], t: i32| mem[u + t as usize] as i8 as i32;
+        let v8_at = |mem: &[u8], t: i32| mem[v + t as usize] as i8 as i32;
+
         if !approx_max {
+            // Exact max tracking with 32-bit H[]
             let mut max_h: i32;
             let mut max_t: i32;
-
             if r > 0 {
-                let h_en0 = if en0 > 0 {
-                    h_arr[en0 as usize - 1] + u_arr[en0 as usize] as i32
-                } else {
-                    h_arr[en0 as usize] + v_arr[en0 as usize] as i32
-                };
-                h_arr[en0 as usize] = h_en0;
+                let h_en0 = if en0 > 0 { h[en0 as usize - 1] + u8_at(&mem, en0) } else { h[en0 as usize] + v8_at(&mem, en0) };
+                h[en0 as usize] = h_en0;
                 max_h = h_en0;
                 max_t = en0;
 
-                // Process [st0..en0) in groups of 4, matching SIMD's 4-lane reduction.
-                // Each lane independently tracks max across its stride-4 positions.
+                // [st0, en1) in 4-lane groups, then reduce lanes (SSE order)
                 let en1 = st0 + (en0 - st0) / 4 * 4;
-                let mut lane_h = [max_h; 4];
-                let mut lane_t = [max_t; 4];
+                let mut hh = [max_h; 4];
+                let mut tt = [max_t; 4];
                 let mut t = st0;
                 while t < en1 {
-                    for i in 0..4i32 {
-                        let pos = (t + i) as usize;
-                        h_arr[pos] += v_arr[pos] as i32;
-                        if h_arr[pos] > lane_h[i as usize] {
-                            lane_h[i as usize] = h_arr[pos];
-                            lane_t[i as usize] = t;
-                        }
+                    for i in 0..4 {
+                        let k = (t + i as i32) as usize;
+                        h[k] += v8_at(&mem, t + i as i32);
+                        if h[k] > hh[i] { hh[i] = h[k]; tt[i] = t; }
                     }
                     t += 4;
                 }
-                // Reduce lanes to scalar (matches SIMD reduction order)
-                for i in 0..4i32 {
-                    if max_h < lane_h[i as usize] {
-                        max_h = lane_h[i as usize];
-                        max_t = lane_t[i as usize] + i;
-                    }
+                for i in 0..4 {
+                    if max_h < hh[i] { max_h = hh[i]; max_t = tt[i] + i as i32; }
                 }
-                // Remainder
                 while t < en0 {
-                    h_arr[t as usize] += v_arr[t as usize] as i32;
-                    if h_arr[t as usize] > max_h {
-                        max_h = h_arr[t as usize];
-                        max_t = t;
-                    }
+                    h[t as usize] += v8_at(&mem, t);
+                    if h[t as usize] > max_h { max_h = h[t as usize]; max_t = t; }
                     t += 1;
                 }
             } else {
-                h_arr[0] = v_arr[0] as i32 - qe_scalar;
-                max_h = h_arr[0];
+                h[0] = v8_at(&mem, 0) - qe_scalar;
+                max_h = h[0];
                 max_t = 0;
             }
-
-            // Track target end score
-            if en0 == target_len as i32 - 1 && h_arr[en0 as usize] > result.max_target_end_score {
-                result.max_target_end_score = h_arr[en0 as usize];
+            if en0 == target_len as i32 - 1 && h[en0 as usize] > result.max_target_end_score {
+                result.max_target_end_score = h[en0 as usize];
                 result.max_target_end_query_pos = r - en0;
             }
-            // Track query end score
-            if r - st0 == query_len as i32 - 1 && h_arr[st0 as usize] > result.max_query_end_score {
-                result.max_query_end_score = h_arr[st0 as usize];
+            if r - st0 == query_len as i32 - 1 && h[st0 as usize] > result.max_query_end_score {
+                result.max_query_end_score = h[st0 as usize];
                 result.max_query_end_target_pos = st0;
             }
-
-            // Overall max and z-drop
             if max_h > result.max {
                 result.max = max_h;
                 result.max_score_target_pos = max_t;
@@ -2995,78 +2883,69 @@ pub fn extend_dual_affine_scalar(
                 let tl = max_t - result.max_score_target_pos;
                 let ql = (r - max_t) - result.max_score_query_pos;
                 let l = if tl > ql { tl - ql } else { ql - tl };
-                if z_drop >= 0 && (result.max - max_h) > z_drop + l * gap_extend2 {
+                if z_drop >= 0 && (result.max - max_h) > (z_drop + l * gap_extend2 as i32) {
                     result.zdropped = 1;
                     break;
                 }
             }
-
-            // Score at final corner
             if r == query_len as i32 + target_len as i32 - 2 && en0 == target_len as i32 - 1 {
-                result.score = h_arr[target_len - 1];
+                result.score = h[target_len - 1];
             }
         } else {
-            // --- Approximate max tracking ---
+            // Approximate max tracking
             if r > 0 {
                 if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t < en0 {
-                    let d0 = v_arr[last_h0_t as usize] as i32;
-                    let d1 = u_arr[(last_h0_t + 1) as usize] as i32;
-                    if d0 > d1 {
-                        h0 += d0;
-                    } else {
-                        h0 += d1;
-                        last_h0_t += 1;
-                    }
+                    let d0 = v8_at(&mem, last_h0_t);
+                    let d1 = u8_at(&mem, last_h0_t + 1);
+                    if d0 > d1 { h0 += d0; } else { h0 += d1; last_h0_t += 1; }
                 } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                    h0 += v_arr[last_h0_t as usize] as i32;
+                    h0 += v8_at(&mem, last_h0_t);
                 } else {
                     last_h0_t += 1;
-                    h0 += u_arr[last_h0_t as usize] as i32;
+                    h0 += u8_at(&mem, last_h0_t);
                 }
-            } else {
-                h0 = v_arr[0] as i32 - qe_scalar;
-                last_h0_t = 0;
-            }
 
-            // Max + z-drop tracking only when APPROX_DROP
-            if (flags & APPROX_DROP) != 0 {
-                if h0 > result.max {
-                    result.max = h0;
-                    result.max_score_target_pos = last_h0_t;
-                    result.max_score_query_pos = r - last_h0_t;
-                } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
-                    let tl = last_h0_t - result.max_score_target_pos;
-                    let ql = (r - last_h0_t) - result.max_score_query_pos;
-                    let l = if tl > ql { tl - ql } else { ql - tl };
-                    if z_drop >= 0 && (result.max - h0) > z_drop + l * gap_extend2 {
-                        result.zdropped = 1;
-                        break;
+                if (flags & APPROX_DROP) != 0 {
+                    if h0 > result.max {
+                        result.max = h0;
+                        result.max_score_target_pos = last_h0_t;
+                        result.max_score_query_pos = r - last_h0_t;
+                    } else if last_h0_t >= result.max_score_target_pos && (r - last_h0_t) >= result.max_score_query_pos {
+                        let tl = last_h0_t - result.max_score_target_pos;
+                        let ql = (r - last_h0_t) - result.max_score_query_pos;
+                        let l = if tl > ql { tl - ql } else { ql - tl };
+                        if z_drop >= 0 && (result.max - h0) > (z_drop + l * gap_extend2 as i32) {
+                            result.zdropped = 1;
+                            break;
+                        }
                     }
                 }
+            } else {
+                h0 = v8_at(&mem, 0) - qe_scalar;
+                last_h0_t = 0;
+                if (flags & APPROX_DROP) != 0 && h0 > result.max {
+                    result.max = h0;
+                    result.max_score_target_pos = 0;
+                    result.max_score_query_pos = 0;
+                }
             }
-
-            // Score at final corner
             if r == query_len as i32 + target_len as i32 - 2 && en0 == target_len as i32 - 1 {
                 result.score = h0;
             }
         }
 
-        last_st = st0;
-        last_en = en0;
+        last_st = st;
+        last_en = en;
     }
 
-    // Final score for approx path
     if approx_max && result.score == NEG_INF {
         result.score = result.max;
     }
 
-    // --- Traceback via shared traceback_dual_affine ---
     if with_cigar {
-        unsafe {
-            traceback_dual_affine(
-                result, query_len, target_len, end_bonus, flags, n_col_, 16,
-                p_arr.as_mut_ptr(), band_off.as_mut_ptr(), band_off_end.as_mut_ptr(),
-            );
-        }
+        traceback_dual_affine_safe(
+            result, query_len, target_len, end_bonus, flags, n_col_ * 16,
+            &p, &band_off, &band_off_end,
+        );
     }
 }

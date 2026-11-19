@@ -753,6 +753,150 @@ pub(super) fn traceback_single_affine_safe(
     }
 }
 
+/// Safe traceback for dual-affine alignment using slice indexing.
+///
+/// Equivalent to [`traceback_dual_affine`] but uses bounds-checked slice access
+/// instead of raw pointer arithmetic. Used by the scalar dual-affine kernel
+/// to provide a fully-safe code path on non-SIMD targets.
+pub(super) fn traceback_dual_affine_safe(
+    result: &mut DpResult,
+    query_len: usize,
+    target_len: usize,
+    end_bonus: i32,
+    flags: i32,
+    stride: usize,
+    p: &[u8],
+    band_off: &[i32],
+    band_off_end: &[i32],
+) {
+    let (mut i, mut j) = traceback_start_position(result, query_len, target_len, end_bonus, flags);
+
+    if i < 0 || j < 0 {
+        return;
+    }
+    let mut cigar = Vec::new();
+    let mut state = 0i32;
+
+    while i >= 0 && j >= 0 {
+        let r = (i + j) as usize;
+        let off_r = band_off[r];
+        let off_end_r = band_off_end[r];
+
+        let mut force_state = -1i32;
+        if i < off_r { force_state = 2; }
+        if i > off_end_r { force_state = 1; }
+
+        let tmp = if force_state < 0 {
+            p[r * stride + (i - off_r) as usize]
+        } else {
+            0
+        };
+
+        if state == 0 { state = (tmp & 7) as i32; }
+        else if ((tmp >> (state + 2)) & 1) == 0 { state = 0; }
+
+        if state == 0 { state = (tmp & 7) as i32; }
+        if force_state >= 0 { state = force_state; }
+
+        let (op, di, dj) = match state {
+            0 => (0u32, 1, 1),  // M
+            1 => (2u32, 1, 0),  // D1
+            2 => (1u32, 0, 1),  // I1
+            3 => (2u32, 1, 0),  // D2
+            4 => (1u32, 0, 1),  // I2
+            _ => (0u32, 1, 1),
+        };
+
+        push_cigar(&mut cigar, op, 1);
+
+        i -= di;
+        j -= dj;
+    }
+
+    if i >= 0 { push_cigar(&mut cigar, 2, (i + 1) as u32); }
+    if j >= 0 { push_cigar(&mut cigar, 1, (j + 1) as u32); }
+
+    if (flags & REV_CIGAR) == 0 { cigar.reverse(); }
+    result.cigar = cigar;
+}
+
+/// Safe traceback for splice-aware alignment using slice indexing.
+///
+/// Equivalent to [`traceback_splice`] but uses bounds-checked slice access
+/// instead of raw pointer arithmetic. Used by the scalar splice kernel
+/// to provide a fully-safe code path on non-SIMD targets.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn traceback_splice_safe(
+    result: &mut DpResult,
+    query_len: usize,
+    target_len: usize,
+    end_bonus: i32,
+    flags: i32,
+    stride: usize,
+    long_thres: i32,
+    p: &[u8],
+    band_off: &[i32],
+    band_off_end: &[i32],
+) {
+    let rev_cigar = (flags & REV_CIGAR) != 0;
+    let (mut i, mut j) = traceback_start_position(result, query_len, target_len, end_bonus, flags);
+
+    if i >= 0 && j >= 0 {
+        let mut cigar = Vec::new();
+        let mut state = 0i32;
+
+        while i >= 0 && j >= 0 {
+            let r = (i + j) as usize;
+            let off_r = band_off[r];
+            let off_end_r = band_off_end[r];
+
+            let mut force_state = -1i32;
+            if i < off_r { force_state = 2; }
+            if i > off_end_r { force_state = 1; }
+
+            let tmp = if force_state < 0 {
+                p[r * stride + (i - off_r) as usize]
+            } else {
+                0
+            };
+
+            if state == 0 { state = (tmp & 7) as i32; }
+            else if ((tmp >> (state + 2)) & 1) == 0 { state = 0; }
+            if state == 0 { state = (tmp & 7) as i32; }
+            if force_state >= 0 { state = force_state; }
+
+            let (op, di, dj) = match state {
+                0 => (0u32, 1, 1),  // M
+                1 => (2u32, 1, 0),  // D
+                2 => (1u32, 0, 1),  // I
+                3 => {
+                    if long_thres > 0 {
+                        (CIGAR_N_SKIP, 1, 0) // N_SKIP (intron)
+                    } else {
+                        (2u32, 1, 0) // D (when long_thres <= 0, treat as normal deletion)
+                    }
+                },
+                _ => (0u32, 1, 1),
+            };
+
+            push_cigar(&mut cigar, op, 1);
+
+            i -= di;
+            j -= dj;
+        }
+
+        // Handle remaining: trailing deletion or N_SKIP
+        if i >= 0 {
+            let op = if long_thres > 0 && i >= long_thres { CIGAR_N_SKIP } else { 2 };
+            push_cigar(&mut cigar, op, (i + 1) as u32);
+        }
+        if j >= 0 { push_cigar(&mut cigar, 1, (j + 1) as u32); }
+
+        if !rev_cigar { cigar.reverse(); }
+        result.cigar = cigar;
+    }
+}
+
 /// Traceback for splice-aware (exts2) alignment — shared across SSE2/SSE4.1/NEON.
 ///
 /// Walks back through the traceback matrix to reconstruct the CIGAR string.

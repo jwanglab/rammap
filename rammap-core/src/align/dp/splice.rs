@@ -12,6 +12,19 @@ use super::common::*;
 // Public API - Splice-Aware Alignment
 // ============================================================================
 
+/// `SPLICE_FORWARD` and `SPLICE_REVERSE` together are contradictory. Reject them at the
+/// public entry points instead of panicking: the result is left as an empty, unaligned
+/// extension.
+fn reject_both_strands(flags: i32, result: &mut DpResult) -> bool {
+    if (flags & SPLICE_FORWARD) != 0 && (flags & SPLICE_REVERSE) != 0 {
+        log::warn!("splice DP called with both SPLICE_FORWARD and SPLICE_REVERSE; skipping alignment");
+        init_dp_result_full(result);
+        return true;
+    }
+    false
+}
+
+
 /// Splice-aware extension alignment
 ///
 /// Uses splice site scoring for RNA-seq alignment. Canonical GT-AG splice sites
@@ -50,6 +63,8 @@ pub fn extend_splice(
     junc: Option<&[u8]>,
     result: &mut DpResult,
 ) {
+    if reject_both_strands(flags, result) { return; }
+
     // Force scalar mode for testing/comparison
     if *crate::align::env_flags::FORCE_SCALAR {
         extend_splice_scalar(qseq, tseq, alphabet_size, score_matrix,
@@ -2916,10 +2931,10 @@ pub fn extend_splice_scalar(
 
     init_dp_result_full(result);
 
+    if reject_both_strands(flags, result) { return; }
     if alphabet_size <= 1 || query_len == 0 || target_len == 0 || gap_open2 <= qe {
         return;
     }
-    assert!((flags & SPLICE_FORWARD) == 0 || (flags & SPLICE_REVERSE) == 0);
 
     // Check scoring matrix bounds (same as SIMD)
     {
@@ -3457,13 +3472,11 @@ pub fn extend_splice_scalar(
         last_en = en0;
     }
 
-    // --- Traceback via shared traceback_splice ---
+    // --- Traceback (bounds-checked) ---
     if with_cigar {
-        unsafe {
-            traceback_splice(
-                result, query_len, target_len, end_bonus, flags, n_col_, 16, long_thres,
-                p_arr.as_mut_ptr(), band_off.as_mut_ptr(), band_off_end.as_mut_ptr(),
-            );
-        }
+        traceback_splice_safe(
+            result, query_len, target_len, end_bonus, flags, stride, long_thres,
+            &p_arr, &band_off, &band_off_end,
+        );
     }
 }
