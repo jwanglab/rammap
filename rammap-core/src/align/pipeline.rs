@@ -2350,10 +2350,11 @@ impl SeqStyle {
 pub(crate) fn seq_style(is_secondary: bool, is_sam_primary: bool, opt: &MapOptions) -> SeqStyle {
     let soft_clip = opt.flags.contains(AlignFlags::SOFTCLIP);
     let secondary_seq = opt.flags.contains(AlignFlags::SECONDARY_SEQ);
-    if is_secondary {
-        if secondary_seq { SeqStyle::AlignedOnly } else { SeqStyle::NoSeq }
-    } else if is_sam_primary || soft_clip {
+    // -Y prints the full read for secondaries too
+    if (!is_secondary && is_sam_primary) || soft_clip {
         SeqStyle::FullRead
+    } else if is_secondary && !secondary_seq {
+        SeqStyle::NoSeq
     } else {
         SeqStyle::AlignedOnly
     }
@@ -2977,12 +2978,14 @@ mod tests {
         assert_eq!(seq_style(false, true, &opt), SeqStyle::FullRead, "primary");
         assert_eq!(seq_style(false, false, &opt), SeqStyle::AlignedOnly, "supplementary");
         assert_eq!(seq_style(true, false, &opt), SeqStyle::NoSeq, "secondary");
-        // -Y keeps the whole read on supplementary records.
+        // -Y keeps the whole read on supplementary and secondary records.
         opt.flags.insert(AlignFlags::SOFTCLIP);
         assert_eq!(seq_style(false, false, &opt), SeqStyle::FullRead, "supplementary with -Y");
-        assert_eq!(seq_style(true, false, &opt), SeqStyle::NoSeq, "secondary with -Y");
-        // --secondary-seq gives secondary records their aligned span, hard-clipped.
+        assert_eq!(seq_style(true, false, &opt), SeqStyle::FullRead, "secondary with -Y");
         opt.flags.insert(AlignFlags::SECONDARY_SEQ);
+        assert_eq!(seq_style(true, false, &opt), SeqStyle::FullRead, "secondary with -Y --secondary-seq");
+        // --secondary-seq alone gives secondary records their aligned span, hard-clipped.
+        opt.flags.remove(AlignFlags::SOFTCLIP);
         assert_eq!(seq_style(true, false, &opt), SeqStyle::AlignedOnly, "secondary with --secondary-seq");
     }
 
