@@ -119,7 +119,7 @@ main() → AlignArgs::parse() → run(args)
 
 **Split index**: `-I batch_size`, `--split-prefix`
 
-**Advanced**: `--rmq`, `--heap-sort`, `--all-chains`, `-X` (ava), `--qstrand`, `--no-hash-name`, `--write-junc`
+**Advanced**: `--rmq`, `--heap-sort`, `-P` (keep all chains), `-X` (ava), `--qstrand`, `--no-hash-name`, `--write-junc`
 
 ---
 

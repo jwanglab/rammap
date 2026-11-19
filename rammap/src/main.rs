@@ -203,9 +203,21 @@ struct AlignArgs {
     #[arg(long)]
     pub no_long_join: bool,
 
-    /// Output all chains (skip secondary filtering)
+    /// Skip self and dual mappings (for the all-vs-all mode; same as -DP --no-long-join --dual=no)
     #[arg(short = 'X')]
+    pub ava_flags: bool,
+
+    /// Skip post-chaining duplicate removal (keep all chains)
+    #[arg(short = 'P')]
     pub all_chains: bool,
+
+    /// Use two I/O threads during mapping (accepted for compatibility; no effect)
+    #[arg(short = '2')]
+    pub two_io_threads: bool,
+
+    /// SDUST threshold; 0 to disable SDUST (only 0 is supported)
+    #[arg(short = 'T')]
+    pub sdust_thres: Option<i32>,
 
     /// Transition mismatch penalty
     #[arg(short = 'b')]
@@ -583,6 +595,8 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         if let Ok(v) = parts[0].parse() { opt.scoring.gap_extend = v; opt.scoring.gap_extend2 = v; }
         if parts.len() > 1 && let Ok(v) = parts[1].parse() { opt.scoring.gap_extend2 = v; }
     }
+    // Remember the preset's -N so that '-N 0' can fall back to it below
+    let old_best_n = opt.filtering.best_n;
     if let Some(v) = cli.best_n { opt.filtering.best_n = v; }
     if let Some(v) = cli.pri_ratio { opt.filtering.pri_ratio = v; }
     if let Some(s) = &cli.z_drop {
@@ -607,6 +621,13 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
     if cli.rev_only { opt.flags.insert(AlignFlags::REV_ONLY); }
     if cli.no_long_join { opt.flags.insert(AlignFlags::NO_LJOIN); }
     if cli.all_chains { opt.flags.insert(AlignFlags::ALL_CHAINS); }
+    // -X = -D -P --no-long-join --dual=no
+    if cli.ava_flags {
+        opt.flags.insert(AlignFlags::ALL_CHAINS | AlignFlags::NO_DIAG | AlignFlags::NO_DUAL | AlignFlags::NO_LJOIN);
+    }
+    if let Some(t) = cli.sdust_thres && t > 0 {
+        anyhow::bail!("-T (SDUST masking) is not supported; only -T 0 is accepted");
+    }
     if let Some(v) = cli.min_dp_max { opt.alignment.min_dp_max = v; }
     if let Some(v) = cli.transition { opt.scoring.transition = v; }
     if let Some(v) = cli.noncan { opt.scoring.noncanon_penalty = v; }
@@ -768,6 +789,16 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         if (q + e) + (q2 + e2) > 127 {
             anyhow::bail!("scoring system violating ({{-O}}+{{-E}})+({{-O2}}+{{-E2}}) <= 127");
         }
+    }
+    if opt.flags.contains(AlignFlags::NO_PRINT_2ND) && opt.flags.contains(AlignFlags::ALL_CHAINS) {
+        anyhow::bail!("-X/-P and --secondary=no can't be applied at the same time");
+    }
+    // '-N 0' becomes the previous -N plus --secondary=no (after the -X/-P check, so '-N 0 -X' is allowed)
+    if opt.filtering.best_n == 0 {
+        eprintln!("[WARNING]\x1b[1;31m '-N 0' reduces mapping accuracy. Please use '--secondary=no' instead.\x1b[0m");
+        eprintln!("[WARNING]\x1b[1;31m changed '-N 0' to '-N {} --secondary=no'.\x1b[0m", old_best_n);
+        opt.filtering.best_n = old_best_n;
+        opt.flags.insert(AlignFlags::NO_PRINT_2ND);
     }
     if cli.eqx && (cli.junc_jump.is_some() || cli.pass1.is_some())
         && opt.flags.contains(AlignFlags::SPLICE) && !pe_mode {
