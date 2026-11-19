@@ -36,6 +36,7 @@ pub fn pair_alignments(
     regs: &mut [Vec<PeReg>; 2],
 ) {
     // Build combined array sorted by (rid, rs, strand-parity)
+    #[derive(Clone, Copy)]
     struct PairEntry {
         s: usize,    // segment index (0 or 1)
         rev: bool,
@@ -68,8 +69,8 @@ pub fn pair_alignments(
     dp_thres -= pe_bonus as i64;
     if dp_thres < 0 { dp_thres = 0; }
 
-    // Radix-like sort by key
-    a.sort_unstable_by_key(|e| e.key);
+    // The radix sort's order of equal keys decides which hit is scanned first
+    crate::align::sort::radix_sort_by_key(&mut a, 8, |e| e.key);
 
     let mut max_score: i64 = -1;
     let mut max_idx: [Option<usize>; 2] = [None, None]; // indices into `a`

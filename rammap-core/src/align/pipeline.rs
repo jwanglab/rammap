@@ -1682,18 +1682,14 @@ fn process_query_core(
 
     // Sort by (score, hash) descending
     // When ALT contigs present, sort by alt-penalized scores
+    // Regs arrive already sorted (map_query / per-segment), so this must be a
+    // stable no-op: re-running the radix sort would flip ties again.
     if !regs.is_empty() {
-        if n_alt > 0 {
-            let alt_drop = opt.filtering.alt_drop;
-            regs.sort_by(|a, b| {
-                let sa = if a.is_alt { scale_alt_score(a.score, alt_drop) } else { a.score };
-                let sb = if b.is_alt { scale_alt_score(b.score, alt_drop) } else { b.score };
-                sb.cmp(&sa).then_with(|| b.hash.cmp(&a.hash))
-            });
-        } else {
-            regs.sort_by(|a, b| b.score.cmp(&a.score)
-                .then_with(|| b.hash.cmp(&a.hash)));
-        }
+        let alt_drop = opt.filtering.alt_drop;
+        regs.sort_by_cached_key(|r| {
+            let sc = if n_alt > 0 && r.is_alt { scale_alt_score(r.score, alt_drop) } else { r.score };
+            std::cmp::Reverse(((sc as u64) << 32) | r.hash as u64)
+        });
     }
 
     let qlen = qseq.len();

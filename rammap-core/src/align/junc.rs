@@ -15,7 +15,7 @@ use super::dp::SPSC_OFFSET;
 
 /// Per-interval data for BED mode: a single annotated interval on a target
 /// sequence with strand and optional thick/itemRgb extras from the BED row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct BedInterval {
     pub start: i32,
     pub end: i32,
@@ -111,8 +111,16 @@ pub fn load_bed_junctions(
     let mut total = 0usize;
     for intv in &mut intervals {
         if intv.is_empty() { continue; }
-        // Sort by st, then by en within same st
-        intv.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+        // Radix sort by start, then each equal-start run by end; the in-place radix
+        // order decides which duplicate (and so which strand) is kept below
+        crate::align::sort::radix_sort_by_key(intv, 4, |e| e.start as u32 as u64);
+        let mut j0 = 0;
+        for j in 1..=intv.len() {
+            if j == intv.len() || intv[j].start != intv[j0].start {
+                crate::align::sort::radix_sort_by_key(&mut intv[j0..j], 4, |e| e.end as u32 as u64);
+                j0 = j;
+            }
+        }
         // Merge intervals with identical (start, end)
         let mut merged = Vec::with_capacity(intv.len());
         let mut i = 0;
@@ -121,7 +129,7 @@ pub fn load_bed_junctions(
             while j < intv.len() && intv[j].start == intv[i].start && intv[j].end == intv[i].end {
                 j += 1;
             }
-            merged.push(intv[i].clone());
+            merged.push(intv[i]);
             i = j;
         }
         total += merged.len();

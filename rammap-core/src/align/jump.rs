@@ -14,7 +14,7 @@ const JUNC_ANNO: u16 = 0x1;
 // const JUNC_MISC: u16 = 0x2;
 
 /// A single junction record in the jump database.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct JumpJunc {
     pub left_pos: i32,      // left/start position
     pub right_pos: i32,     // right/end position
@@ -151,7 +151,16 @@ impl JumpDb {
 
 /// Sort by (left_pos, right_pos) and merge duplicates, summing counts and OR-ing flags.
 fn sort_merge(juncs: &mut Vec<JumpJunc>) {
-    juncs.sort_by(|a, b| a.left_pos.cmp(&b.left_pos).then(a.right_pos.cmp(&b.right_pos)));
+    // Radix sort by left, then each equal-left run by right; the in-place radix
+    // order decides which duplicate (and so which strand) the merge keeps
+    crate::align::sort::radix_sort_by_key(juncs, 4, |e| e.left_pos as u32 as u64);
+    let mut j0 = 0;
+    for j in 1..=juncs.len() {
+        if j == juncs.len() || juncs[j].left_pos != juncs[j0].left_pos {
+            crate::align::sort::radix_sort_by_key(&mut juncs[j0..j], 4, |e| e.right_pos as u32 as u64);
+            j0 = j;
+        }
+    }
     juncs.dedup_by(|a, b| {
         if a.left_pos != b.left_pos || a.right_pos != b.right_pos { return false; }
         b.count += a.count;

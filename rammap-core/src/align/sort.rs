@@ -27,11 +27,17 @@ impl RadixKey for (u64, u64) {
 /// Insertion sort fallback for small subarrays, sorting by radix key only.
 #[inline]
 fn rs_insertsort<T: RadixKey>(arr: &mut [T]) {
+    rs_insertsort_by(arr, &|e: &T| e.radix_key());
+}
+
+/// Insertion sort by `key`: stable, compares keys only.
+#[inline]
+fn rs_insertsort_by<T: Copy, F: Fn(&T) -> u64>(arr: &mut [T], key: &F) {
     for i in 1..arr.len() {
-        if arr[i].radix_key() < arr[i - 1].radix_key() {
+        if key(&arr[i]) < key(&arr[i - 1]) {
             let tmp = arr[i];
             let mut j = i;
-            while j > 0 && tmp.radix_key() < arr[j - 1].radix_key() {
+            while j > 0 && key(&tmp) < key(&arr[j - 1]) {
                 arr[j] = arr[j - 1];
                 j -= 1;
             }
@@ -42,6 +48,11 @@ fn rs_insertsort<T: RadixKey>(arr: &mut [T]) {
 
 /// MSD in-place radix sort
 fn rs_sort<T: RadixKey>(arr: &mut [T], n_bits: u32, s: u32) {
+    rs_sort_by(arr, n_bits, s, &|e: &T| e.radix_key());
+}
+
+/// MSD in-place radix sort keyed by `key`.
+fn rs_sort_by<T: Copy, F: Fn(&T) -> u64>(arr: &mut [T], n_bits: u32, s: u32, key: &F) {
     let size = 1usize << n_bits; // 256
     let m = (size - 1) as u64;
 
@@ -52,7 +63,7 @@ fn rs_sort<T: RadixKey>(arr: &mut [T], n_bits: u32, s: u32) {
 
     // Count elements per bucket
     for item in arr.iter() {
-        let byte = ((item.radix_key() >> s) & m) as usize;
+        let byte = ((key(item) >> s) & m) as usize;
         be[byte] += 1;
     }
 
@@ -67,7 +78,7 @@ fn rs_sort<T: RadixKey>(arr: &mut [T], n_bits: u32, s: u32) {
     let mut k = 0usize;
     while k < size {
         if bb[k] < be[k] {
-            let l = ((arr[bb[k]].radix_key() >> s) & m) as usize;
+            let l = ((key(&arr[bb[k]]) >> s) & m) as usize;
             if l != k {
                 // Element at k's front belongs to bucket l — start swap cycle
                 let mut tmp = arr[bb[k]];
@@ -77,7 +88,7 @@ fn rs_sort<T: RadixKey>(arr: &mut [T], n_bits: u32, s: u32) {
                     std::mem::swap(&mut tmp, &mut arr[bb[cur]]);
                     bb[cur] += 1;
                     // Where does the picked-up element belong?
-                    cur = ((tmp.radix_key() >> s) & m) as usize;
+                    cur = ((key(&tmp) >> s) & m) as usize;
                     if cur == k {
                         break;
                     }
@@ -104,11 +115,21 @@ fn rs_sort<T: RadixKey>(arr: &mut [T], n_bits: u32, s: u32) {
         for i in 0..size {
             let len = be[i] - bb[i];
             if len > RS_MIN_SIZE {
-                rs_sort(&mut arr[bb[i]..be[i]], n_bits, next_s);
+                rs_sort_by(&mut arr[bb[i]..be[i]], n_bits, next_s, key);
             } else if len > 1 {
-                rs_insertsort(&mut arr[bb[i]..be[i]]);
+                rs_insertsort_by(&mut arr[bb[i]..be[i]], key);
             }
         }
+    }
+}
+
+/// In-place radix sort for a key `key_bytes` wide. Unstable, but the order of
+/// equal keys is deterministic, which matters wherever later steps depend on it.
+pub fn radix_sort_by_key<T: Copy, F: Fn(&T) -> u64>(arr: &mut [T], key_bytes: u32, key: F) {
+    if arr.len() <= RS_MIN_SIZE {
+        rs_insertsort_by(arr, &key);
+    } else {
+        rs_sort_by(arr, RS_MAX_BITS, (key_bytes - 1) * RS_MAX_BITS, &key);
     }
 }
 
@@ -120,6 +141,16 @@ pub fn radix_sort_128x(arr: &mut [Minimizer]) {
     } else {
         rs_sort(arr, RS_MAX_BITS, (8 - 1) * RS_MAX_BITS);
     }
+}
+
+/// Radix-sort `(key, index)` ascending, then take it in reverse, so items come
+/// out by key descending with ties in reverse radix order.
+pub fn hit_sort_desc<T, F: Fn(&T) -> u64>(v: &mut Vec<T>, key: F) {
+    if v.len() <= 1 { return; }
+    let mut aux: Vec<(u64, u64)> = v.iter().enumerate().map(|(i, r)| (key(r), i as u64)).collect();
+    radix_sort_128x_pair(&mut aux);
+    let mut tmp: Vec<Option<T>> = v.drain(..).map(Some).collect();
+    v.extend(aux.iter().rev().map(|&(_, i)| tmp[i as usize].take().unwrap()));
 }
 
 /// MSD in-place radix sort for `(u64, u64)` aux entries by `.0`. Cycle-leader
@@ -348,6 +379,44 @@ mod tests {
             assert_eq!(a1[i].x, a2[i].x);
             assert_eq!(a1[i].y, a2[i].y);
         }
+    }
+
+    #[test]
+    fn test_radix_sort_by_key_small_is_stable() {
+        // <= RS_MIN_SIZE falls back to insertion sort, which keeps ties in input order
+        let mut a: Vec<(u64, u32)> = (0..40u32).map(|i| ((i % 3) as u64, i)).collect();
+        radix_sort_by_key(&mut a, 8, |e| e.0);
+        let ids: Vec<u32> = a.iter().map(|e| e.1).collect();
+        let mut expect: Vec<u32> = (0..40).filter(|i| i % 3 == 0).collect();
+        expect.extend((0..40).filter(|i| i % 3 == 1));
+        expect.extend((0..40).filter(|i| i % 3 == 2));
+        assert_eq!(ids, expect);
+    }
+
+    #[test]
+    fn test_radix_sort_by_key_tie_order() {
+        // Fixed expected order: equal keys come out in the radix sort's in-place order.
+        let mut a: Vec<(u64, u32)> = (0..100u32)
+            .map(|i| (((i * 7 % 5) as u64) << 33 | ((i % 3) as u64) << 1, i))
+            .collect();
+        radix_sort_by_key(&mut a, 8, |e| e.0);
+        let ids: Vec<u32> = a.iter().map(|e| e.1).collect();
+        let expect: Vec<u32> = vec![
+            0, 60, 45, 90, 30, 15, 75, 40, 85, 25, 10, 70, 55, 80, 20, 5, 65, 50, 95, 35,
+            3, 63, 48, 93, 18, 33, 78, 43, 88, 13, 28, 73, 58, 83, 8, 23, 68, 53, 98, 38,
+            6, 81, 21, 66, 51, 36, 96, 1, 61, 46, 16, 91, 31, 76, 41, 11, 86, 26, 71, 56,
+            84, 24, 9, 69, 54, 39, 99, 4, 64, 49, 94, 34, 19, 79, 44, 89, 29, 14, 74, 59,
+            42, 12, 87, 27, 72, 57, 7, 82, 22, 67, 52, 37, 97, 2, 62, 47, 17, 92, 32, 77,
+        ];
+        assert_eq!(ids, expect);
+    }
+
+    #[test]
+    fn test_hit_sort_desc_reverses_ties() {
+        // The ascending radix order is taken in reverse, so ties come out reversed
+        let mut v: Vec<(u64, u32)> = vec![(5, 0), (9, 1), (5, 2), (9, 3)];
+        hit_sort_desc(&mut v, |e| e.0);
+        assert_eq!(v, vec![(9, 3), (9, 1), (5, 2), (5, 0)]);
     }
 
     #[test]

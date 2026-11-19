@@ -1166,20 +1166,19 @@ pub fn map_query_multi(
     if opt.flags.contains(AlignFlags::FOR_ONLY) { regs0.retain(|r| !r.is_reverse); }
     if opt.flags.contains(AlignFlags::REV_ONLY) { regs0.retain(|r| r.is_reverse); }
 
-    // Mark ALT-contig chains; then sort chains by descending score.
+    // Sort by (score, hash) descending; tie order follows the radix sort
+    crate::align::sort::hit_sort_desc(&mut regs0, |r| ((r.score as u64) << 32) | r.hash as u64);
+    // Mark ALT-contig chains, then re-sort with alt-scaled scores
     let n_alt = mi.seqs.iter().filter(|s| s.is_alt).count();
     if n_alt > 0 {
         for r in regs0.iter_mut() {
             if mi.seqs[r.ref_id].is_alt { r.is_alt = true; }
         }
         let alt_drop = opt.filtering.alt_drop;
-        regs0.sort_by(|a, b| {
-            let sa = if a.is_alt { scale_alt_score(a.score, alt_drop) } else { a.score };
-            let sb = if b.is_alt { scale_alt_score(b.score, alt_drop) } else { b.score };
-            sb.cmp(&sa).then_with(|| b.hash.cmp(&a.hash))
+        crate::align::sort::hit_sort_desc(&mut regs0, |r| {
+            let sc = if r.is_alt { scale_alt_score(r.score, alt_drop) } else { r.score };
+            ((sc as u64) << 32) | r.hash as u64
         });
-    } else {
-        regs0.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.hash.cmp(&a.hash)));
     }
 
     if regs0.is_empty() {
@@ -1239,7 +1238,8 @@ pub fn map_query_multi(
     // Per-segment parent assignment.
     for (regs_s, _) in &mut per_seg {
         if !regs_s.is_empty() {
-            regs_s.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.hash.cmp(&a.hash)));
+            // Sort by (score, hash) descending; tie order follows the radix sort
+            crate::align::sort::hit_sort_desc(regs_s, |r| ((r.score as u64) << 32) | r.hash as u64);
 
             if !opt.flags.contains(AlignFlags::ALL_CHAINS) {
                 let filter_params = FilterParams::new(opt, mi);
@@ -1483,21 +1483,19 @@ pub fn map_query(
         regs.retain(|r| r.is_reverse);
     }
 
-    // Mark ALT-contig chains; then sort chains by descending score.
+    // Sort by (score, hash) descending; tie order follows the radix sort
+    crate::align::sort::hit_sort_desc(&mut regs, |r| ((r.score as u64) << 32) | r.hash as u64);
+    // Mark ALT-contig chains, then re-sort with alt-scaled scores
     let n_alt = mi.seqs.iter().filter(|s| s.is_alt).count();
     if n_alt > 0 {
         for r in regs.iter_mut() {
             if mi.seqs[r.ref_id].is_alt { r.is_alt = true; }
         }
         let alt_drop = opt.filtering.alt_drop;
-        regs.sort_by(|a, b| {
-            let sa = if a.is_alt { scale_alt_score(a.score, alt_drop) } else { a.score };
-            let sb = if b.is_alt { scale_alt_score(b.score, alt_drop) } else { b.score };
-            sb.cmp(&sa).then_with(|| b.hash.cmp(&a.hash))
+        crate::align::sort::hit_sort_desc(&mut regs, |r| {
+            let sc = if r.is_alt { scale_alt_score(r.score, alt_drop) } else { r.score };
+            ((sc as u64) << 32) | r.hash as u64
         });
-    } else {
-        // Sort by (score, hash) descending, by (score, hash) descending
-        regs.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.hash.cmp(&a.hash)));
     }
 
     let pc2 = Instant::now();
